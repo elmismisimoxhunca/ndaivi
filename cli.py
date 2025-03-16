@@ -199,6 +199,67 @@ def search_database(config, term, entity_type=None):
     finally:
         session.close()
 
+def initialize_database(config_path: str, db_path: str = None) -> str:
+    """
+    Initialize the database if it doesn't exist.
+    
+    Args:
+        config_path: Path to the configuration file
+        db_path: Optional custom database path
+        
+    Returns:
+        Path to the initialized database
+    """
+    logger = logging.getLogger('cli')
+    
+    # Load config
+    config = load_config(config_path)
+    
+    # If db_path is provided, update config
+    if db_path:
+        config['database']['path'] = db_path
+    
+    db_path = config['database']['path']
+    
+    # Check if database directory exists
+    db_dir = os.path.dirname(db_path)
+    if not os.path.exists(db_dir):
+        logger.info(f"Creating database directory: {db_dir}")
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create database directory: {str(e)}")
+            raise
+    
+    # Check if database exists
+    if not os.path.exists(db_path):
+        logger.info(f"Database not found at {db_path}. Initializing new database.")
+        try:
+            # Initialize the database
+            init_db(db_path, config_path)
+            logger.info(f"Database initialized successfully at {db_path}")
+            print(f"✅ Database initialized successfully at {db_path}")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {str(e)}")
+            raise
+    else:
+        logger.info(f"Database already exists at {db_path}")
+    
+    return db_path
+
+def check_database_exists(config: dict) -> bool:
+    """
+    Check if the database exists.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        True if database exists, False otherwise
+    """
+    db_path = config['database']['path']
+    return os.path.exists(db_path)
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='NDAIVI Competitor Scraper CLI')
@@ -212,6 +273,10 @@ def main():
     
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Display statistics')
+    
+    # Initialize database command
+    init_db_parser = subparsers.add_parser('init-db', help='Initialize the database')
+    init_db_parser.add_argument('--path', help='Custom database file path')
     
     # List manufacturers command
     list_mfr_parser = subparsers.add_parser('list-manufacturers', help='List manufacturers')
@@ -252,7 +317,35 @@ def main():
         # Load configuration
         config = load_config(args.config)
         
-        if args.command == 'start':
+        # Check if database exists before any command that requires it
+        # Exclude init-db command which handles its own database check
+        if args.command not in [None, 'init-db'] and not check_database_exists(config):
+            print("⚠️ Database not found! You need to initialize it first.")
+            user_input = input("Do you want to initialize the database now? (y/n): ").lower()
+            
+            if user_input == 'y':
+                db_path = input(f"Enter database path (default: {config['database']['path']}): ")
+                if not db_path.strip():
+                    db_path = config['database']['path']
+                
+                initialize_database(args.config, db_path)
+                # Reload config in case the path was changed
+                config = load_config(args.config)
+            else:
+                print("Database initialization canceled. Use 'init-db' command to initialize the database later.")
+                return
+        
+        if args.command == 'init-db':
+            # Initialize database with custom path if provided
+            try:
+                db_path = args.path
+                initialize_database(args.config, db_path)
+            except Exception as e:
+                logger.error(f"Database initialization failed: {str(e)}")
+                print(f"Error initializing database: {str(e)}")
+                sys.exit(1)
+        
+        elif args.command == 'start':
             # Override max pages if specified
             if args.max_pages:
                 config['crawling']['max_pages_per_run'] = args.max_pages

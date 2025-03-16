@@ -25,7 +25,7 @@ target_url: "https://www.manualslib.com"
 
 # Database configuration
 database:
-  path: "/var/ndaivimanuales/manuals.db"
+  path: "database/manuals.db"
 
 # AI APIs configuration
 ai_apis:
