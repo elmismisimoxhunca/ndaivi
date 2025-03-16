@@ -20,7 +20,7 @@ from database.db_manager import get_db_manager
 # Add the project root to the Python path
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog
+from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession
 import json
 from sqlalchemy import func, desc
 
@@ -207,6 +207,7 @@ class CompetitorScraper:
         # Register signal handlers
         signal.signal(signal.SIGINT, handle_shutdown_signal)  # Ctrl+C
         signal.signal(signal.SIGTERM, handle_shutdown_signal)  # kill command
+        signal.signal(signal.SIGTSTP, handle_shutdown_signal)  # Ctrl+Z
         
         # CRITICAL: Don't attempt database logging for startup - it can cause deadlocks
         # with other components. We've already logged to the file, which is sufficient.
@@ -281,7 +282,6 @@ class CompetitorScraper:
                 continue
             
             # Update crawl status using our database manager
-            # This ensures proper locking and prevents race conditions
             try:
                 with self.db_manager.session() as session:
                     # Check if URL exists in database

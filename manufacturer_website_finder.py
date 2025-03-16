@@ -27,7 +27,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from database.schema import init_db, Manufacturer
+from database.schema import init_db, Manufacturer, ScraperSession
 from database.db_manager import get_db_manager
 from scraper.claude_analyzer import ClaudeAnalyzer
 
@@ -129,6 +129,9 @@ class ManufacturerWebsiteFinder:
         
         # Session for making HTTP requests with anti-bot measures
         self.session = self._create_session()
+        
+        # Flag for shutdown request
+        self.shutdown_requested = False
     
     def _setup_logging(self) -> logging.Logger:
         """Set up logging configuration.
@@ -860,7 +863,6 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
             chrome_options.add_argument('--no-sandbox')
             chrome_options.add_argument('--disable-dev-shm-usage')
             chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--window-size=1920,1080')
             
             # Add stability improvements
             chrome_options.add_argument('--disable-extensions')
@@ -1305,7 +1307,6 @@ Do not include any explanations or additional text outside the delimited format.
             payload = {
                 "model": self.anthropic_model,
                 "max_tokens": 100,
-                "system": "You are a helpful assistant that provides accurate information about manufacturer websites. Only respond in the exact delimited format requested.",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -1317,7 +1318,8 @@ Do not include any explanations or additional text outside the delimited format.
             
             for api_attempt in range(max_api_retries):
                 try:
-                    response = requests.post(
+                    self.logger.info(f"Making Claude API request (attempt {api_attempt+1}/{max_api_retries})")
+                    api_response = requests.post(
                         "https://api.anthropic.com/v1/messages",
                         headers=headers,
                         json=payload,
@@ -1325,16 +1327,16 @@ Do not include any explanations or additional text outside the delimited format.
                     )
                     
                     # Break if successful
-                    if response.status_code == 200:
+                    if api_response.status_code == 200:
                         break
                         
                     # Handle rate limiting
-                    if response.status_code == 429:
+                    if api_response.status_code == 429:
                         wait_time = api_retry_delay * (2 ** api_attempt)  # Exponential backoff
                         self.logger.warning(f"Rate limited by Claude API. Waiting {wait_time} seconds before retry.")
                         time.sleep(wait_time)
                     else:
-                        self.logger.error(f"Error from Claude API: {response.status_code} - {response.text}")
+                        self.logger.error(f"Error from Claude API: {api_response.status_code} - {api_response.text}")
                         if api_attempt < max_api_retries - 1:
                             time.sleep(api_retry_delay * (api_attempt + 1))
                             
@@ -1363,13 +1365,13 @@ Do not include any explanations or additional text outside the delimited format.
                         time.sleep(wait_time)
             
             # Check if all API attempts failed
-            if 'response' not in locals() or response.status_code != 200:
+            if 'api_response' not in locals() or api_response.status_code != 200:
                 self.logger.error(f"All Claude API attempts failed for {manufacturer_name}")
                 return None
                 
             # Handle the successful response
             try:
-                response_data = response.json()
+                response_data = api_response.json()
                 result = response_data["content"][0]["text"]
                 
                 # Parse the delimited response
@@ -1975,6 +1977,11 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
         
         # STAGE 1: Process manufacturers with existing but unvalidated websites
         for manufacturer in manufacturers_with_unvalidated:
+            # Check if shutdown was requested
+            if self.shutdown_requested:
+                self.logger.info("Shutdown requested, stopping processing")
+                break
+                
             try:
                 processed_count += 1
                 self.logger.info(f"Processing manufacturer with unvalidated website: {manufacturer.name} (ID: {manufacturer.id}) " + 
