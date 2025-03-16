@@ -1,5 +1,7 @@
 # NDAIVI - Python Scraping Engine for Manuals
 
+*Updated on March 15, 2025*
+
 ## Project Overview
 NDAIVI is an automated scraping engine designed to extract user manuals from competitor and manufacturer websites. The system populates an SQLite database that can be used by a React frontend and Flask admin system. The primary goal is to self-populate and maintain a manuals database with minimal manual intervention.
 
@@ -141,3 +143,38 @@ Proprietary - All rights reserved
 
 ## Future Plans
 -Stage 2 of the Scrapping Engine: Takes the extracted manufacturers and finds their websites, completing the database.
+
+-Stage 3 of the Scrapping Engine: Allows for optimized, faster operation, more advanced configuration and refinement, headless mode, start-stop-resume, supports HTTP and SOCKS proxy connection. And allows for remote operation, as well as switching between modes.
+
+-Stage 4 of the Scrapping Engine: Scans all manufacturers and their websites for manuals, populating the database with the extracted information. It not only extracts the manual, but creates a new product entity for each manual, complete with:
+-Natural product description
+-Relevant info about the product and the company.
+-SEO tags and keywords
+-Image, derived from the internet or the manufacturers website, using Claude Haiku to validate. 
+This can come out from the manuals themselves. Each manual has a separate entry for English and Spanish / Other specified target languages. It uses the already coded translation methods to render a separate translation, this time with CLaude Sonnet, which is more advanced. 
+
+This is the most complex implementation, as each manufacturer website may vary and it has to adapt to all cases. It includes a robust 2captcha solver. 
+
+-Stage 5: Wrapper / Motor: This provides an elegant, easy to use solution that executes all steps:
+1: Scan competitors website for manufacturers and cateogries, translating them to spanish and other specified languages
+2: Search and register for their official websites
+3: Scan the websites for manuals and populate the database with the actual content that will be displayed to the user. 
+All three steps are doing sequentially and in order, by cycles, in a configurable time allocation. User can configure how much time it will spend in each step. For example, of 1000 seconds, 100 dedicated to category extraction, 100 to website finding, and 800 to manuals extraction.
+
+This will be the nucleus of the FLASK app, and will include an API for the Flask web app to work on.
+
+-Stage 6: Flask-based web app for administrating the scrapping engine.
+A functional, not so pretty system, for handling the scrapping and content population. 
+-Controlling the scrapping system by the flask app, starting, stopping, resuming scrapping.
+-Handle settings
+-Read the scrapping statistics and logs
+-Real time logs
+-Accessing and reading info from the database. 
+-Access file database (Stored PDFs) and their download links
+
+-Stage 7: Postgresql implementation
+AT this point, we will code a system to periodically populate the Postgresql implementation with the latest updates from the scrapping engine, which can be run from a different server than the frontend. It will query daily, updating its contents with the info gathered by the scrapping system.
+
+The PDF files will be stored in the same directory in both frontend and backend and will be served as static content. At least for a while, as the websites need to increase in popularity.
+
+-Stage 8: API that connects to Postgresql to build React-based website displaying the extracted manuals. 
