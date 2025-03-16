@@ -26,6 +26,30 @@ target_url: "https://www.manualslib.com"
 # Database configuration
 database:
   path: "database/manuals.db"
+  
+# Scheduling and execution configuration
+scheduling:
+  # Time allocation between scraper and manufacturer website finder (0-100)
+  # Higher values allocate more time to competitor scraper
+  # Lower values allocate more time to manufacturer website finder
+  time_allocation: 70
+  
+  # Maximum runtime in minutes (0 means no time limit)
+  max_runtime_minutes: 0
+  
+  # Checkpoint interval in minutes (save state for resuming)
+  checkpoint_interval: 5
+  
+  # Background processing configuration
+  background:
+    # Enable background processing
+    enabled: false
+    
+    # Process ID file to track background processes
+    pid_file: "logs/ndaivi_process.pid"
+    
+    # Status file to track progress
+    status_file: "logs/ndaivi_status.json"
 
 # AI APIs configuration
 ai_apis:
@@ -63,3 +87,31 @@ keywords:
     - "account"
     - "privacy"
     - "terms"
+
+# Scraper configuration
+scraper:
+  # Maximum number of pages to process in a single batch
+  batch_size: 100
+  
+  # Timeout in seconds for page requests
+  request_timeout: 30
+  
+  # Number of retries for failed requests
+  max_retries: 3
+  
+  # Delay between retries in seconds
+  retry_delay: 5
+
+# Manufacturer website finder configuration
+manufacturer_finder:
+  # Maximum number of manufacturers to process in a single batch
+  batch_size: 20
+  
+  # Maximum number of search results to validate per manufacturer
+  max_search_results: 3
+  
+  # Timeout in seconds for website validation
+  validation_timeout: 45
+  
+  # Delay between manufacturer processing in seconds
+  processing_delay: 3

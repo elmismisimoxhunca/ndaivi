@@ -2151,6 +2151,157 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
         self.logger.info(f"Website finding process completed in {self.stats['duration']}")
         return self.stats
     
+    def process_batch(self, max_pages=None, max_runtime_minutes=None):
+        """
+        Process a batch of manufacturers with time and page limits.
+        
+        Args:
+            max_pages (int, optional): Maximum number of manufacturers to process in this batch.
+                If None, no limit is applied.
+            max_runtime_minutes (int, optional): Maximum runtime in minutes.
+                If None, runs until max_pages is reached.
+                
+        Returns:
+            dict: Statistics about the batch processing.
+        """
+        self.logger.info(f"Starting batch processing with max_pages={max_pages}, max_runtime_minutes={max_runtime_minutes}")
+        
+        # Initialize stats for this batch
+        batch_start_time = time.time()
+        self.stats['batch_start_time'] = batch_start_time
+        
+        # Calculate end time if max_runtime_minutes is specified
+        end_time = None
+        if max_runtime_minutes is not None and max_runtime_minutes > 0:
+            end_time = time.time() + (max_runtime_minutes * 60)
+            self.logger.info(f"Batch will run until {time.strftime('%H:%M:%S', time.localtime(end_time))}")
+        
+        # Get manufacturers without validated websites
+        manufacturers_without_website = self._get_manufacturers_without_website()
+        manufacturers_with_unvalidated = self._get_manufacturers_with_unvalidated_website()
+        
+        # Prioritize manufacturers with unvalidated websites first
+        manufacturers_to_process = manufacturers_with_unvalidated + manufacturers_without_website
+        
+        # Apply limit if specified
+        if max_pages and max_pages > 0 and manufacturers_to_process:
+            manufacturers_to_process = manufacturers_to_process[:max_pages]
+            self.logger.info(f"Limited to processing {max_pages} manufacturers")
+        
+        # Initialize counters for this run
+        processed_count = 0
+        success_count = 0
+        
+        # Process manufacturers until we reach the limit or run out of time
+        for manufacturer in manufacturers_to_process:
+            # Check if we've exceeded the maximum runtime
+            if end_time and time.time() >= end_time:
+                self.logger.info(f"Reached maximum runtime of {max_runtime_minutes} minutes")
+                break
+                
+            try:
+                processed_count += 1
+                self.logger.info(f"Processing manufacturer: {manufacturer.name} (ID: {manufacturer.id}) " + 
+                               f"[{processed_count}/{len(manufacturers_to_process)}]")
+                
+                # Extract the current website URL
+                website_url = manufacturer.website.strip() if manufacturer.website else None
+                
+                # If manufacturer has an unvalidated website, validate it first
+                if website_url and website_url != "No website found":
+                    self.logger.info(f"Validating existing website for {manufacturer.name}: {website_url}")
+                    try:
+                        is_valid = self._validate_website_with_selenium(manufacturer.name, website_url)
+                    except Exception as e:
+                        self.logger.error(f"Error validating website for {manufacturer.name}: {str(e)}")
+                        is_valid = False
+                    
+                    if is_valid:
+                        try:
+                            self._update_manufacturer_website(manufacturer.id, website_url, True)
+                            success_count += 1
+                            self.logger.info(f"Successfully validated existing website for {manufacturer.name}")
+                            continue
+                        except Exception as e:
+                            self.logger.error(f"Error updating database for {manufacturer.name}: {str(e)}")
+                            continue
+                
+                # If validation fails or no website, ask Claude Haiku for the website
+                self.logger.info(f"Querying Claude Haiku for website for {manufacturer.name}")
+                try:
+                    claude_website = self._query_claude_for_website(manufacturer.name)
+                except Exception as e:
+                    self.logger.error(f"Error querying Claude for {manufacturer.name}: {str(e)}")
+                    claude_website = None
+                
+                if claude_website and (not website_url or claude_website != website_url):
+                    # Validate the website suggested by Claude
+                    self.logger.info(f"Validating Claude's suggestion for {manufacturer.name}: {claude_website}")
+                    try:
+                        is_valid = self._validate_website_with_selenium(manufacturer.name, claude_website)
+                    except Exception as e:
+                        self.logger.error(f"Error validating Claude's website for {manufacturer.name}: {str(e)}")
+                        is_valid = False
+                    
+                    if is_valid:
+                        try:
+                            self._update_manufacturer_website(manufacturer.id, claude_website, True)
+                            success_count += 1
+                            self.logger.info(f"Successfully validated Claude's suggested website for {manufacturer.name}")
+                            continue
+                        except Exception as e:
+                            self.logger.error(f"Error updating database with Claude's website for {manufacturer.name}: {str(e)}")
+                            continue
+                
+                # If Claude doesn't know or validation fails, search and validate top results
+                self.logger.info(f"Searching and validating top results for {manufacturer.name}")
+                try:
+                    google_website = self._search_and_validate_top_results(manufacturer.name)
+                except Exception as e:
+                    self.logger.error(f"Error searching and validating top results for {manufacturer.name}: {str(e)}")
+                    google_website = None
+            
+                if google_website:
+                    try:
+                        self._update_manufacturer_website(manufacturer.id, google_website, True)
+                        success_count += 1
+                        self.logger.info(f"Successfully found and validated website for {manufacturer.name} through search")
+                    except Exception as e:
+                        self.logger.error(f"Error updating database with search website for {manufacturer.name}: {str(e)}")
+                else:
+                    # If no valid website found in top results, mark as "No website found"
+                    try:
+                        self._update_manufacturer_website(manufacturer.id, "No website found", True)
+                        self.logger.info(f"No valid website found for {manufacturer.name}, marked as 'No website found'")
+                    except Exception as e:
+                        self.logger.error(f"Error updating database with 'No website found' for {manufacturer.name}: {str(e)}")
+            except Exception as e:
+                self.logger.error(f"Unexpected error processing manufacturer {manufacturer.name}: {str(e)}")
+            
+            # Log progress regularly
+            if processed_count % 5 == 0 or processed_count == len(manufacturers_to_process):
+                self.logger.info(f"Progress: {processed_count}/{len(manufacturers_to_process)} " + 
+                               f"manufacturers processed, {success_count} successful")
+            
+            # Add random delay between manufacturers to avoid detection
+            time.sleep(random.uniform(2.0, 5.0))
+        
+        # Update stats
+        batch_end_time = time.time()
+        self.stats['batch_end_time'] = batch_end_time
+        self.stats['batch_duration'] = batch_end_time - batch_start_time
+        self.stats['processed_manufacturers'] = processed_count
+        self.stats['successful_validations'] = success_count
+        
+        # Calculate duration in human-readable format
+        duration = batch_end_time - batch_start_time
+        hours, remainder = divmod(duration, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self.stats["duration"] = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+        
+        self.logger.info(f"Batch processing completed in {self.stats['duration']}")
+        return self.stats
+    
     def display_statistics(self):
         """Display statistics about the website finding process."""
         print("\n" + "=" * 60)

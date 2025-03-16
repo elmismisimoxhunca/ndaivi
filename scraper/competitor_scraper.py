@@ -978,6 +978,137 @@ class CompetitorScraper:
             self.logger.error(f"Error getting top manufacturers: {str(e)}")
             return []
     
+    def process_batch(self, max_pages=None, max_runtime_minutes=None):
+        """
+        Process a batch of URLs with time and page limits.
+        
+        Args:
+            max_pages (int, optional): Maximum number of pages to process in this batch.
+                If None, uses the value from config.
+            max_runtime_minutes (int, optional): Maximum runtime in minutes.
+                If None, runs until max_pages is reached.
+                
+        Returns:
+            dict: Statistics about the batch processing.
+        """
+        self.logger.info(f"Starting batch processing with max_pages={max_pages}, max_runtime_minutes={max_runtime_minutes}")
+        
+        # Initialize stats for this batch
+        self.stats['batch_start_time'] = time.time()
+        self.stats['pages_crawled'] = 0
+        
+        # Initialize the URL queue with the target URL and unvisited URLs from database if empty
+        if not self.url_queue:
+            self._load_initial_urls()
+            self._load_unvisited_urls()
+            
+        # Set max pages (0 means no limit)
+        if max_pages is None:
+            max_pages = self.config['crawling']['max_pages_per_run']
+        
+        # Calculate end time if max_runtime_minutes is specified
+        end_time = None
+        if max_runtime_minutes is not None and max_runtime_minutes > 0:
+            end_time = time.time() + (max_runtime_minutes * 60)
+            self.logger.info(f"Batch will run until {time.strftime('%H:%M:%S', time.localtime(end_time))}")
+        
+        # Process URLs until the queue is empty, we reach the maximum number of pages,
+        # or we exceed the maximum runtime
+        pages_crawled = 0
+        
+        while self.url_queue and (max_pages == 0 or pages_crawled < max_pages):
+            # Check if we've exceeded the maximum runtime
+            if end_time and time.time() >= end_time:
+                self.logger.info(f"Reached maximum runtime of {max_runtime_minutes} minutes")
+                break
+                
+            # Get the next URL from the queue
+            current_url, depth = self.url_queue.pop(0)
+            
+            # Skip if already visited
+            if current_url in self.visited_urls:
+                continue
+                
+            # Update crawl status using our database manager
+            try:
+                with self.db_manager.session() as session:
+                    # Check if URL exists in database
+                    status = session.query(CrawlStatus).filter_by(url=current_url).first()
+                    if not status:
+                        status = CrawlStatus(url=current_url, depth=depth)
+                        session.add(status)
+                    
+                    # Mark as visited
+                    status.visited = True
+                    status.last_visited = datetime.datetime.now()
+                
+                # Add to our in-memory visited set
+                self.visited_urls.add(current_url)
+                
+            except Exception as e:
+                self.logger.warning(f"Error updating URL status: {str(e)}")
+            
+            # Crawl the page
+            self.logger.info(f"Crawling {current_url} at depth {depth}")
+            try:
+                soup, new_urls = self._crawl_page(current_url)
+                
+                # Process the page content
+                if soup:
+                    self._process_page(current_url, soup, depth)
+                    
+                    # Update sitemap info in database if enabled
+                    if self.config['crawling'].get('build_sitemap', False) and soup.title:
+                        try:
+                            with self.db_manager.session() as session:
+                                # Update the CrawlStatus entry with sitemap info
+                                status = session.query(CrawlStatus).filter_by(url=current_url).first()
+                                if status:
+                                    status.title = soup.title.string if soup.title else ""
+                                    status.outgoing_links = len(new_urls)
+                        except Exception as e:
+                            self.logger.warning(f"Error updating sitemap info in database: {str(e)}")
+                
+                # Add new URLs to the queue if we haven't reached max depth
+                if self.config['crawling']['max_depth'] == 0 or depth < self.config['crawling']['max_depth']:
+                    for url in new_urls:
+                        if url not in self.visited_urls:
+                            # Check if already in database using our database manager
+                            try:
+                                with self.db_manager.session() as session:
+                                    existing = session.query(CrawlStatus).filter_by(url=url).first()
+                                    if not existing:
+                                        new_status = CrawlStatus(url=url, depth=depth+1, parent_url=current_url)
+                                        session.add(new_status)
+                            except Exception as e:
+                                self.logger.warning(f"Error adding URL to database: {str(e)}")
+                            
+                            self.url_queue.append((url, depth + 1))
+                
+                pages_crawled += 1
+                
+                # Update stats
+                self.stats['pages_crawled'] = pages_crawled
+                
+                # Log progress every 10 pages
+                if pages_crawled % 10 == 0:
+                    self.logger.info(f"Progress: {pages_crawled} pages crawled, {len(self.url_queue)} URLs in queue")
+                    
+            except Exception as e:
+                self.logger.error(f"Error crawling {current_url}: {str(e)}")
+                import traceback
+                self.logger.debug(f"Crawling error details: {traceback.format_exc()}")
+        
+        # Update stats
+        self.stats['batch_end_time'] = time.time()
+        self.stats['batch_duration'] = self.stats['batch_end_time'] - self.stats['batch_start_time']
+        self.stats['pages_crawled'] = pages_crawled
+        self.stats['urls_in_queue'] = len(self.url_queue)
+        
+        self.logger.info(f"Batch processing completed: {pages_crawled} pages crawled in {self.stats['batch_duration']:.2f} seconds")
+        
+        return self.get_statistics()
+    
     def close(self):
         """Close the scraper and release resources"""
         self.logger.info("Closing scraper and database connections")

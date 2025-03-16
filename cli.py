@@ -260,16 +260,819 @@ def check_database_exists(config: dict) -> bool:
     db_path = config['database']['path']
     return os.path.exists(db_path)
 
+def save_process_status(config, status_data):
+    """
+    Save process status to a file for background tracking.
+    
+    Args:
+        config: Configuration dictionary
+        status_data: Status data to save
+    """
+    status_file = config['scheduling']['background']['status_file']
+    status_dir = os.path.dirname(status_file)
+    os.makedirs(status_dir, exist_ok=True)
+    
+    try:
+        with open(status_file, 'w') as f:
+            json.dump(status_data, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to save process status: {str(e)}")
+
+def load_process_status(config):
+    """
+    Load process status from file.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        Status data dictionary or None if file doesn't exist
+    """
+    status_file = config['scheduling']['background']['status_file']
+    
+    if not os.path.exists(status_file):
+        return None
+    
+    try:
+        with open(status_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load process status: {str(e)}")
+        return None
+
+def is_process_running(pid):
+    """
+    Check if a process with the given PID is running.
+    
+    Args:
+        pid: Process ID to check
+        
+    Returns:
+        True if process is running, False otherwise
+    """
+    try:
+        os.kill(pid, 0)  # Signal 0 doesn't kill the process, just checks if it exists
+        return True
+    except OSError:
+        return False
+
+def save_pid(config, pid):
+    """
+    Save process ID to file.
+    
+    Args:
+        config: Configuration dictionary
+        pid: Process ID to save
+    """
+    pid_file = config['scheduling']['background']['pid_file']
+    pid_dir = os.path.dirname(pid_file)
+    os.makedirs(pid_dir, exist_ok=True)
+    
+    try:
+        with open(pid_file, 'w') as f:
+            f.write(str(pid))
+    except Exception as e:
+        logging.error(f"Failed to save PID: {str(e)}")
+
+def load_pid(config):
+    """
+    Load process ID from file.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        Process ID or None if file doesn't exist
+    """
+    pid_file = config['scheduling']['background']['pid_file']
+    
+    if not os.path.exists(pid_file):
+        return None
+    
+    try:
+        with open(pid_file, 'r') as f:
+            return int(f.read().strip())
+    except Exception as e:
+        logging.error(f"Failed to load PID: {str(e)}")
+        return None
+
+def run_scraper_and_finder(config, max_runtime=None, time_allocation=None, background=False):
+    """
+    Run the scraper and manufacturer website finder sequentially based on time allocation.
+    
+    Args:
+        config: Configuration dictionary
+        max_runtime: Maximum runtime in minutes (overrides config value)
+        time_allocation: Time allocation between scraper and finder (0-100) (overrides config value)
+        background: Whether to run in background mode
+        
+    Returns:
+        Dictionary with status information
+    """
+    logger = logging.getLogger('cli')
+    
+    # Get configuration values or use overrides
+    if max_runtime is None:
+        max_runtime = config['scheduling']['max_runtime_minutes']
+    
+    if time_allocation is None:
+        time_allocation = config['scheduling']['time_allocation']
+    
+    # Calculate time allocation
+    if max_runtime > 0:
+        scraper_time = (time_allocation / 100) * max_runtime
+        finder_time = max_runtime - scraper_time
+    else:
+        scraper_time = 0  # Run without time limit
+        finder_time = 0   # Run without time limit
+    
+    start_time = time.time()
+    checkpoint_interval = config['scheduling']['checkpoint_interval'] * 60  # Convert to seconds
+    last_checkpoint = start_time
+    
+    # Initialize status data
+    status = {
+        "start_time": start_time,
+        "last_update": start_time,
+        "max_runtime_minutes": max_runtime,
+        "time_allocation": time_allocation,
+        "current_stage": "competitor_scraper",
+        "stages_completed": [],
+        "scraper_stats": {},
+        "finder_stats": {},
+        "is_complete": False
+    }
+    
+    if background:
+        save_process_status(config, status)
+    
+    try:
+        # Stage 1: Run competitor scraper
+        logger.info(f"Starting competitor scraper (time allocation: {time_allocation}%)")
+        status["current_stage"] = "competitor_scraper"
+        
+        scraper = CompetitorScraper(config_path=config['config_path'])
+        
+        # Set up timing for scraper
+        scraper_start = time.time()
+        scraper_end_time = None
+        if scraper_time > 0:
+            scraper_end_time = scraper_start + (scraper_time * 60)  # Convert to seconds
+        
+        # Run the competitor scraper with time limit
+        logger.info(f"Running competitor scraper with time limit: {int(scraper_time)} minutes")
+        scraper_stats = scraper.process_batch(
+            max_pages=config['scraper'].get('batch_size', 100),
+            max_runtime_minutes=int(scraper_time) if scraper_time > 0 else None
+        )
+        
+        # Update status with scraper statistics
+        status["scraper_stats"] = scraper_stats
+        status["last_update"] = time.time()
+        
+        # Save checkpoint
+        if background:
+            save_process_status(config, status)
+        
+        # Update status after scraper completes
+        status["stages_completed"].append("competitor_scraper")
+        status["scraper_stats"] = scraper.get_statistics()
+        status["last_update"] = time.time()
+        
+        if background:
+            save_process_status(config, status)
+        
+        # Stage 2: Run manufacturer website finder if time permits
+        if max_runtime == 0 or (time.time() - start_time) / 60 < max_runtime:
+            logger.info("Starting manufacturer website finder")
+            status["current_stage"] = "manufacturer_website_finder"
+            
+            finder = ManufacturerWebsiteFinder(config_path=config['config_path'])
+            
+            # Set up timing for finder
+            finder_start = time.time()
+            finder_end_time = None
+            if finder_time > 0:
+                finder_end_time = finder_start + (finder_time * 60)  # Convert to seconds
+            
+            # Run the manufacturer website finder with time limit
+            logger.info(f"Running manufacturer website finder with time limit: {int(finder_time)} minutes")
+            finder_stats = finder.process_batch(
+                max_pages=config['manufacturer_finder'].get('batch_size', 20),
+                max_runtime_minutes=int(finder_time) if finder_time > 0 else None
+            )
+            
+            # Update status with finder statistics
+            status["finder_stats"] = finder_stats
+            status["last_update"] = time.time()
+            
+            # Save checkpoint
+            if background:
+                save_process_status(config, status)
+            
+            # Update status after finder completes
+            status["stages_completed"].append("manufacturer_website_finder")
+            status["finder_stats"] = finder.stats
+        
+        # Mark process as complete
+        status["is_complete"] = True
+        status["last_update"] = time.time()
+        status["total_runtime_minutes"] = (time.time() - start_time) / 60
+        
+        if background:
+            save_process_status(config, status)
+            
+        return status
+        
+    except Exception as e:
+        logger.error(f"Error in sequential run: {str(e)}")
+        status["error"] = str(e)
+        status["last_update"] = time.time()
+        
+        if background:
+            save_process_status(config, status)
+            
+        raise
+
+def format_time_delta(seconds):
+    """
+    Format time delta in a human-readable format.
+    
+    Args:
+        seconds: Time in seconds
+        
+    Returns:
+        Formatted time string
+    """
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m {seconds}s"
+    elif hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
+
+def display_process_status(config):
+    """
+    Display status of a background process.
+    
+    Args:
+        config: Configuration dictionary
+    """
+    # Check if there's a running process
+    pid = load_pid(config)
+    if pid is None:
+        print("No background process found.")
+        return
+    
+    # Check if the process is still running
+    is_running = is_process_running(pid)
+    
+    # Load status data
+    status = load_process_status(config)
+    if status is None:
+        print(f"Process ID: {pid} ({'Running' if is_running else 'Not running'})")
+        print("No status data available.")
+        return
+    
+    # Calculate runtime
+    current_time = time.time()
+    start_time = status.get("start_time", current_time)
+    last_update = status.get("last_update", current_time)
+    runtime = current_time - start_time
+    time_since_update = current_time - last_update
+    
+    # Display status
+    print("\n" + "=" * 50)
+    print("NDAIVI BACKGROUND PROCESS STATUS")
+    print("=" * 50)
+    print(f"Process ID: {pid} ({'Running' if is_running else 'Not running'})")
+    print(f"Started: {datetime.datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Last update: {datetime.datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S')} ({format_time_delta(time_since_update)} ago)")
+    print(f"Total runtime: {format_time_delta(runtime)}")
+    
+    if status.get("max_runtime_minutes", 0) > 0:
+        max_runtime_seconds = status["max_runtime_minutes"] * 60
+        remaining = max_runtime_seconds - runtime
+        if remaining > 0:
+            print(f"Time remaining: {format_time_delta(remaining)}")
+        else:
+            print("Time limit reached")
+    
+    print(f"Current stage: {status.get('current_stage', 'Unknown')}")
+    print(f"Stages completed: {', '.join(status.get('stages_completed', []))}")
+    print(f"Status: {'Complete' if status.get('is_complete', False) else 'In progress'}")
+    
+    # Display scraper stats if available
+    scraper_stats = status.get("scraper_stats", {})
+    if scraper_stats:
+        print("\nCompetitor Scraper Statistics:")
+        print(f"  URLs crawled: {scraper_stats.get('urls_crawled', 0)}")
+        print(f"  Manufacturer pages: {scraper_stats.get('manufacturer_pages', 0)}")
+        print(f"  Manufacturers extracted: {scraper_stats.get('manufacturers_extracted', 0)}")
+        print(f"  Categories extracted: {scraper_stats.get('categories_extracted', 0)}")
+    
+    # Display finder stats if available
+    finder_stats = status.get("finder_stats", {})
+    if finder_stats:
+        print("\nManufacturer Website Finder Statistics:")
+        print(f"  Total manufacturers: {finder_stats.get('total_manufacturers', 0)}")
+        print(f"  Manufacturers with website: {finder_stats.get('manufacturers_with_website', 0)}")
+        print(f"  Claude found: {finder_stats.get('claude_found', 0)}")
+        print(f"  Search engine found: {finder_stats.get('search_engine_found', 0)}")
+    
+    print("=" * 50 + "\n")
+
+def interactive_mode(config):
+    """
+    Run the CLI in interactive mode, prompting the user for commands.
+    
+    Args:
+        config: Configuration dictionary
+    """
+    logger = logging.getLogger('cli')
+    logger.info("Starting interactive mode")
+    
+    print("\n" + "=" * 60)
+    print("NDAIVI INTERACTIVE MODE")
+    print("=" * 60)
+    print("Type 'help' for available commands or 'exit' to quit.")
+    
+    while True:
+        try:
+            command = input("\nndaivi> ").strip().lower()
+            
+            if command == 'exit' or command == 'quit':
+                print("Exiting NDAIVI CLI...")
+                break
+                
+            elif command == 'help':
+                print("\nAvailable commands:")
+                print("  scrape [--max-pages N] [--background]\t\tStart the competitor scraper")
+                print("  find-websites [--limit N]\t\t\tFind manufacturer websites")
+                print("  run-all [--time-allocation N] [--max-runtime N] [--background]\tRun scraper and finder sequentially")
+                print("  status\t\t\t\t\tCheck status of background process")
+                print("  stop\t\t\t\t\tStop background process")
+                print("  resume\t\t\t\t\tResume background process")
+                print("  stats\t\t\t\t\tDisplay database statistics")
+                print("  list-manufacturers [--limit N] [--with-categories]\tList manufacturers")
+                print("  list-categories [--limit N] [--with-manufacturers]\tList categories")
+                print("  search <term> [--type manufacturer|category]\t\tSearch the database")
+                print("  export [--output PATH]\t\t\tExport database to JSON")
+                print("  validate\t\t\t\t\tValidate database consistency")
+                print("  generate-sitemap [--format json|xml|both]\t\tGenerate sitemap files")
+                print("  help\t\t\t\t\tShow this help message")
+                print("  exit\t\t\t\t\tExit the program")
+            
+            elif command.startswith('scrape'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                max_pages = None
+                background = False
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--max-pages' and i + 1 < len(args):
+                        try:
+                            max_pages = int(args[i + 1])
+                            i += 2
+                        except ValueError:
+                            print("Error: --max-pages requires a number")
+                            break
+                    elif args[i] == '--background':
+                        background = True
+                        i += 1
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                # Start the scraper
+                print(f"Starting competitor scraper{' in background' if background else ''}...")
+                scraper = CompetitorScraper(config_path=config['config_path'])
+                
+                if background:
+                    # Fork a new process for background operation using double-fork pattern
+                    try:
+                        # First fork to create child process
+                        pid = os.fork()
+                        if pid > 0:
+                            # Parent process
+                            print(f"Scraper started in background with PID {pid}")
+                            save_pid(config, pid)
+                        else:
+                            # Child process - create a second fork to fully detach
+                            pid2 = os.fork()
+                            if pid2 > 0:
+                                # Exit first child immediately
+                                os._exit(0)
+                            else:
+                                # Grandchild process (now fully detached)
+                                try:
+                                    # Detach from terminal
+                                    os.setsid()
+                                    # Close standard file descriptors
+                                    os.close(0)
+                                    os.close(1)
+                                    os.close(2)
+                                    # Redirect to /dev/null and log files
+                                    sys.stdin = open(os.devnull, 'r')
+                                    sys.stdout = open(os.path.join('logs', 'scraper_background.log'), 'a')
+                                    sys.stderr = open(os.path.join('logs', 'scraper_background_error.log'), 'a')
+                                    
+                                    # Run the actual process
+                                    scraper.start_crawling(max_pages=max_pages)
+                                    sys.exit(0)
+                                except Exception as e:
+                                    logger.error(f"Error in background scraper: {str(e)}")
+                                    sys.exit(1)
+                        # Wait for the first child to exit
+                        if pid == 0:
+                            os._exit(0)
+                        os.waitpid(pid, 0)
+                    except OSError as e:
+                        logger.error(f"Failed to fork process: {str(e)}")
+                        print(f"Error starting background process: {str(e)}")
+                else:
+                    # Run in foreground
+                    try:
+                        scraper.start_crawling(max_pages=max_pages)
+                        print("Scraper completed.")
+                        display_statistics(config)
+                    except Exception as e:
+                        logger.error(f"Error in scraper: {str(e)}")
+                        print(f"Error: {str(e)}")
+            
+            elif command.startswith('find-websites'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                limit = None
+                background = False
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--limit' and i + 1 < len(args):
+                        try:
+                            limit = int(args[i + 1])
+                            i += 2
+                        except ValueError:
+                            print("Error: --limit requires a number")
+                            break
+                    elif args[i] == '--background':
+                        background = True
+                        i += 1
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                # Start the manufacturer website finder
+                print(f"Starting manufacturer website finder{' in background' if background else ''}...")
+                finder = ManufacturerWebsiteFinder(config_path=config['config_path'])
+                
+                if background:
+                    # Fork a new process for background operation using double-fork pattern
+                    try:
+                        # First fork to create child process
+                        pid = os.fork()
+                        if pid > 0:
+                            # Parent process
+                            print(f"Manufacturer website finder started in background with PID {pid}")
+                            save_pid(config, pid)
+                        else:
+                            # Child process - create a second fork to fully detach
+                            pid2 = os.fork()
+                            if pid2 > 0:
+                                # Exit first child immediately
+                                os._exit(0)
+                            else:
+                                # Grandchild process (now fully detached)
+                                try:
+                                    # Detach from terminal
+                                    os.setsid()
+                                    # Close standard file descriptors
+                                    os.close(0)
+                                    os.close(1)
+                                    os.close(2)
+                                    # Redirect to /dev/null and log files
+                                    sys.stdin = open(os.devnull, 'r')
+                                    sys.stdout = open(os.path.join('logs', 'finder_background.log'), 'a')
+                                    sys.stderr = open(os.path.join('logs', 'finder_background_error.log'), 'a')
+                                    
+                                    # Run the actual process
+                                    finder.find_websites(limit=limit)
+                                    sys.exit(0)
+                                except Exception as e:
+                                    logger.error(f"Error in background finder: {str(e)}")
+                                    sys.exit(1)
+                        # Wait for the first child to exit
+                        if pid == 0:
+                            os._exit(0)
+                        os.waitpid(pid, 0)
+                    except OSError as e:
+                        logger.error(f"Failed to fork process: {str(e)}")
+                        print(f"Error starting background process: {str(e)}")
+                else:
+                    # Run in foreground
+                    try:
+                        finder.find_websites(limit=limit)
+                        print("Manufacturer website finder completed.")
+                        display_statistics(config)
+                    except Exception as e:
+                        logger.error(f"Error in finder: {str(e)}")
+                        print(f"Error: {str(e)}")
+            
+            elif command.startswith('run-all'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                time_allocation = None
+                max_runtime = None
+                background = False
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--time-allocation' and i + 1 < len(args):
+                        try:
+                            time_allocation = int(args[i + 1])
+                            if time_allocation < 0 or time_allocation > 100:
+                                print("Error: --time-allocation must be between 0 and 100")
+                                break
+                            i += 2
+                        except ValueError:
+                            print("Error: --time-allocation requires a number")
+                            break
+                    elif args[i] == '--max-runtime' and i + 1 < len(args):
+                        try:
+                            max_runtime = int(args[i + 1])
+                            i += 2
+                        except ValueError:
+                            print("Error: --max-runtime requires a number")
+                            break
+                    elif args[i] == '--background':
+                        background = True
+                        i += 1
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                # Run scraper and finder sequentially
+                print(f"Starting sequential run{' in background' if background else ''}...")
+                
+                if background:
+                    # Fork a new process for background operation
+                    try:
+                        # First fork to create child process
+                        pid = os.fork()
+                        if pid > 0:
+                            # Parent process
+                            print(f"Sequential run started in background with PID {pid}")
+                            save_pid(config, pid)
+                        else:
+                            # Child process - create a second fork to fully detach
+                            pid2 = os.fork()
+                            if pid2 > 0:
+                                # Exit first child immediately
+                                os._exit(0)
+                            else:
+                                # Grandchild process (now fully detached)
+                                try:
+                                    # Detach from terminal
+                                    os.setsid()
+                                    # Close standard file descriptors
+                                    os.close(0)
+                                    os.close(1)
+                                    os.close(2)
+                                    # Redirect to /dev/null
+                                    sys.stdin = open(os.devnull, 'r')
+                                    sys.stdout = open(os.path.join('logs', 'background_process.log'), 'a')
+                                    sys.stderr = open(os.path.join('logs', 'background_process_error.log'), 'a')
+                                    
+                                    # Run the actual process
+                                    run_scraper_and_finder(
+                                        config,
+                                        max_runtime=max_runtime,
+                                        time_allocation=time_allocation,
+                                        background=True
+                                    )
+                                    sys.exit(0)
+                                except Exception as e:
+                                    logger.error(f"Error in background process: {str(e)}")
+                                    sys.exit(1)
+                        # Wait for the first child to exit
+                        if pid == 0:
+                            os._exit(0)
+                        os.waitpid(pid, 0)
+                    except OSError as e:
+                        logger.error(f"Failed to fork process: {str(e)}")
+                        print(f"Error starting background process: {str(e)}")
+                else:
+                    # Run in foreground
+                    try:
+                        status = run_scraper_and_finder(
+                            config,
+                            max_runtime=max_runtime,
+                            time_allocation=time_allocation,
+                            background=False
+                        )
+                        print("Sequential run completed.")
+                        display_statistics(config)
+                    except Exception as e:
+                        logger.error(f"Error in sequential run: {str(e)}")
+                        print(f"Error: {str(e)}")
+            
+            elif command == 'status':
+                display_process_status(config)
+                
+            elif command == 'stop':
+                pid = load_pid(config)
+                if pid and is_process_running(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        print(f"Sent termination signal to process {pid}")
+                    except Exception as e:
+                        logger.error(f"Error stopping process: {str(e)}")
+                        print(f"Error stopping process: {str(e)}")
+                else:
+                    print("No running process found")
+                    
+            elif command == 'resume':
+                status_data = load_process_status(config)
+                if not status_data:
+                    print("No saved process status found")
+                    continue
+                    
+                print("Resuming previous process...")
+                # TODO: Implement resume functionality
+                print("Resume functionality not yet implemented")
+                
+            elif command == 'stats':
+                display_statistics(config)
+                
+            elif command.startswith('list-manufacturers'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                limit = None
+                with_categories = False
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--limit' and i + 1 < len(args):
+                        try:
+                            limit = int(args[i + 1])
+                            i += 2
+                        except ValueError:
+                            print("Error: --limit requires a number")
+                            break
+                    elif args[i] == '--with-categories':
+                        with_categories = True
+                        i += 1
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                list_manufacturers(config, limit, with_categories)
+                
+            elif command.startswith('list-categories'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                limit = None
+                with_manufacturers = False
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--limit' and i + 1 < len(args):
+                        try:
+                            limit = int(args[i + 1])
+                            i += 2
+                        except ValueError:
+                            print("Error: --limit requires a number")
+                            break
+                    elif args[i] == '--with-manufacturers':
+                        with_manufacturers = True
+                        i += 1
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                list_categories(config, limit, with_manufacturers)
+                
+            elif command.startswith('search '):
+                parts = command.split()
+                if len(parts) < 2:
+                    print("Error: search requires a term")
+                    continue
+                    
+                term = parts[1]
+                entity_type = None
+                
+                if len(parts) > 2 and parts[2] == '--type' and len(parts) > 3:
+                    if parts[3] in ['manufacturer', 'category']:
+                        entity_type = parts[3]
+                    else:
+                        print(f"Error: Invalid type '{parts[3]}'. Use 'manufacturer' or 'category'")
+                        continue
+                
+                search_database(config, term, entity_type)
+                
+            elif command.startswith('export'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                output_path = 'output/database_export.json'  # Default path
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--output' and i + 1 < len(args):
+                        output_path = args[i + 1]
+                        i += 2
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                success, message = export_database_to_json(config['database']['path'], output_path)
+                print(message)
+                
+            elif command == 'validate':
+                issues = validate_database_consistency(config['database']['path'])
+                if issues:
+                    print("Found database consistency issues:")
+                    for issue in issues:
+                        print(f"  - {issue}")
+                else:
+                    print("No database consistency issues found")
+                    
+            elif command.startswith('generate-sitemap'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                format_type = 'both'  # Default format
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--format' and i + 1 < len(args):
+                        if args[i + 1] in ['json', 'xml', 'both']:
+                            format_type = args[i + 1]
+                            i += 2
+                        else:
+                            print(f"Error: Invalid format '{args[i + 1]}'. Use 'json', 'xml', or 'both'")
+                            break
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                print("Generating sitemap files from database...")
+                scraper = CompetitorScraper(config_path=config['config_path'])
+                scraper.generate_sitemap_files(format_type=format_type)
+                print("Sitemap generation completed.")
+                
+            else:
+                print(f"Unknown command: {command}")
+                print("Type 'help' for available commands.")
+                
+        except KeyboardInterrupt:
+            print("\nOperation interrupted. Type 'exit' to quit.")
+        except Exception as e:
+            logger.error(f"Error in interactive mode: {str(e)}")
+            print(f"Error: {str(e)}")
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='NDAIVI Competitor Scraper CLI')
     parser.add_argument('--config', default='config.yaml', help='Path to configuration file')
+    parser.add_argument('--interactive', '-i', action='store_true', help='Run in interactive mode')
     
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
-    # Start command
-    start_parser = subparsers.add_parser('start', help='Start the scraper')
-    start_parser.add_argument('--max-pages', type=int, help='Maximum number of pages to crawl')
+    # Scrape command (replaces 'start')
+    scrape_parser = subparsers.add_parser('scrape', help='Start the competitor scraper')
+    scrape_parser.add_argument('--max-pages', type=int, help='Maximum number of pages to crawl')
+    scrape_parser.add_argument('--background', action='store_true', help='Run in background mode')
+    
+    # Find websites command
+    find_websites_parser = subparsers.add_parser('find-websites', help='Find manufacturer websites')
+    find_websites_parser.add_argument('--limit', type=int, help='Limit the number of manufacturers to process')
+    find_websites_parser.add_argument('--background', action='store_true', help='Run in background mode')
+    
+    # Run-all command (replaces 'run')
+    run_all_parser = subparsers.add_parser('run-all', help='Run scraper and manufacturer website finder sequentially')
+    run_all_parser.add_argument('--time-allocation', type=int, choices=range(0, 101), metavar='[0-100]',
+                           help='Time allocation between scraper and finder (0-100, higher values favor scraper)')
+    run_all_parser.add_argument('--max-runtime', type=int, help='Maximum runtime in minutes')
+    run_all_parser.add_argument('--background', action='store_true', help='Run in background mode')
+    
+    # Background commands
+    background_parser = subparsers.add_parser('background', help='Background process commands')
+    background_subparsers = background_parser.add_subparsers(dest='bg_command', help='Background command')
+    
+    # Status command
+    status_parser = background_subparsers.add_parser('status', help='Check status of background process')
+    
+    # Stop command
+    stop_parser = background_subparsers.add_parser('stop', help='Stop background process')
+    
+    # Resume command
+    resume_parser = background_subparsers.add_parser('resume', help='Resume background process')
     
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Display statistics')
@@ -317,6 +1120,9 @@ def main():
         # Load configuration
         config = load_config(args.config)
         
+        # Store config path in config dict for use in other functions
+        config['config_path'] = args.config
+        
         # Check if database exists before any command that requires it
         # Exclude init-db command which handles its own database check
         if args.command not in [None, 'init-db'] and not check_database_exists(config):
@@ -331,10 +1137,16 @@ def main():
                 initialize_database(args.config, db_path)
                 # Reload config in case the path was changed
                 config = load_config(args.config)
+                config['config_path'] = args.config
             else:
                 print("Database initialization canceled. Use 'init-db' command to initialize the database later.")
                 return
         
+        # Check for interactive mode first
+        if args.interactive:
+            interactive_mode(config)
+            return
+            
         if args.command == 'init-db':
             # Initialize database with custom path if provided
             try:
@@ -345,8 +1157,8 @@ def main():
                 print(f"Error initializing database: {str(e)}")
                 sys.exit(1)
         
-        elif args.command == 'start':
-            # Override max pages if specified
+        elif args.command == 'scrape':
+            # Start the competitor scraper (replaces 'start')
             if args.max_pages:
                 config['crawling']['max_pages_per_run'] = args.max_pages
             
@@ -355,7 +1167,284 @@ def main():
             scraper.start_crawling()
             display_statistics(config)
             scraper.close()
+        
+        elif args.command == 'find-websites':
+            # Find manufacturer websites
+            print(f"Starting manufacturer website finder{' in background' if args.background else ''}...")
             
+            # Check if we should run in background mode
+            if args.background:
+                # Check if there's already a background process running
+                pid = load_pid(config)
+                if pid and is_process_running(pid):
+                    print(f"⚠️ Background process already running with PID {pid}")
+                    print("Use 'background status' to check its status or 'background stop' to stop it.")
+                    return
+                
+                # Fork a new process using double-fork pattern
+                try:
+                    # First fork to create child process
+                    pid = os.fork()
+                    if pid > 0:
+                        # Parent process
+                        print(f"Started background process with PID {pid}")
+                        print("Use 'background status' to check its status.")
+                        # Save PID to file
+                        save_pid(config, pid)
+                        return
+                    else:
+                        # Child process - create a second fork to fully detach
+                        pid2 = os.fork()
+                        if pid2 > 0:
+                            # Exit first child immediately
+                            os._exit(0)
+                        else:
+                            # Grandchild process (now fully detached)
+                            # Detach from terminal
+                            os.setsid()
+                            os.umask(0)
+                            # Close file descriptors
+                            os.close(0)
+                            os.close(1)
+                            os.close(2)
+                            # Redirect to log files
+                            sys.stdin = open(os.devnull, 'r')
+                            sys.stdout = open(os.path.join('logs', 'finder_background.log'), 'a')
+                            sys.stderr = open(os.path.join('logs', 'finder_background_error.log'), 'a')
+                except OSError as e:
+                    logger.error(f"Failed to fork process: {str(e)}")
+                    print(f"Error starting background process: {str(e)}")
+                    return
+            
+            try:
+                # Initialize the finder
+                finder = ManufacturerWebsiteFinder(config_path=args.config)
+                # Find websites
+                finder.find_websites(limit=args.limit)
+                
+                if not args.background:
+                    print("\nManufacturer website finder completed successfully.")
+                    display_statistics(config)
+                    
+                # If we're in the child process, exit
+                if args.background and os.getpid() != os.getppid():
+                    sys.exit(0)
+                    
+            except Exception as e:
+                logger.error(f"Error in manufacturer website finder: {str(e)}")
+                print(f"Error: {str(e)}")
+                if args.background and os.getpid() != os.getppid():
+                    sys.exit(1)
+        
+        elif args.command == 'run-all':
+            # Run scraper and manufacturer website finder sequentially
+            print(f"Starting sequential run of competitor scraper and manufacturer website finder{' in background' if args.background else ''}...")
+            
+            # Check if we should run in background mode
+            if args.background:
+                # Check if there's already a background process running
+                pid = load_pid(config)
+                if pid and is_process_running(pid):
+                    print(f"⚠️ Background process already running with PID {pid}")
+                    print("Use 'background status' to check its status or 'background stop' to stop it.")
+                    return
+                
+                # Fork a new process using double-fork pattern
+                try:
+                    # First fork to create child process
+                    pid = os.fork()
+                    if pid > 0:
+                        # Parent process
+                        print(f"Started background process with PID {pid}")
+                        print("Use 'background status' to check its status.")
+                        # Save PID to file
+                        save_pid(config, pid)
+                        return
+                    else:
+                        # Child process - create a second fork to fully detach
+                        pid2 = os.fork()
+                        if pid2 > 0:
+                            # Exit first child immediately
+                            os._exit(0)
+                        else:
+                            # Grandchild process (now fully detached)
+                            # Detach from terminal
+                            os.setsid()
+                            os.umask(0)
+                            # Close file descriptors
+                            os.close(0)
+                            os.close(1)
+                            os.close(2)
+                            # Redirect to log files
+                            sys.stdin = open(os.devnull, 'r')
+                            sys.stdout = open(os.path.join('logs', 'finder_background.log'), 'a')
+                            sys.stderr = open(os.path.join('logs', 'finder_background_error.log'), 'a')
+                except OSError as e:
+                    logger.error(f"Failed to fork process: {str(e)}")
+                    print(f"Error starting background process: {str(e)}")
+                    return
+            
+            try:
+                # Run the sequential process
+                run_scraper_and_finder(
+                    config,
+                    max_runtime=args.max_runtime,
+                    time_allocation=args.time_allocation,
+                    background=args.background
+                )
+                
+                if not args.background:
+                    print("\nSequential run completed successfully.")
+                    display_statistics(config)
+                    
+                # If we're in the child process, exit
+                if args.background and os.getpid() != os.getppid():
+                    sys.exit(0)
+                    
+            except Exception as e:
+                logger.error(f"Error in sequential run: {str(e)}")
+                print(f"Error in sequential run: {str(e)}")
+                if args.background and os.getpid() != os.getppid():
+                    sys.exit(1)
+        
+        elif args.command == 'background':
+            if args.bg_command == 'status':
+                # Display status of background process
+                display_process_status(config)
+                
+            elif args.bg_command == 'stop':
+                # Stop background process
+                pid = load_pid(config)
+                if pid is None:
+                    print("No background process found.")
+                    return
+                
+                if not is_process_running(pid):
+                    print(f"Process with PID {pid} is not running.")
+                    # Clean up PID file
+                    os.remove(config['scheduling']['background']['pid_file'])
+                    return
+                
+                # Try to terminate the process gracefully
+                try:
+                    os.kill(pid, 15)  # SIGTERM
+                    print(f"Sent termination signal to process {pid}.")
+                    
+                    # Wait for process to terminate
+                    for _ in range(5):
+                        time.sleep(1)
+                        if not is_process_running(pid):
+                            print(f"Process {pid} terminated successfully.")
+                            # Clean up PID file
+                            os.remove(config['scheduling']['background']['pid_file'])
+                            return
+                    
+                    # If process didn't terminate, ask to force kill
+                    print(f"Process {pid} is still running. Force kill? (y/n): ", end='')
+                    if input().lower() == 'y':
+                        os.kill(pid, 9)  # SIGKILL
+                        print(f"Sent kill signal to process {pid}.")
+                        # Clean up PID file
+                        os.remove(config['scheduling']['background']['pid_file'])
+                    else:
+                        print("Process not killed.")
+                        
+                except OSError as e:
+                    logger.error(f"Failed to terminate process: {str(e)}")
+                    print(f"Error terminating process: {str(e)}")
+                    
+            elif args.bg_command == 'resume':
+                # Resume background process
+                status = load_process_status(config)
+                if status is None:
+                    print("No saved process state found to resume.")
+                    return
+                
+                # Check if there's already a background process running
+                pid = load_pid(config)
+                if pid and is_process_running(pid):
+                    print(f"⚠️ Background process already running with PID {pid}")
+                    print("Use 'background status' to check its status or 'background stop' to stop it.")
+                    return
+                
+                print("Resuming background process...")
+                
+                # Fork a new process using double-fork pattern
+                try:
+                    # First fork to create child process
+                    pid = os.fork()
+                    if pid > 0:
+                        # Parent process
+                        print(f"Started background process with PID {pid}")
+                        print("Use 'background status' to check its status.")
+                        # Save PID to file
+                        save_pid(config, pid)
+                        return
+                    else:
+                        # Child process - create a second fork to fully detach
+                        pid2 = os.fork()
+                        if pid2 > 0:
+                            # Exit first child immediately
+                            os._exit(0)
+                        else:
+                            # Grandchild process (now fully detached)
+                            # Detach from terminal
+                            os.setsid()
+                            os.umask(0)
+                            # Close file descriptors
+                            os.close(0)
+                            os.close(1)
+                            os.close(2)
+                            # Redirect to log files
+                            sys.stdin = open(os.devnull, 'r')
+                            sys.stdout = open(os.path.join('logs', 'finder_background.log'), 'a')
+                            sys.stderr = open(os.path.join('logs', 'finder_background_error.log'), 'a')
+                except OSError as e:
+                    logger.error(f"Failed to fork process: {str(e)}")
+                    print(f"Error starting background process: {str(e)}")
+                    return
+                
+                try:
+                    # Resume the sequential process based on saved state
+                    current_stage = status.get('current_stage', 'competitor_scraper')
+                    stages_completed = status.get('stages_completed', [])
+                    
+                    # Determine what to run based on saved state
+                    if 'competitor_scraper' not in stages_completed and current_stage == 'competitor_scraper':
+                        # Resume from competitor scraper
+                        run_scraper_and_finder(
+                            config,
+                            max_runtime=status.get('max_runtime_minutes'),
+                            time_allocation=status.get('time_allocation'),
+                            background=True
+                        )
+                    elif 'competitor_scraper' in stages_completed and current_stage == 'manufacturer_website_finder':
+                        # Resume from manufacturer website finder
+                        finder = ManufacturerWebsiteFinder(config_path=config['config_path'])
+                        finder.find_websites()
+                        
+                        # Update status
+                        status["stages_completed"].append("manufacturer_website_finder")
+                        status["finder_stats"] = finder.stats
+                        status["is_complete"] = True
+                        status["last_update"] = time.time()
+                        save_process_status(config, status)
+                    else:
+                        # Both stages completed or unknown state
+                        logger.error(f"Cannot resume from unknown state: {current_stage}")
+                        sys.exit(1)
+                    
+                    # If we're in the child process, exit
+                    if os.getpid() != os.getppid():
+                        sys.exit(0)
+                        
+                except Exception as e:
+                    logger.error(f"Error resuming process: {str(e)}")
+                    if os.getpid() != os.getppid():
+                        sys.exit(1)
+            else:
+                print("Unknown background command. Use 'status', 'stop', or 'resume'.")
+        
         elif args.command == 'stats':
             display_statistics(config)
             
