@@ -5,8 +5,9 @@
 manuals.db.backup 
 manuals.db-shm
 manuals.db-wal
-scraper.logs
+scraper.log
 __pycache__/
 *.py[cod]
 *$py.class
 *.log
+*pycache
