@@ -208,6 +208,28 @@ def main():
     
     # Initialize the scraper
     try:
+        # Ensure database exists with all required tables before initializing the scraper
+        logger.info("Ensuring database exists with all required tables...")
+        from database.schema import init_db
+        
+        # Load config to get database path
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+            
+        db_path = config['database']['path']
+        
+        # Create database directory if it doesn't exist
+        db_dir = os.path.dirname(db_path)
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+            logger.info(f"Created database directory {db_dir}")
+        
+        # Initialize database if it doesn't exist
+        if not os.path.exists(db_path):
+            logger.info(f"Database not found. Initializing database at {db_path}")
+            init_db(db_path, config_path=args.config)
+            logger.info("Database initialized successfully")
+        
         global scraper_instance
         scraper_instance = CompetitorScraper(config_path=args.config)
         

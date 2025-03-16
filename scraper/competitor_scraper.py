@@ -35,7 +35,23 @@ class CompetitorScraper:
         # Initialize database with our singleton database manager
         # This prevents race conditions and database locks
         try:
-            # Get the database manager singleton
+            # First, ensure the database exists with all required tables
+            from database.schema import init_db
+            db_path = self.config['database']['path']
+            
+            # Create database directory if it doesn't exist
+            db_dir = os.path.dirname(db_path)
+            if not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+                self.logger.info(f"Created database directory {db_dir}")
+            
+            # Initialize database if it doesn't exist or force initialization
+            if not os.path.exists(db_path):
+                self.logger.info(f"Database not found. Initializing database at {db_path}")
+                init_db(db_path, config_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml'))
+                self.logger.info("Database initialized successfully")
+            
+            # Now get the database manager singleton
             self.db_manager = get_db_manager(self.config['database']['path'])
             # Ensure the database manager is actually initialized
             if not hasattr(self.db_manager, '_initialized') or not self.db_manager._initialized:
@@ -161,6 +177,37 @@ class CompetitorScraper:
         # Log to file only first to avoid any startup database contention issues
         self.logger.info("Starting crawling process")
         
+        # Create a new session record in the database
+        try:
+            with self.db_manager.session() as session:
+                # Create a new scraper session
+                self.current_session = ScraperSession(
+                    session_type='scraper',
+                    status='running',
+                    max_pages=self.config['crawling']['max_pages_per_run']
+                )
+                session.add(self.current_session)
+                # Get the session ID after commit
+                session.flush()
+                self.session_id = self.current_session.id
+                self.logger.info(f"Created new scraper session with ID {self.session_id}")
+        except Exception as e:
+            self.logger.error(f"Failed to create scraper session: {str(e)}")
+            # Continue anyway - we'll try to recover
+            self.session_id = None
+        
+        # Register signal handlers for graceful shutdown
+        import signal
+        self.shutdown_requested = False
+        
+        def handle_shutdown_signal(sig, frame):
+            self.logger.info(f"Received shutdown signal {sig}, finishing gracefully...")
+            self.shutdown_requested = True
+        
+        # Register signal handlers
+        signal.signal(signal.SIGINT, handle_shutdown_signal)  # Ctrl+C
+        signal.signal(signal.SIGTERM, handle_shutdown_signal)  # kill command
+        
         # CRITICAL: Don't attempt database logging for startup - it can cause deadlocks
         # with other components. We've already logged to the file, which is sufficient.
         # Database logging will continue for other operations after startup is complete.
@@ -211,10 +258,16 @@ class CompetitorScraper:
         pages_crawled = 0
         
         # Process URLs until the queue is empty or we reach the maximum number of pages
+        # or a shutdown is requested
         url_batch_count = 0  # Counter for batch processing
         batch_size = 10  # Number of URLs to process before committing
         
-        while self.url_queue and (max_pages == 0 or pages_crawled < max_pages):
+        # Initialize session statistics
+        urls_processed = 0
+        manufacturers_extracted = 0
+        categories_extracted = 0
+        
+        while self.url_queue and (max_pages == 0 or pages_crawled < max_pages) and not self.shutdown_requested:
             # Get the next URL from the queue
             current_url, depth = self.url_queue.pop(0)
             
@@ -317,21 +370,41 @@ class CompetitorScraper:
             self._log_to_db("INFO", f"Updated sitemap information for {sitemap_entries} pages in database")
         
         self.stats['end_time'] = time.time()
-        self.logger.info(f"Crawling finished. Processed {pages_crawled} pages.")
-        self._log_to_db("INFO", f"Crawling finished. Processed {pages_crawled} pages.")
+        
+        # Determine if the crawling was interrupted or completed normally
+        status = 'interrupted' if self.shutdown_requested else 'completed'
+        status_message = "Crawling interrupted by user" if self.shutdown_requested else f"Crawling finished. Processed {pages_crawled} pages."
+        
+        self.logger.info(status_message)
+        self._log_to_db("INFO", status_message)
         
         # Update stats using database manager
         try:
             with self.db_manager.session() as session:
                 manufacturers_count = session.query(Manufacturer).count()
                 categories_count = session.query(Category).count()
+                manufacturers_with_website = session.query(Manufacturer).filter(Manufacturer.website != None).count()
+                
                 self.stats['manufacturers_found'] = manufacturers_count
                 self.stats['categories_found'] = categories_count
+                self.stats['manufacturers_with_website'] = manufacturers_with_website
+                
+                # Update the session record if we created one
+                if hasattr(self, 'session_id') and self.session_id is not None:
+                    scraper_session = session.query(ScraperSession).filter_by(id=self.session_id).first()
+                    if scraper_session:
+                        scraper_session.end_time = datetime.datetime.now()
+                        scraper_session.status = status
+                        scraper_session.urls_processed = pages_crawled
+                        scraper_session.manufacturers_extracted = self.stats.get('manufacturers_extracted', 0)
+                        scraper_session.categories_extracted = self.stats.get('categories_extracted', 0)
+                        self.logger.info(f"Updated scraper session {self.session_id} with status '{status}'.")
         except Exception as e:
-            self.logger.warning(f"Error getting stats: {str(e)}")
+            self.logger.warning(f"Error updating stats and session: {str(e)}")
             # Set default values if query fails
             self.stats['manufacturers_found'] = 0
             self.stats['categories_found'] = 0
+            self.stats['manufacturers_with_website'] = 0
         
         return pages_crawled
     
@@ -828,6 +901,16 @@ class CompetitorScraper:
                 # Get manufacturer website
                 manufacturer_website = mfr_data.get('website')
                 
+                # Skip website if it's the same domain as our target (competitor) website
+                if manufacturer_website:
+                    target_domain = urlparse(self.config['target_url']).netloc
+                    website_domain = urlparse(manufacturer_website).netloc
+                    
+                    # Check if website is the same domain as our target or contains the target domain
+                    if target_domain in website_domain:
+                        self.logger.info(f"Skipping website {manufacturer_website} for {manufacturer_name} - matches target domain")
+                        manufacturer_website = None
+                
                 # Only use source_url as a fallback if it's likely a manufacturer website
                 if not manufacturer_website:
                     source_domain = urlparse(source_url).netloc
@@ -836,7 +919,7 @@ class CompetitorScraper:
                     if manufacturer_name.lower() in source_domain.lower() and source_domain != target_domain:
                         manufacturer_website = source_url
                     else:
-                            manufacturer_website = None
+                        manufacturer_website = None
                 
                 # Add this manufacturer to our processed list
                 processed_manufacturers.append({
@@ -1112,6 +1195,18 @@ class CompetitorScraper:
     def close(self):
         """Close the scraper and release resources"""
         self.logger.info("Closing scraper and database connections")
+        
+        # If we have an active session that wasn't properly closed, mark it as interrupted
+        if hasattr(self, 'session_id') and self.session_id is not None:
+            try:
+                with self.db_manager.session() as session:
+                    scraper_session = session.query(ScraperSession).filter_by(id=self.session_id).first()
+                    if scraper_session and scraper_session.status == 'running':
+                        scraper_session.status = 'interrupted'
+                        scraper_session.end_time = datetime.datetime.now()
+                        self.logger.info(f"Marked session {self.session_id} as interrupted during close")
+            except Exception as e:
+                self.logger.error(f"Error updating session status during close: {str(e)}")
         
         # Explicitly call the database manager's shutdown method to ensure
         # all connections are properly closed

@@ -4,11 +4,13 @@ import sys
 import argparse
 import time
 import yaml
+import json
+import datetime
 import logging
 from scraper.competitor_scraper import CompetitorScraper
 from manufacturer_website_finder import ManufacturerWebsiteFinder
 from utils import load_config, validate_database_consistency, export_database_to_json
-from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog
+from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -37,46 +39,252 @@ def get_db_session(config):
     Session = sessionmaker(bind=engine)
     return Session()
 
-def display_statistics(config):
-    """Display statistics about the database"""
+def list_sessions(config: dict, session_type: str = None, limit: int = 10) -> None:
+    """
+    List past scraper sessions with detailed information
+    
+    Args:
+        config: Application configuration dictionary
+        session_type: Type of sessions to list ('scraper' or 'finder')
+        limit: Maximum number of sessions to display
+    """
     session = get_db_session(config)
     
     try:
-        # Get counts
-        total_urls = session.query(CrawlStatus).count()
-        visited_urls = session.query(CrawlStatus).filter_by(visited=True).count()
-        manufacturer_pages = session.query(CrawlStatus).filter_by(is_manufacturer_page=True).count()
+        # Build query
+        query = session.query(ScraperSession)
+        
+        # Filter by type if specified
+        if session_type in ['scraper', 'finder']:
+            query = query.filter_by(session_type=session_type)
+        
+        # Get the most recent sessions
+        sessions = query.order_by(ScraperSession.start_time.desc()).limit(limit).all()
+        
+        if not sessions:
+            print(f"No {'scraper ' if session_type == 'scraper' else ''}{'finder ' if session_type == 'finder' else ''}sessions found in database.")
+            return
+        
+        print("\n" + "=" * 80)
+        print(f"RECENT {'SCRAPER ' if session_type == 'scraper' else ''}{'FINDER ' if session_type == 'finder' else ''}SESSIONS")
+        print("=" * 80)
+        
+        for i, s in enumerate(sessions, 1):
+            # Calculate duration if session has ended
+            duration_str = "N/A"
+            if s.end_time:
+                duration = (s.end_time - s.start_time).total_seconds()
+                hours = int(duration // 3600)
+                minutes = int((duration % 3600) // 60)
+                seconds = int(duration % 60)
+                duration_str = f"{hours}h {minutes}m {seconds}s"
+            
+            # Determine what statistics to show based on session type
+            stats = []
+            if s.session_type == 'scraper':
+                stats.append(f"URLs: {s.urls_processed}")
+                stats.append(f"Manufacturers: {s.manufacturers_extracted}")
+                stats.append(f"Categories: {s.categories_extracted}")
+            elif s.session_type == 'finder':
+                stats.append(f"Websites found: {s.websites_found}")
+            stats_str = ", ".join(stats)
+            
+            # Format start time
+            start_time = s.start_time.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Format error message (truncated)
+            error_msg = f"Error: {s.error[:50]}..." if s.error and len(s.error) > 50 else f"Error: {s.error}" if s.error else ""
+            
+            # Print session details with color formatting based on status
+            status_color = "\033[92m" if s.status == 'completed' else "\033[93m" if s.status == 'running' else "\033[91m"  # Green for completed, yellow for running, red for interrupted
+            reset_color = "\033[0m"
+            
+            print(f"{i}. [Session #{s.id}] {start_time} - {status_color}{s.status.upper()}{reset_color}")
+            print(f"   Type: {s.session_type.capitalize()}, Duration: {duration_str}")
+            print(f"   Stats: {stats_str}")
+            if error_msg:
+                print(f"   {error_msg}")
+            print()
+    
+    finally:
+        session.close()
+
+def display_statistics(config, report_type=None):
+    """
+    Display statistics about the database
+    
+    Args:
+        config: Configuration dictionary
+        report_type: Optional, type of report to display ('scraper', 'finder', or None for combined)
+    """
+    session = get_db_session(config)
+    
+    try:
+        # Common statistics
         manufacturers = session.query(Manufacturer).count()
         categories = session.query(Category).count()
         manufacturers_with_website = session.query(Manufacturer).filter(Manufacturer.website != None).count()
         
-        # Display stats
-        print("\n" + "=" * 50)
-        print("COMPETITOR SCRAPER STATISTICS")
-        print("=" * 50)
-        print(f"Total URLs in database: {total_urls}")
-        print(f"Visited URLs: {visited_urls}")
-        print(f"Manufacturer pages identified: {manufacturer_pages}")
-        print(f"Manufacturers extracted: {manufacturers}")
-        print(f"Categories extracted: {categories}")
-        print(f"Manufacturers with website: {manufacturers_with_website}")
+        # Get most recent session of each type if available
+        latest_scraper = session.query(ScraperSession).filter_by(session_type='scraper').order_by(ScraperSession.start_time.desc()).first()
+        latest_finder = session.query(ScraperSession).filter_by(session_type='finder').order_by(ScraperSession.start_time.desc()).first()
         
-        # Display top manufacturers
-        print("\nTop 10 Manufacturers:")
-        top_manufacturers = session.query(Manufacturer).limit(10).all()
-        for i, mfr in enumerate(top_manufacturers, 1):
-            print(f"{i}. {mfr.name} - Categories: {len(mfr.categories)} - Website: {mfr.website or 'N/A'}")
+        # Determine which report(s) to show
+        show_scraper = report_type in [None, 'scraper'] and latest_scraper is not None
+        show_finder = report_type in [None, 'finder'] and latest_finder is not None
         
-        # Display top categories
-        print("\nTop 10 Categories:")
-        top_categories = session.query(Category).limit(10).all()
-        for i, cat in enumerate(top_categories, 1):
-            print(f"{i}. {cat.name} - Manufacturers: {len(cat.manufacturers)}")
+        # Display scraper stats if requested
+        if show_scraper:
+            total_urls = session.query(CrawlStatus).count()
+            visited_urls = session.query(CrawlStatus).filter_by(visited=True).count()
+            manufacturer_pages = session.query(CrawlStatus).filter_by(is_manufacturer_page=True).count()
+            
+            print("\n" + "=" * 50)
+            print("COMPETITOR SCRAPER STATISTICS")
+            print("=" * 50)
+            print(f"Last session: {latest_scraper.start_time.strftime('%Y-%m-%d %H:%M:%S')} ({latest_scraper.status})")
+            if latest_scraper.end_time:
+                duration = (latest_scraper.end_time - latest_scraper.start_time).total_seconds()
+                print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
+            print(f"URLs processed: {latest_scraper.urls_processed}")
+            print(f"Total URLs in database: {total_urls}")
+            print(f"Visited URLs: {visited_urls}")
+            print(f"Manufacturer pages identified: {manufacturer_pages}")
+            print(f"Manufacturers extracted: {latest_scraper.manufacturers_extracted}")
+            print(f"Categories extracted: {latest_scraper.categories_extracted}")
+            
+            # Display top manufacturers
+            print("\nTop 10 Manufacturers:")
+            top_manufacturers = session.query(Manufacturer).limit(10).all()
+            for i, mfr in enumerate(top_manufacturers, 1):
+                print(f"{i}. {mfr.name} - Categories: {len(mfr.categories)} - Website: {mfr.website or 'N/A'}")
+            
+            # Display top categories
+            print("\nTop 10 Categories:")
+            top_categories = session.query(Category).limit(10).all()
+            for i, cat in enumerate(top_categories, 1):
+                print(f"{i}. {cat.name} - Manufacturers: {len(cat.manufacturers)}")
+            
+            print("=" * 50)
         
-        print("=" * 50 + "\n")
+        # Display finder stats if requested
+        if show_finder:
+            print("\n" + "=" * 50 if show_scraper else "\n" + "=" * 50)
+            print("MANUFACTURER WEBSITE FINDER STATISTICS")
+            print("=" * 50)
+            print(f"Last session: {latest_finder.start_time.strftime('%Y-%m-%d %H:%M:%S')} ({latest_finder.status})")
+            if latest_finder.end_time:
+                duration = (latest_finder.end_time - latest_finder.start_time).total_seconds()
+                print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
+            print(f"Total manufacturers: {manufacturers}")
+            print(f"Manufacturers with website: {manufacturers_with_website}")
+            print(f"Websites found in session: {latest_finder.websites_found}")
+            
+            # Display manufacturers with websites
+            print("\nTop 10 Manufacturers with Websites:")
+            manufacturers_with_sites = session.query(Manufacturer).filter(Manufacturer.website != None).limit(10).all()
+            for i, mfr in enumerate(manufacturers_with_sites, 1):
+                print(f"{i}. {mfr.name} - Website: {mfr.website}")
+            
+            print("=" * 50)
+        
+        # If no reports could be shown, display basic database stats
+        if not (show_scraper or show_finder):
+            print("\n" + "=" * 50)
+            print("DATABASE STATISTICS")
+            print("=" * 50)
+            print(f"Total manufacturers: {manufacturers}")
+            print(f"Total categories: {categories}")
+            print(f"Manufacturers with website: {manufacturers_with_website}")
+            
+            # Display top manufacturers
+            print("\nTop 10 Manufacturers:")
+            top_manufacturers = session.query(Manufacturer).limit(10).all()
+            for i, mfr in enumerate(top_manufacturers, 1):
+                print(f"{i}. {mfr.name} - Categories: {len(mfr.categories)} - Website: {mfr.website or 'N/A'}")
+            
+            print("=" * 50 + "\n")
         
     except Exception as e:
         print(f"Error getting statistics: {str(e)}")
+    
+    finally:
+        session.close()
+
+def list_sessions(config, session_type=None, limit=10):
+    """
+    List past scraper sessions with their status and statistics
+    
+    Args:
+        config: Configuration dictionary
+        session_type: Optional filter by session type ('scraper' or 'finder')
+        limit: Maximum number of sessions to display
+    """
+    session = get_db_session(config)
+    
+    try:
+        # Build query
+        query = session.query(ScraperSession)
+        
+        # Filter by type if specified
+        if session_type in ['scraper', 'finder']:
+            query = query.filter_by(session_type=session_type)
+        
+        # Get the most recent sessions
+        sessions = query.order_by(ScraperSession.start_time.desc()).limit(limit).all()
+        
+        if not sessions:
+            print(f"No {'scraper ' if session_type else ''}{'finder ' if session_type == 'finder' else ''}sessions found in database.")
+            return
+        
+        print("\n" + "=" * 80)
+        print(f"RECENT {'SCRAPER ' if session_type == 'scraper' else ''}{'FINDER ' if session_type == 'finder' else ''}SESSIONS")
+        print("=" * 80)
+        
+        for i, s in enumerate(sessions, 1):
+            # Calculate duration if session has ended
+            duration_str = "N/A"
+            if s.end_time:
+                duration = (s.end_time - s.start_time).total_seconds()
+                hours = int(duration // 3600)
+                minutes = int((duration % 3600) // 60)
+                seconds = int(duration % 60)
+                duration_str = f"{hours}h {minutes}m {seconds}s"
+            
+            # Determine what statistics to show based on session type
+            stats = []
+            if s.session_type == 'scraper':
+                stats.append(f"URLs: {s.urls_processed}")
+                stats.append(f"Manufacturers: {s.manufacturers_extracted}")
+                stats.append(f"Categories: {s.categories_extracted}")
+            elif s.session_type == 'finder':
+                stats.append(f"Websites found: {s.websites_found}")
+            stats_str = ", ".join(stats)
+            
+            # Format start time
+            start_time = s.start_time.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Format error message (truncated)
+            error_msg = f"Error: {s.error[:50]}..." if s.error else ""
+            
+            # Print session details
+            status_color = ""
+            end_color = ""
+            if s.status == 'completed':
+                status_color = ""
+            elif s.status == 'interrupted':
+                status_color = ""
+            
+            print(f"{i}. [ID: {s.id}] {start_time} - {status_color}{s.status.upper()}{end_color} - Duration: {duration_str}")
+            print(f"   Type: {s.session_type.capitalize()}, {stats_str}")
+            if error_msg:
+                print(f"   {error_msg}")
+            print()
+        
+        print("=" * 80 + "\n")
+    
+    except Exception as e:
+        print(f"Error listing sessions: {str(e)}")
     
     finally:
         session.close()
@@ -517,6 +725,123 @@ def format_time_delta(seconds):
     else:
         return f"{seconds}s"
 
+def get_last_log_entries(log_file, num_lines=10):
+    """
+    Get the last N lines from a log file.
+    
+    Args:
+        log_file: Path to the log file
+        num_lines: Number of lines to read from the end of the file
+        
+    Returns:
+        List of the last N lines from the log file
+    """
+    if not os.path.exists(log_file):
+        return []
+        
+    try:
+        with open(log_file, 'r') as f:
+            # Use deque with maxlen to efficiently get the last N lines
+            from collections import deque
+            last_lines = deque(maxlen=num_lines)
+            for line in f:
+                last_lines.append(line.strip())
+            return list(last_lines)
+    except Exception as e:
+        logging.error(f"Error reading log file {log_file}: {str(e)}")
+        return []
+
+def update_status_for_terminated_process(config, pid, status):
+    """
+    Update status file for a terminated process.
+    
+    Args:
+        config: Configuration dictionary
+        pid: Process ID
+        status: Status data
+        
+    Returns:
+        Updated status data
+    """
+    if not status or status.get('is_complete', False):
+        return status
+        
+    logging.info(f"Process {pid} is not running but status shows in progress. Updating status.")
+    status['is_complete'] = True
+    status['end_time'] = time.time()
+    status['termination_reason'] = "Process terminated unexpectedly"
+    save_process_status(config, status)
+    logging.info("Status updated for terminated process")
+    return status
+
+def ensure_database_exists(config):
+    """
+    Ensure the database exists with all required tables.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        True if database exists and has all required tables, False otherwise
+    """
+    db_path = config['database']['path']
+    logger = logging.getLogger('cli')
+    
+    # Create database directory if it doesn't exist
+    db_dir = os.path.dirname(db_path)
+    if not os.path.exists(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            logger.info(f"Created database directory {db_dir}")
+        except Exception as e:
+            logger.error(f"Failed to create database directory: {str(e)}")
+            print(f"Error: Failed to create database directory: {str(e)}")
+            return False
+    
+    # Check if database file exists
+    db_exists = os.path.exists(db_path)
+    
+    # Initialize database if it doesn't exist
+    if not db_exists:
+        try:
+            logger.info(f"Database not found. Initializing database at {db_path}")
+            from database.schema import init_db
+            init_db(db_path, config_path=os.path.join(os.path.dirname(__file__), 'config.yaml'))
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {str(e)}")
+            print(f"Error: Failed to initialize database: {str(e)}")
+            return False
+    
+    # Verify that the database has all required tables
+    try:
+        # Connect to the database
+        engine = create_engine(f'sqlite:///{db_path}')
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        
+        # Check if the crawl_status table exists by querying it
+        try:
+            # Try to query the CrawlStatus table
+            from database.schema import CrawlStatus
+            session.query(CrawlStatus).limit(1).all()
+            logger.info("Database verification successful: crawl_status table exists")
+        except Exception as e:
+            logger.warning(f"Database verification failed: crawl_status table may not exist: {str(e)}")
+            
+            # If the table doesn't exist, reinitialize the database
+            logger.info("Reinitializing database to ensure all tables exist")
+            from database.schema import init_db
+            init_db(db_path, config_path=os.path.join(os.path.dirname(__file__), 'config.yaml'))
+            logger.info("Database reinitialized successfully")
+            
+        session.close()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to verify database tables: {str(e)}")
+        print(f"Error: Failed to verify database tables: {str(e)}")
+        return False
+
 def display_process_status(config):
     """
     Display status of a background process.
@@ -524,6 +849,9 @@ def display_process_status(config):
     Args:
         config: Configuration dictionary
     """
+    # Ensure database exists before any database operations
+    ensure_database_exists(config)
+    
     # Check if there's a running process
     pid = load_pid(config)
     if pid is None:
@@ -533,8 +861,24 @@ def display_process_status(config):
     # Check if the process is still running
     is_running = is_process_running(pid)
     
+    # Double-check process status using ps command
+    if is_running:
+        try:
+            import subprocess
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
+            if result.returncode != 0 or not result.stdout.strip() or result.stdout.strip()[0] == 'Z':
+                is_running = False
+                logging.debug(f"Process {pid} not running according to ps command")
+        except Exception as e:
+            logging.debug(f"Error checking process status with ps: {str(e)}")
+    
     # Load status data
     status = load_process_status(config)
+    
+    # Update status for terminated processes
+    if not is_running and status and not status.get('is_complete', False):
+        status = update_status_for_terminated_process(config, pid, status)
+    
     if status is None:
         print(f"Process ID: {pid} ({'Running' if is_running else 'Not running'})")
         print("No status data available.")
@@ -586,6 +930,32 @@ def display_process_status(config):
         print(f"  Claude found: {finder_stats.get('claude_found', 0)}")
         print(f"  Search engine found: {finder_stats.get('search_engine_found', 0)}")
     
+    # Display last log entries if available
+    current_stage = status.get('current_stage', 'Unknown')
+    log_file = None
+    
+    # Determine which log file to read based on the current stage
+    if current_stage == 'scraping':
+        log_file = os.path.join('logs', 'competitor_scraper.log')
+    elif current_stage == 'finding_websites':
+        log_file = os.path.join('logs', 'ndaivi.log')
+    else:
+        log_file = os.path.join('logs', 'ndaivi.log')
+    
+    if log_file and os.path.exists(log_file):
+        print("\nRecent Log Entries:")
+        log_entries = get_last_log_entries(log_file, 5)
+        if log_entries:
+            for entry in log_entries:
+                # Extract and display only the message part of the log entry
+                parts = entry.split(' - ', 2)
+                if len(parts) >= 3:
+                    print(f"  {parts[0]} - {parts[2]}")
+                else:
+                    print(f"  {entry}")
+        else:
+            print("  No recent log entries found")
+    
     print("=" * 50 + "\n")
 
 def interactive_mode(config):
@@ -619,7 +989,8 @@ def interactive_mode(config):
                 print("  status\t\t\t\t\tCheck status of background process")
                 print("  stop\t\t\t\t\tStop background process")
                 print("  resume\t\t\t\t\tResume background process")
-                print("  stats\t\t\t\t\tDisplay database statistics")
+                print("  stats [--type scraper|finder]\t\t\tDisplay database statistics")
+                print("  sessions [--type scraper|finder] [--limit N]\tList past scraper sessions")
                 print("  list-manufacturers [--limit N] [--with-categories]\tList manufacturers")
                 print("  list-categories [--limit N] [--with-manufacturers]\tList categories")
                 print("  search <term> [--type manufacturer|category]\t\tSearch the database")
@@ -908,8 +1279,53 @@ def interactive_mode(config):
                 # TODO: Implement resume functionality
                 print("Resume functionality not yet implemented")
                 
-            elif command == 'stats':
-                display_statistics(config)
+            elif command.startswith('stats'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                report_type = None
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--type' and i + 1 < len(args):
+                        if args[i + 1] in ['scraper', 'finder']:
+                            report_type = args[i + 1]
+                            i += 2
+                        else:
+                            print(f"Error: Invalid type '{args[i + 1]}'. Use 'scraper' or 'finder'.")
+                            break
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                display_statistics(config, report_type=report_type)
+                
+            elif command.startswith('sessions'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                session_type = None
+                limit = 10  # Default limit
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--type' and i + 1 < len(args):
+                        if args[i + 1] in ['scraper', 'finder']:
+                            session_type = args[i + 1]
+                            i += 2
+                        else:
+                            print(f"Error: Invalid type '{args[i + 1]}'. Use 'scraper' or 'finder'.")
+                            break
+                    elif args[i] == '--limit' and i + 1 < len(args):
+                        try:
+                            limit = int(args[i + 1])
+                            i += 2
+                        except ValueError:
+                            print("Error: --limit requires a number")
+                            break
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                list_sessions(config, session_type=session_type, limit=limit)
                 
             elif command.startswith('list-manufacturers'):
                 args = command.split()[1:] if len(command.split()) > 1 else []
@@ -1076,6 +1492,12 @@ def main():
     
     # Stats command
     stats_parser = subparsers.add_parser('stats', help='Display statistics')
+    stats_parser.add_argument('--type', choices=['scraper', 'finder'], help='Type of statistics to display')
+    
+    # Sessions command
+    sessions_parser = subparsers.add_parser('sessions', help='List past scraper sessions')
+    sessions_parser.add_argument('--type', choices=['scraper', 'finder'], help='Type of sessions to list')
+    sessions_parser.add_argument('--limit', type=int, default=10, help='Maximum number of sessions to display')
     
     # Initialize database command
     init_db_parser = subparsers.add_parser('init-db', help='Initialize the database')
@@ -1123,24 +1545,33 @@ def main():
         # Store config path in config dict for use in other functions
         config['config_path'] = args.config
         
-        # Check if database exists before any command that requires it
+        # Ensure database exists with all required tables before any command that requires it
         # Exclude init-db command which handles its own database check
-        if args.command not in [None, 'init-db'] and not check_database_exists(config):
-            print("⚠️ Database not found! You need to initialize it first.")
-            user_input = input("Do you want to initialize the database now? (y/n): ").lower()
-            
-            if user_input == 'y':
-                db_path = input(f"Enter database path (default: {config['database']['path']}): ")
-                if not db_path.strip():
-                    db_path = config['database']['path']
+        if args.command not in [None, 'init-db']:
+            logger.info("Ensuring database exists with all required tables...")
+            if not ensure_database_exists(config):
+                print("⚠️ Database initialization failed! Please check the logs for details.")
+                user_input = input("Do you want to try initializing the database again? (y/n): ").lower()
                 
-                initialize_database(args.config, db_path)
-                # Reload config in case the path was changed
-                config = load_config(args.config)
-                config['config_path'] = args.config
+                if user_input == 'y':
+                    db_path = input(f"Enter database path (default: {config['database']['path']}): ")
+                    if not db_path.strip():
+                        db_path = config['database']['path']
+                    
+                    initialize_database(args.config, db_path)
+                    # Reload config in case the path was changed
+                    config = load_config(args.config)
+                    config['config_path'] = args.config
+                    
+                    # Verify database initialization again
+                    if not ensure_database_exists(config):
+                        print("⚠️ Database initialization failed again. Please check the logs for details.")
+                        return
+                else:
+                    print("Database initialization canceled. Use 'init-db' command to initialize the database later.")
+                    return
             else:
-                print("Database initialization canceled. Use 'init-db' command to initialize the database later.")
-                return
+                logger.info("Database verification successful. All required tables exist.")
         
         # Check for interactive mode first
         if args.interactive:
@@ -1159,14 +1590,21 @@ def main():
         
         elif args.command == 'scrape':
             # Start the competitor scraper (replaces 'start')
+            max_pages = None
             if args.max_pages:
                 config['crawling']['max_pages_per_run'] = args.max_pages
+                max_pages = args.max_pages
             
-            # Initialize and start the scraper
-            scraper = CompetitorScraper(config_path=args.config)
-            scraper.start_crawling()
-            display_statistics(config)
-            scraper.close()
+            try:
+                # Initialize and start the scraper
+                scraper = CompetitorScraper(config_path=args.config)
+                # Use the max_pages from config, don't pass it as a parameter
+                scraper.start_crawling()
+                display_statistics(config)
+                scraper.close()
+            except Exception as e:
+                logger.error(f"Error in scraper: {str(e)}")
+                print(f"Error: {str(e)}")
         
         elif args.command == 'find-websites':
             # Find manufacturer websites
@@ -1446,7 +1884,10 @@ def main():
                 print("Unknown background command. Use 'status', 'stop', or 'resume'.")
         
         elif args.command == 'stats':
-            display_statistics(config)
+            display_statistics(config, report_type=args.type)
+            
+        elif args.command == 'sessions':
+            list_sessions(config, session_type=args.type, limit=args.limit)
             
         elif args.command == 'list-manufacturers':
             list_manufacturers(config, args.limit, args.with_categories)

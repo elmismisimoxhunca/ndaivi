@@ -154,6 +154,25 @@ class ScraperLog(Base):
         return f"<ScraperLog(timestamp='{self.timestamp}', level='{self.level}', message='{self.message[:50]}...')>"
 
 
+class ScraperSession(Base):
+    __tablename__ = 'scraper_sessions'
+    
+    id = Column(Integer, primary_key=True)
+    session_type = Column(String(20), nullable=False)  # 'scraper' or 'finder'
+    start_time = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    end_time = Column(DateTime, nullable=True)
+    status = Column(String(20), default='running')  # 'running', 'completed', 'interrupted'
+    urls_processed = Column(Integer, default=0)
+    manufacturers_extracted = Column(Integer, default=0)
+    categories_extracted = Column(Integer, default=0)
+    websites_found = Column(Integer, default=0)
+    max_pages = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    
+    def __repr__(self):
+        return f"<ScraperSession(id={self.id}, type='{self.session_type}', status='{self.status}')>"
+
+
 def get_db_engine(db_path):
     """
     Create a SQLAlchemy engine with optimized settings for SQLite.

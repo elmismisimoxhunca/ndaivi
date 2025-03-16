@@ -6,8 +6,15 @@ manuals.db.backup
 manuals.db-shm
 manuals.db-wal
 scraper.log
-__pycache__/
+*/__pycache__/
 *.py[cod]
 *$py.class
 *.log
-*pycache
+__pycache__/manufacturer_website_finder.cpython-311.pyc
+__pycache__/utils.cpython-311.pyc
+database/__pycache__/__init__.cpython-311.pyc
+database/__pycache__/db_manager.cpython-311.pyc
+database/__pycache__/schema.cpython-311.pyc
+scraper/__pycache__/__init__.cpython-311.pyc
+scraper/__pycache__/competitor_scraper.cpython-311.pyc
+scraper/__pycache__/claude_analyzer.cpython-311.pyc
