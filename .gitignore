@@ -1,0 +1,8 @@
+/logs
+/output
+/venv
+manuals.db
+manuals.db.backup 
+manuals.db-shm
+manuals.db-wal
+scraper.logs

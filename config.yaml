@@ -1,0 +1,65 @@
+# Competitor Scraping Engine Configuration
+
+# Language configuration
+languages:
+  # English is always the default source language
+  source: "en"
+  
+  # Target languages to translate into
+  # Format: "language_code": "language_name"
+  targets:
+    "es": "Spanish"
+    # Add or remove languages as needed
+    # Use ISO 639-1 two-letter language codes
+    # Examples:
+    # "ja": "Japanese"
+    # "ko": "Korean"
+    # "zh": "Chinese"
+    # "ru": "Russian"
+  
+  # Number of categories to translate in one batch
+  translation_batch_size: 50
+
+# Target website to crawl
+target_url: "https://www.manualslib.com"
+
+# Database configuration
+database:
+  path: "/var/ndaivimanuales/manuals.db"
+
+# AI APIs configuration
+ai_apis:
+  anthropic:
+    api_key: "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"
+    model: "claude-3-haiku-20240307"
+    sonnet_model: "claude-3-7-sonnet-20250219"
+
+# Crawling settings
+crawling:
+  max_depth: 10  # Increased depth to ensure more comprehensive crawling
+  delay_between_requests: 2  # seconds
+  max_pages_per_run: 0  # 0 means no limit, will crawl until no pages remain
+  build_sitemap: true  # Enable sitemap building
+  respect_robots_txt: false  # Temporarily disable robots.txt to test scraper
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+  initial_urls:
+    - "https://www.manualslib.com"
+
+# Keywords for filtering
+keywords:
+  positive:
+    - "manufacturer"
+    - "brand"
+    - "companies"
+    - "products"
+    - "category"
+    - "catalog"
+    - "brands"
+  negative:
+    - "cart"
+    - "checkout"
+    - "login"
+    - "register"
+    - "account"
+    - "privacy"
+    - "terms"

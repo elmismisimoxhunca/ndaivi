@@ -1,0 +1,65 @@
+# NDAIVI Windsurf Rules
+
+## Project Structure
+- Keep all Python code in appropriate modules (scraper/, database/)
+- Maintain clear separation of concerns between components
+- Use relative imports within the project
+- Refer to readme.md for context on the project structure and files.
+
+## Coding Standards
+- Follow PEP 8 for Python style (4-space indents, snake_case for variables)
+- Use type hints where possible (e.g., def scrape(url: str) -> list)
+- Add docstrings to all functions and classes
+- Use logging module instead of print statements
+
+## Database Guidelines
+- Always use the db_manager singleton for database access
+- Use context managers for database sessions
+- Handle database exceptions appropriately
+- Validate data before inserting into the database
+
+## AI Integration
+- Maintain strict delimited format for Claude API responses
+- Keep prompt templates in the prompt_templates.py file
+- Handle API rate limits and errors gracefully
+
+## Error Handling
+- Log all errors with appropriate context
+- Use try/except blocks for external API calls
+- Implement retries for transient errors
+
+## Configuration
+- Store sensitive information in .env file (not in config.yaml)
+- Document all configuration parameters
+- Validate configuration before use
+
+## Testing
+- Write unit tests for critical components
+- Test error handling paths
+- Mock external API calls in tests
+
+## File Descriptions
+
+### Root Directory
+- `main.py`: Entry point for the scraper application. Handles command-line arguments, configuration validation, and initializes the scraping process.
+- `run_claude_scraper.py`: Specialized script for running Claude-based scraping operations independently.
+- `cli.py`: Command-line interface providing various commands to interact with the scraper and database.
+- `utils.py`: Utility functions used across the application for common tasks.
+- `validate_data.py`: Tools for validating and correcting data in the database.
+- `config.yaml`: Configuration file containing settings for the scraper, database, AI APIs, and crawling parameters.
+- `README.md`: Documentation of the project, its structure, and usage instructions.
+
+### Database Module
+- `database/__init__.py`: Package initialization for database module.
+- `database/db_manager.py`: Singleton database manager that handles connections and prevents race conditions.
+- `database/schema.py`: Defines the SQLAlchemy ORM models and database schema, including tables for manufacturers, categories, products, and logging.
+
+### Scraper Module
+- `scraper/__init__.py`: Package initialization for scraper module.
+- `scraper/competitor_scraper.py`: Main implementation of the competitor website scraper. Handles crawling, URL management, and data extraction.
+- `scraper/claude_analyzer.py`: Integration with Claude AI for analyzing web content, detecting manufacturer pages, and extracting structured data.
+- `scraper/prompt_templates.py`: Contains prompt templates for Claude AI to ensure consistent and reliable data extraction.
+
+### Logs Directory
+- `logs/ndaivi.log`: Main application log file.
+- `logs/competitor_scraper.log`: Detailed logs specific to the competitor scraping process.

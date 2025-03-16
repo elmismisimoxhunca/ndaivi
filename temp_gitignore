@@ -1,0 +1,7 @@
+manuals.db
+manuals.db.backup
+manuals.db-wal
+manuals.db-shm
+logs/manufacturer_website_finder.log
+logs/
+venv/
