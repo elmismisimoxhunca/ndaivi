@@ -118,6 +118,7 @@ def display_statistics(config, report_type=None):
         report_type: Optional, type of report to display ('scraper', 'finder', or None for combined)
     """
     session = get_db_session(config)
+    logger = logging.getLogger('cli')
     
     try:
         # Common statistics
@@ -139,74 +140,109 @@ def display_statistics(config, report_type=None):
             visited_urls = session.query(CrawlStatus).filter_by(visited=True).count()
             manufacturer_pages = session.query(CrawlStatus).filter_by(is_manufacturer_page=True).count()
             
-            print("\n" + "=" * 50)
+            print("\n" + "=" * 60)
             print("COMPETITOR SCRAPER STATISTICS")
-            print("=" * 50)
+            print("=" * 60)
+            
+            # SESSION STATISTICS SECTION
+            print("\n--- SESSION STATISTICS ---")
             print(f"Last session: {latest_scraper.start_time.strftime('%Y-%m-%d %H:%M:%S')} ({latest_scraper.status})")
-            if latest_scraper.end_time:
-                duration = (latest_scraper.end_time - latest_scraper.start_time).total_seconds()
-                print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
-            print(f"URLs processed: {latest_scraper.urls_processed}")
+            if latest_scraper.end_time and latest_scraper.start_time:
+                try:
+                    duration = (latest_scraper.end_time - latest_scraper.start_time).total_seconds()
+                    print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
+                except Exception as e:
+                    print("Duration: Error calculating duration")
+                    logger.error(f"Error calculating session duration: {str(e)}")
+            
+            print(f"URLs processed in session: {latest_scraper.urls_processed}")
+            print(f"Manufacturers extracted in session: {latest_scraper.manufacturers_extracted}")
+            print(f"Categories extracted in session: {latest_scraper.categories_extracted}")
+            
+            # GLOBAL STATISTICS SECTION
+            print("\n--- GLOBAL DATABASE STATISTICS ---")
             print(f"Total URLs in database: {total_urls}")
             print(f"Visited URLs: {visited_urls}")
             print(f"Manufacturer pages identified: {manufacturer_pages}")
-            print(f"Manufacturers extracted: {latest_scraper.manufacturers_extracted}")
-            print(f"Categories extracted: {latest_scraper.categories_extracted}")
+            print(f"Total manufacturers in database: {manufacturers}")
+            print(f"Total categories in database: {categories}")
+            print(f"Manufacturers with website: {manufacturers_with_website}")
             
-            # Display top manufacturers
-            print("\nTop 10 Manufacturers:")
+            # Display top manufacturers with clear separation between data types
+            print("\n--- TOP 10 MANUFACTURERS ---")
             top_manufacturers = session.query(Manufacturer).limit(10).all()
             for i, mfr in enumerate(top_manufacturers, 1):
-                print(f"{i}. {mfr.name} - Categories: {len(mfr.categories)} - Website: {mfr.website or 'N/A'}")
+                print(f"{i}. {mfr.name}")
+                print(f"   Categories: {len(mfr.categories)}")
+                print(f"   Website: {mfr.website or 'N/A'}")
             
-            # Display top categories
-            print("\nTop 10 Categories:")
+            # Display top categories with clear separation
+            print("\n--- TOP 10 CATEGORIES ---")
             top_categories = session.query(Category).limit(10).all()
             for i, cat in enumerate(top_categories, 1):
-                print(f"{i}. {cat.name} - Manufacturers: {len(cat.manufacturers)}")
+                # Each category should belong to exactly one manufacturer
+                manufacturer_name = cat.manufacturers[0].name if cat.manufacturers else "Unknown"
+                print(f"{i}. {cat.name}")
+                print(f"   Manufacturer: {manufacturer_name}")
             
-            print("=" * 50)
+            print("=" * 60)
         
         # Display finder stats if requested
         if show_finder:
-            print("\n" + "=" * 50 if show_scraper else "\n" + "=" * 50)
+            print("\n" + "=" * 60 if show_scraper else "\n" + "=" * 60)
             print("MANUFACTURER WEBSITE FINDER STATISTICS")
-            print("=" * 50)
+            print("=" * 60)
+            
+            # SESSION STATISTICS SECTION
+            print("\n--- SESSION STATISTICS ---")
             print(f"Last session: {latest_finder.start_time.strftime('%Y-%m-%d %H:%M:%S')} ({latest_finder.status})")
-            if latest_finder.end_time:
-                duration = (latest_finder.end_time - latest_finder.start_time).total_seconds()
-                print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
-            print(f"Total manufacturers: {manufacturers}")
-            print(f"Manufacturers with website: {manufacturers_with_website}")
+            if latest_finder.end_time and latest_finder.start_time:
+                try:
+                    duration = (latest_finder.end_time - latest_finder.start_time).total_seconds()
+                    print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
+                except Exception as e:
+                    print("Duration: Error calculating duration")
+                    logger.error(f"Error calculating session duration: {str(e)}")
+            
             print(f"Websites found in session: {latest_finder.websites_found}")
             
-            # Display manufacturers with websites
-            print("\nTop 10 Manufacturers with Websites:")
+            # GLOBAL STATISTICS SECTION
+            print("\n--- GLOBAL DATABASE STATISTICS ---")
+            print(f"Total manufacturers in database: {manufacturers}")
+            print(f"Manufacturers with website: {manufacturers_with_website}")
+            
+            # Display manufacturers with websites with clear separation
+            print("\n--- TOP 10 MANUFACTURERS WITH WEBSITES ---")
             manufacturers_with_sites = session.query(Manufacturer).filter(Manufacturer.website != None).limit(10).all()
             for i, mfr in enumerate(manufacturers_with_sites, 1):
-                print(f"{i}. {mfr.name} - Website: {mfr.website}")
+                print(f"{i}. {mfr.name}")
+                print(f"   Website: {mfr.website}")
+                print(f"   Categories: {len(mfr.categories)}")
             
-            print("=" * 50)
+            print("=" * 60)
         
         # If no reports could be shown, display basic database stats
         if not (show_scraper or show_finder):
-            print("\n" + "=" * 50)
+            print("\n" + "=" * 60)
             print("DATABASE STATISTICS")
-            print("=" * 50)
+            print("=" * 60)
             print(f"Total manufacturers: {manufacturers}")
             print(f"Total categories: {categories}")
             print(f"Manufacturers with website: {manufacturers_with_website}")
             
-            # Display top manufacturers
-            print("\nTop 10 Manufacturers:")
+            # Display top manufacturers with clear separation
+            print("\n--- TOP 10 MANUFACTURERS ---")
             top_manufacturers = session.query(Manufacturer).limit(10).all()
             for i, mfr in enumerate(top_manufacturers, 1):
-                print(f"{i}. {mfr.name} - Categories: {len(mfr.categories)} - Website: {mfr.website or 'N/A'}")
+                print(f"{i}. {mfr.name}")
+                print(f"   Categories: {len(mfr.categories)}")
+                print(f"   Website: {mfr.website or 'N/A'}")
             
-            print("=" * 50 + "\n")
+            print("=" * 60 + "\n")
         
     except Exception as e:
         print(f"Error getting statistics: {str(e)}")
+        logger.error(f"Error in display_statistics: {str(e)}")
     
     finally:
         session.close()
@@ -244,47 +280,44 @@ def list_sessions(config, session_type=None, limit=10):
         for i, s in enumerate(sessions, 1):
             # Calculate duration if session has ended
             duration_str = "N/A"
-            if s.end_time:
-                duration = (s.end_time - s.start_time).total_seconds()
-                hours = int(duration // 3600)
-                minutes = int((duration % 3600) // 60)
-                seconds = int(duration % 60)
-                duration_str = f"{hours}h {minutes}m {seconds}s"
-            
-            # Determine what statistics to show based on session type
-            stats = []
-            if s.session_type == 'scraper':
-                stats.append(f"URLs: {s.urls_processed}")
-                stats.append(f"Manufacturers: {s.manufacturers_extracted}")
-                stats.append(f"Categories: {s.categories_extracted}")
-            elif s.session_type == 'finder':
-                stats.append(f"Websites found: {s.websites_found}")
-            stats_str = ", ".join(stats)
+            if s.end_time and s.start_time:
+                try:
+                    duration = (s.end_time - s.start_time).total_seconds()
+                    hours = int(duration // 3600)
+                    minutes = int((duration % 3600) // 60)
+                    seconds = int(duration % 60)
+                    duration_str = f"{hours}h {minutes}m {seconds}s"
+                except Exception as e:
+                    duration_str = "Error calculating duration"
+                    logging.error(f"Error calculating session duration: {str(e)}")
             
             # Format start time
-            start_time = s.start_time.strftime('%Y-%m-%d %H:%M:%S')
+            start_time = s.start_time.strftime('%Y-%m-%d %H:%M:%S') if s.start_time else "N/A"
+            
+            # Print session details with clear section header
+            print(f"{i}. [ID: {s.id}] {start_time} - {s.status.upper()} - Duration: {duration_str}")
+            
+            # Display session-specific statistics with clear separation
+            if s.session_type == 'scraper':
+                print(f"   Type: Scraper")
+                print(f"   URLs processed: {s.urls_processed}")
+                print(f"   Manufacturers extracted: {s.manufacturers_extracted}")
+                print(f"   Categories extracted: {s.categories_extracted}")
+            elif s.session_type == 'finder':
+                print(f"   Type: Website Finder")
+                print(f"   Websites found: {s.websites_found}")
             
             # Format error message (truncated)
-            error_msg = f"Error: {s.error[:50]}..." if s.error else ""
+            if s.error:
+                print(f"   Error: {s.error[:100]}...") if len(s.error) > 100 else print(f"   Error: {s.error}")
             
-            # Print session details
-            status_color = ""
-            end_color = ""
-            if s.status == 'completed':
-                status_color = ""
-            elif s.status == 'interrupted':
-                status_color = ""
-            
-            print(f"{i}. [ID: {s.id}] {start_time} - {status_color}{s.status.upper()}{end_color} - Duration: {duration_str}")
-            print(f"   Type: {s.session_type.capitalize()}, {stats_str}")
-            if error_msg:
-                print(f"   {error_msg}")
             print()
         
         print("=" * 80 + "\n")
     
     except Exception as e:
         print(f"Error listing sessions: {str(e)}")
+        logging.error(f"Error in list_sessions: {str(e)}")
     
     finally:
         session.close()
@@ -1598,8 +1631,8 @@ def main():
             try:
                 # Initialize and start the scraper
                 scraper = CompetitorScraper(config_path=args.config)
-                # Use the max_pages from config, don't pass it as a parameter
-                scraper.start_crawling()
+                # Pass max_pages directly to start_crawling
+                scraper.start_crawling(max_pages=max_pages)
                 display_statistics(config)
                 scraper.close()
             except Exception as e:

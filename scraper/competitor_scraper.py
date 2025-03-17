@@ -8,6 +8,8 @@ import datetime
 import requests
 import random
 import sqlite3
+import signal
+import threading
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from sqlalchemy import create_engine, text
@@ -23,6 +25,48 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession
 import json
 from sqlalchemy import func, desc
+
+# Global shutdown and suspension flags for signal handling
+_SHUTDOWN_REQUESTED = False
+_SUSPEND_REQUESTED = False
+
+def global_shutdown_handler(sig, frame):
+    """Global signal handler for graceful shutdown
+    
+    Args:
+        sig: Signal number
+        frame: Current stack frame
+    """
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    print(f"Received shutdown signal {sig}, finishing gracefully...")
+
+def global_suspend_handler(sig, frame):
+    """Global signal handler for process suspension (CTRL+Z)
+    
+    Args:
+        sig: Signal number
+        frame: Current stack frame
+    """
+    global _SUSPEND_REQUESTED
+    _SUSPEND_REQUESTED = True
+    print(f"Received suspension signal {sig}, marking session as interrupted...")
+    
+    # After marking as interrupted, call the default handler to actually suspend
+    # We'll use the default handler by resetting the signal and re-raising it
+    signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTSTP)
+    
+# Register global signal handlers
+signal.signal(signal.SIGINT, global_shutdown_handler)  # Ctrl+C
+signal.signal(signal.SIGTERM, global_shutdown_handler)  # kill command
+
+# Register our custom SIGTSTP handler that marks the session as interrupted before suspending
+try:
+    signal.signal(signal.SIGTSTP, global_suspend_handler)  # Ctrl+Z
+except AttributeError:
+    # SIGTSTP might not be available on all platforms
+    pass
 
 class CompetitorScraper:
     def __init__(self, config_path='config.yaml'):
@@ -171,8 +215,49 @@ class CompetitorScraper:
         
         return visited_urls
     
-    def start_crawling(self):
-        """Start the crawling process"""
+    def check_shutdown_requested(self):
+        """Check if shutdown was requested via global signal handler
+        
+        Returns:
+            bool: True if shutdown was requested, False otherwise
+        """
+        global _SHUTDOWN_REQUESTED, _SUSPEND_REQUESTED
+        
+        # Check for suspension request first
+        if _SUSPEND_REQUESTED and not getattr(self, 'suspend_handled', False):
+            self.suspend_handled = True
+            self.logger.info("Suspension requested via CTRL+Z, marking session as interrupted...")
+            self._log_to_db("INFO", "Process suspension requested via CTRL+Z")
+            
+            # Mark the current session as interrupted before suspension
+            if hasattr(self, 'session_id') and self.session_id is not None:
+                try:
+                    with self.db_manager.session() as session:
+                        scraper_session = session.query(ScraperSession).filter_by(id=self.session_id).first()
+                        if scraper_session and scraper_session.status == 'running':
+                            scraper_session.status = 'interrupted'
+                            scraper_session.end_time = datetime.datetime.now()
+                            self.logger.info(f"Marked session {self.session_id} as interrupted due to CTRL+Z")
+                except Exception as e:
+                    self.logger.error(f"Error updating session status during suspension: {str(e)}")
+        
+        # Then check for shutdown request
+        if _SHUTDOWN_REQUESTED and not getattr(self, 'shutdown_requested', False):
+            self.shutdown_requested = True
+            self.logger.info("Shutdown requested via signal, finishing gracefully...")
+            self._log_to_db("INFO", "Shutdown requested via signal")
+            # Ensure we clean up resources when shutdown is requested
+            self.close()
+            
+        return getattr(self, 'shutdown_requested', False)
+    
+    def start_crawling(self, max_pages=None):
+        """Start the crawling process
+        
+        Args:
+            max_pages (int, optional): Maximum number of pages to process.
+                If None, uses the value from config.
+        """
         self.stats['start_time'] = time.time()
         # Log to file only first to avoid any startup database contention issues
         self.logger.info("Starting crawling process")
@@ -184,7 +269,7 @@ class CompetitorScraper:
                 self.current_session = ScraperSession(
                     session_type='scraper',
                     status='running',
-                    max_pages=self.config['crawling']['max_pages_per_run']
+                    max_pages=max_pages if max_pages is not None else self.config['crawling']['max_pages_per_run']
                 )
                 session.add(self.current_session)
                 # Get the session ID after commit
@@ -196,27 +281,11 @@ class CompetitorScraper:
             # Continue anyway - we'll try to recover
             self.session_id = None
         
-        # Register signal handlers for graceful shutdown
-        import signal
+        # Initialize shutdown flag
         self.shutdown_requested = False
         
-        def handle_shutdown_signal(sig, frame):
-            self.logger.info(f"Received shutdown signal {sig}, finishing gracefully...")
-            self.shutdown_requested = True
-        
-        # Register signal handlers
-        signal.signal(signal.SIGINT, handle_shutdown_signal)  # Ctrl+C
-        signal.signal(signal.SIGTERM, handle_shutdown_signal)  # kill command
-        signal.signal(signal.SIGTSTP, handle_shutdown_signal)  # Ctrl+Z
-        
-        # CRITICAL: Don't attempt database logging for startup - it can cause deadlocks
-        # with other components. We've already logged to the file, which is sufficient.
-        # Database logging will continue for other operations after startup is complete.
-        # This prevents the main.py getting stuck at "Starting crawling process"
-        
-        # Note for maintenance: The original code here tried to log to the database
-        # using an isolated session, but even this approach can cause contention
-        # with other database operations happening in parallel.
+        # Check if shutdown was already requested before we even started
+        self.check_shutdown_requested()
         
         # Mark in stats that we're initialized
         self.stats['initialized'] = True
@@ -225,188 +294,30 @@ class CompetitorScraper:
         if not self.url_queue:
             self._load_initial_urls()
             self._load_unvisited_urls()
-        
-        # Initialize sitemap tracking
-        # We'll use the database for sitemap instead of a separate file
-        build_sitemap = self.config['crawling'].get('build_sitemap', False)
-        sitemap_entries = 0
-        
-        # Check if we should respect robots.txt
-        respect_robots_txt = self.config['crawling'].get('respect_robots_txt', True)
-        disallowed_patterns = []
-        
-        if respect_robots_txt:
-            try:
-                # Parse robots.txt
-                target_url = self.config['target_url']
-                robots_url = urljoin(target_url, '/robots.txt')
-                response = requests.get(robots_url, timeout=30)
-                
-                if response.status_code == 200:
-                    self.logger.info(f"Found robots.txt at {robots_url}")
-                    # Extract disallowed patterns
-                    for line in response.text.splitlines():
-                        if line.lower().startswith('disallow:'):
-                            pattern = line.split(':', 1)[1].strip()
-                            if pattern:
-                                disallowed_patterns.append(pattern)
-                                self.logger.info(f"Added disallowed pattern: {pattern}")
-            except Exception as e:
-                self.logger.warning(f"Error parsing robots.txt: {str(e)}")
-        
-        # Get max pages per run (0 means no limit)
-        max_pages = self.config['crawling']['max_pages_per_run']
-        pages_crawled = 0
-        
-        # Process URLs until the queue is empty or we reach the maximum number of pages
-        # or a shutdown is requested
-        url_batch_count = 0  # Counter for batch processing
-        batch_size = 10  # Number of URLs to process before committing
-        
-        # Initialize session statistics
-        urls_processed = 0
-        manufacturers_extracted = 0
-        categories_extracted = 0
-        
-        while self.url_queue and (max_pages == 0 or pages_crawled < max_pages) and not self.shutdown_requested:
-            # Get the next URL from the queue
-            current_url, depth = self.url_queue.pop(0)
             
-            # Skip if already visited
-            if current_url in self.visited_urls:
-                continue
-            
-            # Skip if matches any disallowed pattern from robots.txt
-            if respect_robots_txt and any(current_url.endswith(pattern) or pattern in current_url for pattern in disallowed_patterns):
-                self.logger.info(f"Skipping disallowed URL: {current_url}")
-                continue
-            
-            # Update crawl status using our database manager
-            try:
-                with self.db_manager.session() as session:
-                    # Check if URL exists in database
-                    status = session.query(CrawlStatus).filter_by(url=current_url).first()
-                    if not status:
-                        status = CrawlStatus(url=current_url, depth=depth)
-                        session.add(status)
-                    
-                    # Mark as visited
-                    status.visited = True
-                    status.last_visited = datetime.datetime.now()
-                    
-                    # No need to track batch count - each operation is atomic
-                    # No explicit commit needed - handled by context manager
-                
-                # Add to our in-memory visited set
-                self.visited_urls.add(current_url)
-                
-            except Exception as e:
-                self.logger.warning(f"Error updating URL status: {str(e)}")
-                # No explicit rollback needed - context manager handles it
-            
-            # Crawl the page
-            self.logger.info(f"Crawling {current_url} at depth {depth}")
-            try:
-                soup, new_urls = self._crawl_page(current_url)
-                
-                # Process the page content
-                if soup:
-                    self._process_page(current_url, soup, depth)
-                    
-                    # Update sitemap info in database if enabled
-                    if build_sitemap and soup.title:
-                        try:
-                            with self.db_manager.session() as session:
-                                # Update the CrawlStatus entry with sitemap info
-                                status = session.query(CrawlStatus).filter_by(url=current_url).first()
-                                if status:
-                                    status.title = soup.title.string if soup.title else ""
-                                    status.outgoing_links = len(new_urls)
-                                    sitemap_entries += 1
-                        except Exception as e:
-                            self.logger.warning(f"Error updating sitemap info in database: {str(e)}")
-                
-                # Add new URLs to the queue if we haven't reached max depth
-                if self.config['crawling']['max_depth'] == 0 or depth < self.config['crawling']['max_depth']:
-                    for url in new_urls:
-                        if url not in self.visited_urls:
-                            # Check if already in database using our database manager
-                            try:
-                                with self.db_manager.session() as session:
-                                    existing = session.query(CrawlStatus).filter_by(url=url).first()
-                                    if not existing:
-                                        new_status = CrawlStatus(url=url, depth=depth+1, parent_url=current_url)
-                                        session.add(new_status)
-                                    # No explicit commit needed - handled by context manager
-                            except Exception as e:
-                                self.logger.warning(f"Error adding URL to database: {str(e)}")
-                            
-                            self.url_queue.append((url, depth + 1))
-                
-                pages_crawled += 1
-                
-                # Update stats
-                self.stats['pages_crawled'] = pages_crawled
-                
-                # Log progress every 10 pages
-                if pages_crawled % 10 == 0:
-                    self.logger.info(f"Progress: {pages_crawled} pages crawled, {len(self.url_queue)} URLs in queue")
-                    self._log_to_db("INFO", f"Progress: {pages_crawled} pages crawled, {len(self.url_queue)} URLs in queue")
-                
-                # Respect the crawl delay
-                time.sleep(self.config['crawling']['delay_between_requests'])
-                
-            except Exception as e:
-                self.logger.error(f"Error crawling {current_url}: {str(e)}")
-                self._log_to_db("ERROR", f"Error crawling {current_url}: {str(e)}")
+        # Use process_batch to handle the actual crawling
+        # This ensures that max_pages is properly respected
+        batch_stats = self.process_batch(max_pages=max_pages)
         
-        # Final commit logic removed - database manager handles commits through its context manager
-        if url_batch_count > 0:
-            self.logger.info(f"Database manager handled {url_batch_count} URL status updates throughout the process")
-                
-        # Log sitemap statistics
-        if build_sitemap:
-            self.logger.info(f"Updated sitemap information for {sitemap_entries} pages in database")
-            self._log_to_db("INFO", f"Updated sitemap information for {sitemap_entries} pages in database")
-        
-        self.stats['end_time'] = time.time()
-        
-        # Determine if the crawling was interrupted or completed normally
-        status = 'interrupted' if self.shutdown_requested else 'completed'
-        status_message = "Crawling interrupted by user" if self.shutdown_requested else f"Crawling finished. Processed {pages_crawled} pages."
-        
-        self.logger.info(status_message)
-        self._log_to_db("INFO", status_message)
-        
-        # Update stats using database manager
+        # Update session record with final status
         try:
             with self.db_manager.session() as session:
-                manufacturers_count = session.query(Manufacturer).count()
-                categories_count = session.query(Category).count()
-                manufacturers_with_website = session.query(Manufacturer).filter(Manufacturer.website != None).count()
-                
-                self.stats['manufacturers_found'] = manufacturers_count
-                self.stats['categories_found'] = categories_count
-                self.stats['manufacturers_with_website'] = manufacturers_with_website
-                
-                # Update the session record if we created one
                 if hasattr(self, 'session_id') and self.session_id is not None:
                     scraper_session = session.query(ScraperSession).filter_by(id=self.session_id).first()
                     if scraper_session:
+                        # Use the status from batch_stats (interrupted or completed)
+                        scraper_session.status = batch_stats.get('status', 'completed')
                         scraper_session.end_time = datetime.datetime.now()
-                        scraper_session.status = status
-                        scraper_session.urls_processed = pages_crawled
-                        scraper_session.manufacturers_extracted = self.stats.get('manufacturers_extracted', 0)
-                        scraper_session.categories_extracted = self.stats.get('categories_extracted', 0)
-                        self.logger.info(f"Updated scraper session {self.session_id} with status '{status}'.")
+                        scraper_session.pages_crawled = batch_stats.get('pages_crawled', 0)
+                        scraper_session.manufacturers_found = batch_stats.get('manufacturers_found', 0)
+                        scraper_session.categories_found = batch_stats.get('categories_found', 0)
         except Exception as e:
-            self.logger.warning(f"Error updating stats and session: {str(e)}")
-            # Set default values if query fails
-            self.stats['manufacturers_found'] = 0
-            self.stats['categories_found'] = 0
-            self.stats['manufacturers_with_website'] = 0
+            self.logger.error(f"Failed to update scraper session: {str(e)}")
+            
+        # Log completion
+        self.logger.info(f"Crawling finished. Processed {batch_stats.get('pages_crawled', 0)} pages.")
         
-        return pages_crawled
+        return batch_stats
     
     def generate_sitemap_files(self):
         """Generate sitemap files from database information"""
@@ -1100,6 +1011,12 @@ class CompetitorScraper:
         pages_crawled = 0
         
         while self.url_queue and (max_pages == 0 or pages_crawled < max_pages):
+            # Check if shutdown was requested (either locally or via global flag)
+            if self.check_shutdown_requested():
+                self.logger.info("Graceful shutdown requested, finishing current batch")
+                self._log_to_db("INFO", "Graceful shutdown requested by user")
+                break
+                
             # Check if we've exceeded the maximum runtime
             if end_time and time.time() >= end_time:
                 self.logger.info(f"Reached maximum runtime of {max_runtime_minutes} minutes")
@@ -1187,6 +1104,17 @@ class CompetitorScraper:
         self.stats['batch_duration'] = self.stats['batch_end_time'] - self.stats['batch_start_time']
         self.stats['pages_crawled'] = pages_crawled
         self.stats['urls_in_queue'] = len(self.url_queue)
+        
+        # Add shutdown status to stats
+        if self.check_shutdown_requested():
+            self.stats['status'] = 'interrupted'
+            status_message = "Crawling interrupted by user"
+        else:
+            self.stats['status'] = 'completed'
+            status_message = f"Crawling finished. Processed {pages_crawled} pages."
+        
+        self.logger.info(status_message)
+        self._log_to_db("INFO", status_message)
         
         self.logger.info(f"Batch processing completed: {pages_crawled} pages crawled in {self.stats['batch_duration']:.2f} seconds")
         

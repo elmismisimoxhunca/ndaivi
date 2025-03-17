@@ -2315,34 +2315,34 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
         print("MANUFACTURER WEBSITE FINDER STATISTICS")
         print("=" * 60)
         
-        # Database statistics
-        print("\nDATABASE STATISTICS:")
+        # Global database statistics
+        print("\nGLOBAL DATABASE STATISTICS:")
         print(f"Total manufacturers in database: {self.stats['total_manufacturers']}")
-        print(f"Manufacturers with websites before: {self.stats['manufacturers_with_website']}")
+        print(f"Manufacturers with websites: {self.stats['manufacturers_with_website']}")
         
-        # Process statistics
+        # Session statistics
         if "processed_manufacturers" in self.stats:
-            print("\nPROCESS STATISTICS:")
-            print(f"Manufacturers processed: {self.stats['processed_manufacturers']}")
-            print(f"Websites found via Claude: {self.stats['claude_found']}")
-            print(f"Websites found via search engines: {self.stats['search_engine_found']}")
-            print(f"Validation failures: {self.stats['validation_failed']}")
+            print("\nCURRENT SESSION STATISTICS:")
+            print(f"Manufacturers processed in this session: {self.stats['processed_manufacturers']}")
+            print(f"Websites found via Claude in this session: {self.stats['claude_found']}")
+            print(f"Websites found via search engines in this session: {self.stats['search_engine_found']}")
+            print(f"Validation failures in this session: {self.stats['validation_failed']}")
             
-            # Calculate success rate
+            # Calculate success rate for this session
             success_count = self.stats['claude_found'] + self.stats['search_engine_found'] - self.stats['validation_failed']
             if self.stats['processed_manufacturers'] > 0:
                 success_rate = (success_count / self.stats['processed_manufacturers']) * 100
-                print(f"Success rate: {success_rate:.2f}%")
+                print(f"Success rate for this session: {success_rate:.2f}%")
             
-            # Search engine usage
-            print("\nSEARCH ENGINE USAGE:")
+            # Search engine usage for this session
+            print("\nSEARCH ENGINE USAGE (THIS SESSION):")
             for engine, count in self.stats["search_engine_usage"].items():
                 if count > 0:
                     print(f"  {engine}: {count} queries")
             
-            # Duration
+            # Duration of this session
             if "duration" in self.stats:
-                print(f"\nTotal duration: {self.stats['duration']}")
+                print(f"\nSession duration: {self.stats['duration']}")
         
         print("=" * 60 + "\n")
 
