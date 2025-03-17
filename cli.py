@@ -13,6 +13,8 @@ from utils import load_config, validate_database_consistency, export_database_to
 from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from database.db_manager import get_db_manager
+from database.statistics_manager import StatisticsManager
 
 def setup_logging():
     """Set up logging configuration"""
@@ -110,142 +112,149 @@ def list_sessions(config: dict, session_type: str = None, limit: int = 10) -> No
         session.close()
 
 def display_statistics(config, report_type=None):
-    """
-    Display statistics about the database
+    """Display statistics about scraper and finder sessions"""
+    # Get database session
+    db_manager = get_db_manager(config['database']['path'])
     
-    Args:
-        config: Configuration dictionary
-        report_type: Optional, type of report to display ('scraper', 'finder', or None for combined)
-    """
-    session = get_db_session(config)
+    # Create a StatisticsManager instance for displaying statistics
+    stats_manager = StatisticsManager('combined', db_manager)
+    
+    # Determine which reports to show based on report_type
+    show_scraper = report_type in [None, 'scraper', 'all']
+    show_finder = report_type in [None, 'finder', 'all']
+    
     logger = logging.getLogger('cli')
     
     try:
-        # Common statistics
-        manufacturers = session.query(Manufacturer).count()
-        categories = session.query(Category).count()
-        manufacturers_with_website = session.query(Manufacturer).filter(Manufacturer.website != None).count()
-        
-        # Get most recent session of each type if available
-        latest_scraper = session.query(ScraperSession).filter_by(session_type='scraper').order_by(ScraperSession.start_time.desc()).first()
-        latest_finder = session.query(ScraperSession).filter_by(session_type='finder').order_by(ScraperSession.start_time.desc()).first()
-        
-        # Determine which report(s) to show
-        show_scraper = report_type in [None, 'scraper'] and latest_scraper is not None
-        show_finder = report_type in [None, 'finder'] and latest_finder is not None
-        
-        # Display scraper stats if requested
-        if show_scraper:
-            total_urls = session.query(CrawlStatus).count()
-            visited_urls = session.query(CrawlStatus).filter_by(visited=True).count()
-            manufacturer_pages = session.query(CrawlStatus).filter_by(is_manufacturer_page=True).count()
+        with db_manager.session() as session:
+            # Get basic database statistics
+            manufacturers = session.query(Manufacturer).count()
+            categories = session.query(Category).count()
+            manufacturers_with_website = session.query(Manufacturer).filter(Manufacturer.website != None).count()
             
-            print("\n" + "=" * 60)
-            print("COMPETITOR SCRAPER STATISTICS")
-            print("=" * 60)
+            # Get latest sessions
+            latest_scraper = session.query(ScraperSession).filter_by(session_type='scraper').order_by(ScraperSession.start_time.desc()).first()
+            latest_finder = session.query(ScraperSession).filter_by(session_type='finder').order_by(ScraperSession.start_time.desc()).first()
+            latest_session = session.query(ScraperSession).order_by(ScraperSession.start_time.desc()).first()
             
-            # SESSION STATISTICS SECTION
-            print("\n--- SESSION STATISTICS ---")
-            print(f"Last session: {latest_scraper.start_time.strftime('%Y-%m-%d %H:%M:%S')} ({latest_scraper.status})")
-            if latest_scraper.end_time and latest_scraper.start_time:
-                try:
+            # Get URL statistics if needed
+            if show_scraper:
+                total_urls = session.query(CrawlStatus).count()
+                visited_urls = session.query(CrawlStatus).filter_by(visited=True).count()
+                urls_in_queue = total_urls - visited_urls
+            
+            # Display scraper stats if requested
+            if show_scraper and latest_scraper:
+                print("\n" + "=" * 60)
+                print("COMPETITOR SCRAPER STATISTICS")
+                print("=" * 60)
+                
+                # Session information
+                print("\n--- LATEST SCRAPER SESSION ---")
+                print(f"Session ID: {latest_scraper.id}")
+                print(f"Start time: {latest_scraper.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Status: {latest_scraper.status.upper()}")
+                
+                if latest_scraper.end_time:
                     duration = (latest_scraper.end_time - latest_scraper.start_time).total_seconds()
                     print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
-                except Exception as e:
-                    print("Duration: Error calculating duration")
-                    logger.error(f"Error calculating session duration: {str(e)}")
+                
+                # URL statistics
+                print("\n--- URL STATISTICS ---")
+                print(f"Total URLs in database: {total_urls}")
+                print(f"Visited URLs: {visited_urls}")
+                print(f"URLs remaining in queue: {urls_in_queue}")
+                
+                # Extraction statistics
+                print("\n--- EXTRACTION STATISTICS ---")
+                print(f"Manufacturers extracted: {manufacturers}")
+                print(f"Categories extracted: {categories}")
+                print(f"Manufacturers with website: {manufacturers_with_website}")
+                
+                if manufacturers > 0:
+                    website_percentage = (manufacturers_with_website / manufacturers) * 100
+                    print(f"Percentage with website: {website_percentage:.2f}%")
+                    print(f"Average categories per manufacturer: {categories / manufacturers:.2f}")
+                
+                # Display manufacturers with websites with clear separation
+                print("\n--- TOP 10 MANUFACTURERS WITH WEBSITES ---")
+                manufacturers_with_sites = session.query(Manufacturer).filter(Manufacturer.website != None).limit(10).all()
+                for i, mfr in enumerate(manufacturers_with_sites, 1):
+                    print(f"{i}. {mfr.name}")
+                    print(f"   Website: {mfr.website}")
+                    print(f"   Categories: {len(mfr.categories)}")
+                
+                print("=" * 60)
             
-            print(f"URLs processed in session: {latest_scraper.urls_processed}")
-            print(f"Manufacturers extracted in session: {latest_scraper.manufacturers_extracted}")
-            print(f"Categories extracted in session: {latest_scraper.categories_extracted}")
-            
-            # GLOBAL STATISTICS SECTION
-            print("\n--- GLOBAL DATABASE STATISTICS ---")
-            print(f"Total URLs in database: {total_urls}")
-            print(f"Visited URLs: {visited_urls}")
-            print(f"Manufacturer pages identified: {manufacturer_pages}")
-            print(f"Total manufacturers in database: {manufacturers}")
-            print(f"Total categories in database: {categories}")
-            print(f"Manufacturers with website: {manufacturers_with_website}")
-            
-            # Display top manufacturers with clear separation between data types
-            print("\n--- TOP 10 MANUFACTURERS ---")
-            top_manufacturers = session.query(Manufacturer).limit(10).all()
-            for i, mfr in enumerate(top_manufacturers, 1):
-                print(f"{i}. {mfr.name}")
-                print(f"   Categories: {len(mfr.categories)}")
-                print(f"   Website: {mfr.website or 'N/A'}")
-            
-            # Display top categories with clear separation
-            print("\n--- TOP 10 CATEGORIES ---")
-            top_categories = session.query(Category).limit(10).all()
-            for i, cat in enumerate(top_categories, 1):
-                # Each category should belong to exactly one manufacturer
-                manufacturer_name = cat.manufacturers[0].name if cat.manufacturers else "Unknown"
-                print(f"{i}. {cat.name}")
-                print(f"   Manufacturer: {manufacturer_name}")
-            
-            print("=" * 60)
-        
-        # Display finder stats if requested
-        if show_finder:
-            print("\n" + "=" * 60 if show_scraper else "\n" + "=" * 60)
-            print("MANUFACTURER WEBSITE FINDER STATISTICS")
-            print("=" * 60)
-            
-            # SESSION STATISTICS SECTION
-            print("\n--- SESSION STATISTICS ---")
-            print(f"Last session: {latest_finder.start_time.strftime('%Y-%m-%d %H:%M:%S')} ({latest_finder.status})")
-            if latest_finder.end_time and latest_finder.start_time:
-                try:
+            # Display finder stats if requested
+            if show_finder and latest_finder:
+                print("\n" + "=" * 60 if show_scraper else "\n" + "=" * 60)
+                print("MANUFACTURER WEBSITE FINDER STATISTICS")
+                print("=" * 60)
+                
+                # Session information
+                print("\n--- LATEST FINDER SESSION ---")
+                print(f"Session ID: {latest_finder.id}")
+                print(f"Start time: {latest_finder.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Status: {latest_finder.status.upper()}")
+                
+                if latest_finder.end_time:
                     duration = (latest_finder.end_time - latest_finder.start_time).total_seconds()
                     print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
-                except Exception as e:
-                    print("Duration: Error calculating duration")
-                    logger.error(f"Error calculating session duration: {str(e)}")
+                
+                # Finder statistics
+                print("\n--- FINDER STATISTICS ---")
+                print(f"Total manufacturers: {manufacturers}")
+                print(f"Manufacturers with website: {manufacturers_with_website}")
+                
+                if manufacturers > 0:
+                    website_percentage = (manufacturers_with_website / manufacturers) * 100
+                    print(f"Percentage with website: {website_percentage:.2f}%")
+                
+                # Display manufacturers with websites with clear separation
+                print("\n--- TOP 10 MANUFACTURERS WITH WEBSITES ---")
+                manufacturers_with_sites = session.query(Manufacturer).filter(Manufacturer.website != None).limit(10).all()
+                for i, mfr in enumerate(manufacturers_with_sites, 1):
+                    print(f"{i}. {mfr.name}")
+                    print(f"   Website: {mfr.website}")
+                    print(f"   Categories: {len(mfr.categories)}")
+                
+                print("=" * 60)
             
-            print(f"Websites found in session: {latest_finder.websites_found}")
-            
-            # GLOBAL STATISTICS SECTION
-            print("\n--- GLOBAL DATABASE STATISTICS ---")
-            print(f"Total manufacturers in database: {manufacturers}")
-            print(f"Manufacturers with website: {manufacturers_with_website}")
-            
-            # Display manufacturers with websites with clear separation
-            print("\n--- TOP 10 MANUFACTURERS WITH WEBSITES ---")
-            manufacturers_with_sites = session.query(Manufacturer).filter(Manufacturer.website != None).limit(10).all()
-            for i, mfr in enumerate(manufacturers_with_sites, 1):
-                print(f"{i}. {mfr.name}")
-                print(f"   Website: {mfr.website}")
-                print(f"   Categories: {len(mfr.categories)}")
-            
-            print("=" * 60)
-        
-        # If no reports could be shown, display basic database stats
-        if not (show_scraper or show_finder):
-            print("\n" + "=" * 60)
-            print("DATABASE STATISTICS")
-            print("=" * 60)
-            print(f"Total manufacturers: {manufacturers}")
-            print(f"Total categories: {categories}")
-            print(f"Manufacturers with website: {manufacturers_with_website}")
-            
-            # Display top manufacturers with clear separation
-            print("\n--- TOP 10 MANUFACTURERS ---")
-            top_manufacturers = session.query(Manufacturer).limit(10).all()
-            for i, mfr in enumerate(top_manufacturers, 1):
-                print(f"{i}. {mfr.name}")
-                print(f"   Categories: {len(mfr.categories)}")
-                print(f"   Website: {mfr.website or 'N/A'}")
-            
-            print("=" * 60 + "\n")
-        
+            # If no reports could be shown, display basic database stats
+            if not (show_scraper and latest_scraper) and not (show_finder and latest_finder):
+                print("\n" + "=" * 60)
+                print("DATABASE STATISTICS")
+                print("=" * 60)
+                
+                # Show latest session information if available
+                if latest_session:
+                    print("\n--- LATEST SESSION INFORMATION ---")
+                    print(f"Session type: {latest_session.session_type.capitalize()}")
+                    print(f"Start time: {latest_session.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"Status: {latest_session.status.upper()}")
+                    if latest_session.end_time:
+                        duration = (latest_session.end_time - latest_session.start_time).total_seconds()
+                        print(f"Duration: {int(duration//3600)}h {int((duration%3600)//60)}m {int(duration%60)}s")
+                
+                print("\n--- GLOBAL DATABASE STATISTICS ---")
+                print(f"Total manufacturers: {manufacturers}")
+                print(f"Total categories: {categories}")
+                print(f"Manufacturers with website: {manufacturers_with_website}")
+                
+                # Display top manufacturers with clear separation
+                print("\n--- TOP 10 MANUFACTURERS ---")
+                top_manufacturers = session.query(Manufacturer).limit(10).all()
+                for i, mfr in enumerate(top_manufacturers, 1):
+                    print(f"{i}. {mfr.name}")
+                    print(f"   Categories: {len(mfr.categories)}")
+                    print(f"   Website: {mfr.website or 'N/A'}")
+                
+                print("=" * 60 + "\n")
+    
     except Exception as e:
         print(f"Error getting statistics: {str(e)}")
         logger.error(f"Error in display_statistics: {str(e)}")
-    
-    finally:
-        session.close()
 
 def list_sessions(config, session_type=None, limit=10):
     """
@@ -266,7 +275,7 @@ def list_sessions(config, session_type=None, limit=10):
         if session_type in ['scraper', 'finder']:
             query = query.filter_by(session_type=session_type)
         
-        # Get the most recent sessions
+        # Get the most recent sessions (newest first, limited to 10 by default)
         sessions = query.order_by(ScraperSession.start_time.desc()).limit(limit).all()
         
         if not sessions:
@@ -282,11 +291,14 @@ def list_sessions(config, session_type=None, limit=10):
             duration_str = "N/A"
             if s.end_time and s.start_time:
                 try:
-                    duration = (s.end_time - s.start_time).total_seconds()
+                    # Ensure both timestamps are in the same timezone format
+                    # If the duration is negative, it means there's a timezone issue - use absolute value
+                    duration = abs((s.end_time - s.start_time).total_seconds())
                     hours = int(duration // 3600)
                     minutes = int((duration % 3600) // 60)
                     seconds = int(duration % 60)
                     duration_str = f"{hours}h {minutes}m {seconds}s"
+                    logging.info(f"Calculated duration for session {s.id}: {duration_str} (start: {s.start_time}, end: {s.end_time})")
                 except Exception as e:
                     duration_str = "Error calculating duration"
                     logging.error(f"Error calculating session duration: {str(e)}")
@@ -300,12 +312,14 @@ def list_sessions(config, session_type=None, limit=10):
             # Display session-specific statistics with clear separation
             if s.session_type == 'scraper':
                 print(f"   Type: Scraper")
-                print(f"   URLs processed: {s.urls_processed}")
-                print(f"   Manufacturers extracted: {s.manufacturers_extracted}")
-                print(f"   Categories extracted: {s.categories_extracted}")
+                print(f"   URLs processed: {s.urls_processed or 0}")
+                print(f"   Manufacturers extracted: {s.manufacturers_extracted or 0}")
+                print(f"   Categories extracted: {s.categories_extracted or 0}")
             elif s.session_type == 'finder':
                 print(f"   Type: Website Finder")
-                print(f"   Websites found: {s.websites_found}")
+                print(f"   Searches performed: {s.urls_processed or 0}")
+                print(f"   Websites visited: {s.manufacturers_extracted or 0}")
+                print(f"   Websites validated: {s.websites_found or 0}")
             
             # Format error message (truncated)
             if s.error:
@@ -662,10 +676,14 @@ def run_scraper_and_finder(config, max_runtime=None, time_allocation=None, backg
         
         # Run the competitor scraper with time limit
         logger.info(f"Running competitor scraper with time limit: {int(scraper_time)} minutes")
-        scraper_stats = scraper.process_batch(
-            max_pages=config['scraper'].get('batch_size', 100),
-            max_runtime_minutes=int(scraper_time) if scraper_time > 0 else None
+        scraper_stats = scraper.start_crawling(
+            max_pages=config['scraper'].get('batch_size', 100)
         )
+        
+        # If time limit is set, check if we need to stop early
+        if scraper_time > 0 and time.time() >= scraper_end_time:
+            logger.info(f"Reached maximum runtime for scraper: {int(scraper_time)} minutes")
+            scraper.shutdown_requested = True
         
         # Update status with scraper statistics
         status["scraper_stats"] = scraper_stats
@@ -698,10 +716,14 @@ def run_scraper_and_finder(config, max_runtime=None, time_allocation=None, backg
             
             # Run the manufacturer website finder with time limit
             logger.info(f"Running manufacturer website finder with time limit: {int(finder_time)} minutes")
-            finder_stats = finder.process_batch(
-                max_pages=config['manufacturer_finder'].get('batch_size', 20),
-                max_runtime_minutes=int(finder_time) if finder_time > 0 else None
+            finder_stats = finder.start_crawling(
+                max_pages=config['manufacturer_finder'].get('batch_size', 20)
             )
+            
+            # If time limit is set, check if we need to stop early
+            if finder_time > 0 and time.time() >= finder_end_time:
+                logger.info(f"Reached maximum runtime for finder: {int(finder_time)} minutes")
+                finder.shutdown_requested = True
             
             # Update status with finder statistics
             status["finder_stats"] = finder_stats
@@ -1022,8 +1044,8 @@ def interactive_mode(config):
                 print("  status\t\t\t\t\tCheck status of background process")
                 print("  stop\t\t\t\t\tStop background process")
                 print("  resume\t\t\t\t\tResume background process")
-                print("  stats [--type scraper|finder]\t\t\tDisplay database statistics")
-                print("  sessions [--type scraper|finder] [--limit N]\tList past scraper sessions")
+                print("  global-stats [--type scraper|finder]\t\tDisplay global database statistics")
+                print("  session-stats [--type scraper|finder] [--limit N]\tList detailed statistics for past sessions")
                 print("  list-manufacturers [--limit N] [--with-categories]\tList manufacturers")
                 print("  list-categories [--limit N] [--with-manufacturers]\tList categories")
                 print("  search <term> [--type manufacturer|category]\t\tSearch the database")
@@ -1282,7 +1304,7 @@ def interactive_mode(config):
                             background=False
                         )
                         print("Sequential run completed.")
-                        display_statistics(config)
+                        print("Use 'session-stats' command to view detailed results.")
                     except Exception as e:
                         logger.error(f"Error in sequential run: {str(e)}")
                         print(f"Error: {str(e)}")
@@ -1312,7 +1334,7 @@ def interactive_mode(config):
                 # TODO: Implement resume functionality
                 print("Resume functionality not yet implemented")
                 
-            elif command.startswith('stats'):
+            elif command.startswith('global-stats'):
                 args = command.split()[1:] if len(command.split()) > 1 else []
                 report_type = None
                 
@@ -1332,7 +1354,7 @@ def interactive_mode(config):
                 
                 display_statistics(config, report_type=report_type)
                 
-            elif command.startswith('sessions'):
+            elif command.startswith('session-stats'):
                 args = command.split()[1:] if len(command.split()) > 1 else []
                 session_type = None
                 limit = 10  # Default limit
@@ -1523,14 +1545,14 @@ def main():
     # Resume command
     resume_parser = background_subparsers.add_parser('resume', help='Resume background process')
     
-    # Stats command
-    stats_parser = subparsers.add_parser('stats', help='Display statistics')
-    stats_parser.add_argument('--type', choices=['scraper', 'finder'], help='Type of statistics to display')
+    # Global stats command
+    global_stats_parser = subparsers.add_parser('global-stats', help='Display global statistics across all sessions')
+    global_stats_parser.add_argument('--type', choices=['scraper', 'finder'], help='Type of statistics to display')
     
-    # Sessions command
-    sessions_parser = subparsers.add_parser('sessions', help='List past scraper sessions')
-    sessions_parser.add_argument('--type', choices=['scraper', 'finder'], help='Type of sessions to list')
-    sessions_parser.add_argument('--limit', type=int, default=10, help='Maximum number of sessions to display')
+    # Session stats command
+    session_stats_parser = subparsers.add_parser('session-stats', help='List detailed statistics for past scraper sessions')
+    session_stats_parser.add_argument('--type', choices=['scraper', 'finder'], help='Type of sessions to list')
+    session_stats_parser.add_argument('--limit', type=int, default=10, help='Maximum number of sessions to display')
     
     # Initialize database command
     init_db_parser = subparsers.add_parser('init-db', help='Initialize the database')
@@ -1633,7 +1655,8 @@ def main():
                 scraper = CompetitorScraper(config_path=args.config)
                 # Pass max_pages directly to start_crawling
                 scraper.start_crawling(max_pages=max_pages)
-                display_statistics(config)
+                # Don't display statistics at the end - user can use session-stats command
+                print("\nScraping completed. Use 'session-stats' command to view results.")
                 scraper.close()
             except Exception as e:
                 logger.error(f"Error in scraper: {str(e)}")
@@ -1695,7 +1718,7 @@ def main():
                 
                 if not args.background:
                     print("\nManufacturer website finder completed successfully.")
-                    display_statistics(config)
+                    print("Use 'session-stats' command to view detailed results.")
                     
                 # If we're in the child process, exit
                 if args.background and os.getpid() != os.getppid():
@@ -1766,7 +1789,7 @@ def main():
                 
                 if not args.background:
                     print("\nSequential run completed successfully.")
-                    display_statistics(config)
+                    print("Use 'session-stats' command to view detailed results.")
                     
                 # If we're in the child process, exit
                 if args.background and os.getpid() != os.getppid():

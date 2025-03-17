@@ -29,6 +29,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from database.schema import init_db, Manufacturer, ScraperSession
 from database.db_manager import get_db_manager
+from database.statistics_manager import StatisticsManager
 from scraper.claude_analyzer import ClaudeAnalyzer
 
 class ManufacturerWebsiteFinder:
@@ -111,18 +112,14 @@ class ManufacturerWebsiteFinder:
         # Initialize Claude API
         self._setup_claude_api()
         
-        # Initialize statistics
-        self.stats = {
-            "total_manufacturers": 0,
-            "manufacturers_with_website": 0,
-            "claude_found": 0,
-            "search_engine_found": 0,
-            "validation_failed": 0,
-            "dns_resolution_errors": 0,
-            "connection_errors": 0,
-            "timeout_errors": 0,
-            "search_engine_usage": {engine["name"]: 0 for engine in self.SEARCH_ENGINES}
-        }
+        # Initialize statistics manager
+        self.stats_manager = StatisticsManager('finder', self.db_manager)
+        self.session_id = self.stats_manager.session_id
+        
+        # Keep a reference to stats dictionary for backward compatibility
+        self.stats = self.stats_manager.get_all_stats()
+        # Add engine usage tracking which isn't in the statistics manager
+        self.stats['search_engine_usage'] = {engine["name"]: 0 for engine in self.SEARCH_ENGINES}
         
         # Current search engine index for alternating
         self.current_search_engine = 0
@@ -132,6 +129,63 @@ class ManufacturerWebsiteFinder:
         
         # Flag for shutdown request
         self.shutdown_requested = False
+        
+        # Clean up any existing Chrome processes that might interfere
+        self._cleanup_chrome_processes()
+    
+    def _cleanup_chrome_processes(self):
+        """Kill any existing Chrome/Chromium processes that might interfere with our scraper.
+        
+        This helps prevent issues with port conflicts or resource limitations.
+        """
+        try:
+            import subprocess
+            import signal
+            import psutil
+            
+            self.logger.info("Checking for existing Chrome/Chromium processes...")
+            
+            # Find and kill chromedriver processes
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # Check if it's a Chrome-related process
+                    if proc.info['name'] and (
+                        'chrome' in proc.info['name'].lower() or 
+                        'chromium' in proc.info['name'].lower() or
+                        'chromedriver' in proc.info['name'].lower()
+                    ):
+                        self.logger.info(f"Terminating Chrome-related process: {proc.info['name']} (PID: {proc.info['pid']})")
+                        try:
+                            proc.terminate()  # Try graceful termination first
+                            proc.wait(timeout=3)  # Wait up to 3 seconds
+                        except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                            # Force kill if termination fails or times out
+                            try:
+                                proc.kill()
+                            except psutil.NoSuchProcess:
+                                pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                    # Skip processes we can't access or that disappeared
+                    continue
+                    
+            # Alternative approach using subprocess for systems without psutil
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(['taskkill', '/F', '/IM', 'chromedriver.exe'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    subprocess.run(['taskkill', '/F', '/IM', 'chromium.exe'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                else:  # Linux/Mac
+                    subprocess.run(['pkill', '-f', 'chromedriver'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    subprocess.run(['pkill', '-f', 'chromium'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                    subprocess.run(['pkill', '-f', 'chrome'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            except Exception as e:
+                self.logger.warning(f"Error during subprocess cleanup: {str(e)}")
+                
+            self.logger.info("Chrome process cleanup completed")
+        except ImportError:
+            self.logger.warning("psutil module not available, skipping process cleanup")
+        except Exception as e:
+            self.logger.warning(f"Error during Chrome process cleanup: {str(e)}")
     
     def _setup_logging(self) -> logging.Logger:
         """Set up logging configuration.
@@ -225,10 +279,6 @@ class ManufacturerWebsiteFinder:
             self.logger.info("Chrome process cleanup completed")
         except Exception as e:
             self.logger.warning(f"Error during Chrome process cleanup: {str(e)}")
-        if not hasattr(self.db_manager, '_initialized') or not self.db_manager._initialized:
-            self.db_manager.initialize(db_path)
-        
-        self.logger.info(f"Database manager initialized for {db_path}")
     
     def _setup_claude_api(self):
         """Initialize the Claude API client."""
@@ -354,8 +404,26 @@ class ManufacturerWebsiteFinder:
                 options.add_argument('--headless=new')  # Use new headless mode
                 options.add_argument('--no-sandbox')
                 options.add_argument('--disable-dev-shm-usage')
-                # Specify the browser binary location as Chromium
-                options.binary_location = "/usr/bin/chromium"
+                # Check multiple possible Chrome binary locations
+                chrome_binary_paths = [
+                    '/usr/bin/chromium',
+                    '/usr/bin/chromium-browser',
+                    '/usr/bin/google-chrome',
+                    '/usr/bin/google-chrome-stable',
+                    '/snap/bin/chromium',
+                ]
+                
+                chrome_found = False
+                for binary_path in chrome_binary_paths:
+                    if os.path.exists(binary_path):
+                        self.logger.info(f"Found Chrome binary at: {binary_path}")
+                        options.binary_location = binary_path
+                        chrome_found = True
+                        break
+                
+                if not chrome_found:
+                    self.logger.warning("Could not find Chrome binary in standard locations. Will attempt to continue without specifying binary path.")
+                    
                 # Add disable-gpu flag for better headless compatibility
                 options.add_argument('--disable-gpu')
                 # Add these options to improve stability and prevent zombie processes
@@ -855,6 +923,9 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
         """
         self.logger.info(f"Validating website with Selenium: {website_url} for {manufacturer_name}")
         
+        # Increment the websites visited counter
+        self.stats['websites_visited'] += 1
+        
         try:
             self.logger.info(f"DEBUGGING CHROMEDRIVER: Starting setup for URL {website_url}")
             # Set up Chrome options with advanced stability settings
@@ -1061,6 +1132,9 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
         """
         self.logger.info(f"Searching and validating top {max_results} results for {manufacturer_name}")
         
+        # Increment the searches counter
+        self.stats['searches_performed'] += 1
+        
         try:
             # Construct search queries in order of specificity
             search_queries = [
@@ -1109,28 +1183,55 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
                 chrome_options.add_experimental_option('useAutomationExtension', False)
                 
                 try:
-                    # Set path to Chromium explicitly
-                    chrome_path = "/usr/bin/chromium"
-                    if os.path.exists(chrome_path):
-                        chrome_options.binary_location = chrome_path
-                        self.logger.info(f"Using Chromium browser at: {chrome_path}")
+                    # Check multiple possible Chrome binary locations
+                    chrome_binary_paths = [
+                        '/usr/bin/chromium',
+                        '/usr/bin/chromium-browser',
+                        '/usr/bin/google-chrome',
+                        '/usr/bin/google-chrome-stable',
+                        '/snap/bin/chromium',
+                    ]
                     
-                    # First try with custom ChromeDriver if available
-                    chromedriver_path = os.path.join(os.path.dirname(__file__), 'chromedriver')
-                    if os.path.exists(chromedriver_path):
-                        self.logger.info(f"Using custom ChromeDriver at: {chromedriver_path}")
+                    chrome_found = False
+                    for binary_path in chrome_binary_paths:
+                        if os.path.exists(binary_path):
+                            self.logger.info(f"Found Chrome binary at: {binary_path}")
+                            chrome_options.binary_location = binary_path
+                            chrome_found = True
+                            break
+                    
+                    if not chrome_found:
+                        self.logger.warning("Could not find Chrome binary in standard locations. Will attempt to continue without specifying binary path.")
+                    
+                    # Try to use ChromeDriverManager to get the appropriate driver
+                    try:
+                        from webdriver_manager.chrome import ChromeDriverManager
+                        driver_path = ChromeDriverManager().install()
+                        self.logger.info(f"Using ChromeDriver from ChromeDriverManager: {driver_path}")
                         service = ChromeService(
-                            executable_path=chromedriver_path,
+                            executable_path=driver_path,
                             log_path=os.path.join(os.path.dirname(__file__), 'logs', 'chromedriver.log'),
                             service_args=['--verbose']
                         )
-                    else:
-                        # Fall back to system ChromeDriver
-                        self.logger.info("Using system ChromeDriver")
-                        service = ChromeService(
-                            log_path=os.path.join(os.path.dirname(__file__), 'logs', 'chromedriver.log'),
-                            service_args=['--verbose']
-                        )
+                    except Exception as cdm_error:
+                        self.logger.warning(f"ChromeDriverManager failed: {str(cdm_error)}")
+                        
+                        # Fall back to custom ChromeDriver if available
+                        chromedriver_path = os.path.join(os.path.dirname(__file__), 'chromedriver')
+                        if os.path.exists(chromedriver_path):
+                            self.logger.info(f"Using custom ChromeDriver at: {chromedriver_path}")
+                            service = ChromeService(
+                                executable_path=chromedriver_path,
+                                log_path=os.path.join(os.path.dirname(__file__), 'logs', 'chromedriver.log'),
+                                service_args=['--verbose']
+                            )
+                        else:
+                            # Fall back to system ChromeDriver
+                            self.logger.info("Using system ChromeDriver")
+                            service = ChromeService(
+                                log_path=os.path.join(os.path.dirname(__file__), 'logs', 'chromedriver.log'),
+                                service_args=['--verbose']
+                            )
                     
                     # Create driver with timeouts
                     driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -1163,19 +1264,36 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
                         # Navigate to Google and perform the search
                         driver.get("https://www.google.com/search?q=" + query.replace(' ', '+'))
                         
-                        # Wait for search results to load (using a shorter timeout)
+                        # Wait for search results to load with a longer timeout and better error handling
                         try:
-                            WebDriverWait(driver, 10).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, "div.g, div[data-hveid]"))
-                            )
+                            # Increase timeout and use multiple selectors to be more resilient
+                            for selector in ["div.g, div[data-hveid]", "#search", "body"]:
+                                try:
+                                    WebDriverWait(driver, 20).until(
+                                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                                    )
+                                    self.logger.info(f"Found search results with selector: {selector}")
+                                    break
+                                except Exception:
+                                    continue
                         except Exception as wait_error:
                             self.logger.warning(f"Timeout waiting for search results: {str(wait_error)}")
-                            # Try to recover by getting a new driver
+                            # Try to recover by getting a new driver and using a different search engine
                             driver.quit()
                             driver = create_chrome_driver()
                             if not driver:
+                                self.logger.error("Failed to create new driver after timeout")
                                 break
-                            continue
+                                
+                            # Try a different search engine URL instead of Google
+                            try:
+                                alternative_url = f"https://duckduckgo.com/html/?q={query.replace(' ', '+')}"
+                                self.logger.info(f"Trying alternative search engine: {alternative_url}")
+                                driver.get(alternative_url)
+                                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".result__body")))
+                            except Exception as alt_error:
+                                self.logger.warning(f"Alternative search engine also failed: {str(alt_error)}")
+                                continue
                         
                         # Extract search result links safely
                         result_links = []
@@ -1262,8 +1380,11 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
                 # Always close the driver
                 try:
                     driver.quit()
-                except:
-                    pass
+                except Exception as e:
+                    self.logger.warning(f"Error quitting driver: {str(e)}")
+                    
+                # Make sure all Chrome processes are terminated
+                self._cleanup_chrome_processes()
                     
         except Exception as e:
             self.logger.error(f"Error setting up search for {manufacturer_name}: {str(e)}")
@@ -1892,6 +2013,8 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
                 # Only consider valid if both conditions are met
                 if is_official and has_manuals:
                     self.logger.info(f"Validated {website_url} as official website with manuals for {manufacturer_name}")
+                    # Increment the websites validated counter
+                    self.stats['websites_validated'] += 1
                     return True
                 else:
                     reason = []
@@ -1947,6 +2070,28 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
             signal.alarm(7200)  # 2 hours in seconds
         self.logger.info("Starting Selenium-based website finding process")
         start_time = time.time()
+        
+        # Create a new scraper session for tracking
+        self.session_id = None
+        try:
+            with self.db_manager.session() as db_session:
+                # Create a new scraper session
+                scraper_session = ScraperSession(
+                    session_type='finder',
+                    status='running',
+                    start_time=datetime.datetime.now()
+                )
+                db_session.add(scraper_session)
+                db_session.commit()
+                self.session_id = scraper_session.id
+                self.logger.info(f"Created new finder session with ID: {self.session_id}")
+        except Exception as e:
+            self.logger.error(f"Failed to create scraper session: {str(e)}")
+            
+        # Initialize session statistics
+        self.stats['searches_performed'] = 0  # Number of search engine searches
+        self.stats['websites_visited'] = 0    # Number of websites visited
+        self.stats['websites_validated'] = 0  # Number of websites successfully validated
         
         # STAGE 1: Process manufacturers with unvalidated websites first
         self.logger.info("STAGE 1: Processing manufacturers with unvalidated websites")
@@ -2293,58 +2438,127 @@ HAS_MANUALS: yes  # or 'no' if no evidence of manuals
             # Add random delay between manufacturers to avoid detection
             time.sleep(random.uniform(2.0, 5.0))
         
-        # Update stats
+        # Update statistics in the stats manager
         batch_end_time = time.time()
-        self.stats['batch_end_time'] = batch_end_time
-        self.stats['batch_duration'] = batch_end_time - batch_start_time
-        self.stats['processed_manufacturers'] = processed_count
-        self.stats['successful_validations'] = success_count
+        runtime_seconds = batch_end_time - batch_start_time
         
-        # Calculate duration in human-readable format
-        duration = batch_end_time - batch_start_time
-        hours, remainder = divmod(duration, 3600)
+        # Update all stats in the statistics manager
+        stats_updates = {
+            'manufacturers_processed': processed_count,
+            'successful_validations': success_count,
+            'claude_found': self.stats.get('claude_found', 0),
+            'search_engine_found': self.stats.get('search_engine_found', 0),
+            'validation_failed': self.stats.get('validation_failed', 0),
+            'runtime_seconds': runtime_seconds
+        }
+        
+        # Update the stats manager with all our batch statistics
+        self.stats_manager.update_multiple_stats(stats_updates)
+        
+        # Keep a reference to our stats for backward compatibility
+        self.stats = self.stats_manager.get_all_stats()
+        
+        # Calculate duration in human-readable format for logging
+        hours, remainder = divmod(runtime_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
-        self.stats["duration"] = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+        duration_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
         
-        self.logger.info(f"Batch processing completed in {self.stats['duration']}")
+        self.logger.info(f"Batch processing completed in {duration_str}")
+        
+        # Let the stats manager handle database updates
+        try:
+            self.stats_manager.update_session_in_database(completed=True)
+            self.logger.info(f"Session statistics updated in database for session ID: {self.session_id}")
+        except Exception as e:
+            self.logger.error(f"Error updating session statistics in database: {str(e)}")
+        
+        # Display statistics to the console
+        self.display_statistics()
+        
         return self.stats
     
-    def display_statistics(self):
-        """Display statistics about the website finding process."""
+    def display_statistics(self) -> None:
+        """Display statistics about the website finding process.
+        
+        Uses the StatisticsManager to get and display statistics, as well as
+        update the database with the latest session information.
+        """
         print("\n" + "=" * 60)
         print("MANUFACTURER WEBSITE FINDER STATISTICS")
         print("=" * 60)
         
-        # Global database statistics
+        # Query global database statistics
+        try:
+            with self.db_manager.session() as session:
+                total_manufacturers = session.query(Manufacturer).count()
+                manufacturers_with_website = session.query(Manufacturer).filter(
+                    Manufacturer.website != None, 
+                    Manufacturer.website != ''
+                ).count()
+                
+                # Update global statistics in our stats manager
+                self.stats_manager.update_stat("total_manufacturers", total_manufacturers)
+                self.stats_manager.update_stat("manufacturers_with_website", manufacturers_with_website)
+        except Exception as e:
+            self.logger.error(f"Error retrieving database statistics: {str(e)}")
+        
+        # Get the latest stats
+        self.stats = self.stats_manager.get_all_stats()
+        
+        # Display global database statistics
         print("\nGLOBAL DATABASE STATISTICS:")
         print(f"Total manufacturers in database: {self.stats['total_manufacturers']}")
         print(f"Manufacturers with websites: {self.stats['manufacturers_with_website']}")
         
-        # Session statistics
-        if "processed_manufacturers" in self.stats:
-            print("\nCURRENT SESSION STATISTICS:")
-            print(f"Manufacturers processed in this session: {self.stats['processed_manufacturers']}")
-            print(f"Websites found via Claude in this session: {self.stats['claude_found']}")
-            print(f"Websites found via search engines in this session: {self.stats['search_engine_found']}")
-            print(f"Validation failures in this session: {self.stats['validation_failed']}")
-            
-            # Calculate success rate for this session
-            success_count = self.stats['claude_found'] + self.stats['search_engine_found'] - self.stats['validation_failed']
-            if self.stats['processed_manufacturers'] > 0:
-                success_rate = (success_count / self.stats['processed_manufacturers']) * 100
-                print(f"Success rate for this session: {success_rate:.2f}%")
-            
-            # Search engine usage for this session
-            print("\nSEARCH ENGINE USAGE (THIS SESSION):")
+        # Display session statistics
+        print("\n--- CURRENT SESSION STATISTICS ---")
+        processed = self.stats.get('manufacturers_processed', 0)
+        claude_found = self.stats.get('claude_found', 0)
+        search_found = self.stats.get('search_engine_found', 0)
+        validation_failed = self.stats.get('validation_failed', 0)
+        
+        print(f"Manufacturers processed: {processed}")
+        print(f"Websites found via Claude: {claude_found}")
+        print(f"Websites found via search engines: {search_found}")
+        print(f"Validation failures: {validation_failed}")
+        
+        # Calculate success rate for this session
+        success_count = claude_found + search_found - validation_failed
+        if processed > 0:
+            success_rate = (success_count / processed) * 100
+            print(f"Success rate: {success_rate:.2f}%")
+        
+        # Show search engine usage for this session
+        if "search_engine_usage" in self.stats:
+            print("\nSearch Engine Usage:")
             for engine, count in self.stats["search_engine_usage"].items():
                 if count > 0:
                     print(f"  {engine}: {count} queries")
-            
-            # Duration of this session
-            if "duration" in self.stats:
-                print(f"\nSession duration: {self.stats['duration']}")
         
-        print("=" * 60 + "\n")
+        # Duration of this session
+        runtime_seconds = self.stats.get("runtime_seconds", 0)
+        hours, remainder = divmod(runtime_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+        print(f"\nSession duration: {duration_str}")
+        
+        # Log statistics through the stats manager (to keep logs consistent)
+        self.logger.info("Finder session statistics summary:")
+        self.logger.info(f"Manufacturers processed: {processed}")
+        self.logger.info(f"Websites found via Claude: {claude_found}")
+        self.logger.info(f"Websites found via search engines: {search_found}")
+        self.logger.info(f"Validation failures: {validation_failed}")
+        self.logger.info(f"Success rate: {success_rate:.2f if processed > 0 else 0}%")
+        
+        # Update session statistics in the database
+        try:
+            # Mark session as completed if this is a final display
+            self.stats_manager.update_session_in_database(completed=True)
+            self.logger.info(f"Updated session statistics in database for session ID: {self.session_id}")
+        except Exception as e:
+            self.logger.error(f"Error updating session statistics in database: {str(e)}")
+        
+        self.logger.info("Manufacturer website finder completed")
 
 def main():
     """Main entry point for the manufacturer website finder."""
