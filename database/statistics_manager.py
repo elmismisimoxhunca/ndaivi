@@ -71,6 +71,7 @@ class StatisticsManager:
                 "connection_errors": 0,
                 "timeout_errors": 0,
                 "dns_resolution_errors": 0,
+                "status": "running",
             }
         elif self.component_type == 'finder':
             return {
@@ -349,6 +350,67 @@ class StatisticsManager:
         # Calculate and log final runtime
         runtime_seconds = (self.stats["end_time"] - self.stats["start_time"]).total_seconds()
         self.stats["runtime_seconds"] = runtime_seconds
+    
+    def start_batch(self) -> None:
+        """
+        Start a new batch of operations within the current session.
+        This is used for tracking statistics for a subset of operations.
+        """
+        self.batch_stats = {
+            "start_time": datetime.datetime.now(),
+            "end_time": None,
+            "runtime_seconds": 0,
+            "pages_crawled": 0,
+            "manufacturers_found": 0,
+            "categories_found": 0,
+            "status": "running"
+        }
+        self.logger.info(f"Started new batch in session {self.session_id}")
+    
+    def end_batch(self) -> None:
+        """
+        End the current batch of operations, updating end time and runtime.
+        """
+        if not hasattr(self, 'batch_stats'):
+            self.logger.warning("Cannot end batch: No batch was started")
+            return
+            
+        self.batch_stats["end_time"] = datetime.datetime.now()
+        
+        # Calculate runtime
+        if self.batch_stats["start_time"]:
+            runtime_seconds = (self.batch_stats["end_time"] - self.batch_stats["start_time"]).total_seconds()
+            self.batch_stats["runtime_seconds"] = runtime_seconds
+            
+        self.logger.info(f"Ended batch in session {self.session_id}. Runtime: {runtime_seconds:.2f} seconds")
+    
+    def increment_stat(self, key: str, value: int = 1) -> None:
+        """
+        Increment a specific statistic by the given value.
+        This is a convenience method for update_stat with increment=True.
+        
+        Args:
+            key: The statistic key to increment
+            value: The value to increment by (default: 1)
+        """
+        self.update_stat(key, value, increment=True)
+        
+        # Also update batch stats if we're in a batch
+        if hasattr(self, 'batch_stats') and key in self.batch_stats:
+            self.batch_stats[key] += value
+    
+    def get_batch_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics for the current batch.
+        
+        Returns:
+            Dictionary of batch statistics or None if no batch is active
+        """
+        if not hasattr(self, 'batch_stats'):
+            self.logger.warning("No batch statistics available")
+            return {}
+            
+        return self.batch_stats
         runtime_minutes = runtime_seconds / 60
         
         self.logger.info(f"{self.component_type.capitalize()} session completed in {runtime_minutes:.2f} minutes")

@@ -1511,12 +1511,12 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='NDAIVI Competitor Scraper CLI')
     parser.add_argument('--config', default='config.yaml', help='Path to configuration file')
-    parser.add_argument('--interactive', '-i', action='store_true', help='Run in interactive mode')
+    parser.add_argument('--non-interactive', '-n', action='store_true', help='Run in non-interactive mode (command line only)')
     
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
-    # Scrape command (replaces 'start')
-    scrape_parser = subparsers.add_parser('scrape', help='Start the competitor scraper')
+    # Scrape command - simplified single command for scraping
+    scrape_parser = subparsers.add_parser('scrape', help='Run the web scraper')
     scrape_parser.add_argument('--max-pages', type=int, help='Maximum number of pages to crawl')
     scrape_parser.add_argument('--background', action='store_true', help='Run in background mode')
     
@@ -1525,12 +1525,12 @@ def main():
     find_websites_parser.add_argument('--limit', type=int, help='Limit the number of manufacturers to process')
     find_websites_parser.add_argument('--background', action='store_true', help='Run in background mode')
     
-    # Run-all command (replaces 'run')
-    run_all_parser = subparsers.add_parser('run-all', help='Run scraper and manufacturer website finder sequentially')
-    run_all_parser.add_argument('--time-allocation', type=int, choices=range(0, 101), metavar='[0-100]',
+    # Run command - single command for running both scraper and finder
+    run_parser = subparsers.add_parser('run', help='Run scraper and manufacturer website finder')
+    run_parser.add_argument('--time-allocation', type=int, choices=range(0, 101), metavar='[0-100]',
                            help='Time allocation between scraper and finder (0-100, higher values favor scraper)')
-    run_all_parser.add_argument('--max-runtime', type=int, help='Maximum runtime in minutes')
-    run_all_parser.add_argument('--background', action='store_true', help='Run in background mode')
+    run_parser.add_argument('--max-runtime', type=int, help='Maximum runtime in minutes')
+    run_parser.add_argument('--background', action='store_true', help='Run in background mode')
     
     # Background commands
     background_parser = subparsers.add_parser('background', help='Background process commands')
@@ -1628,8 +1628,16 @@ def main():
             else:
                 logger.info("Database verification successful. All required tables exist.")
         
-        # Check for interactive mode first
-        if args.interactive:
+        # Check for non-interactive mode, otherwise default to interactive mode
+        if args.non_interactive:
+            # Continue with command line processing
+            pass
+        elif not args.command:
+            # If no command is specified, go to interactive mode by default
+            interactive_mode(config)
+            return
+        else:
+            # If a command is specified but we're not in non-interactive mode, still use interactive
             interactive_mode(config)
             return
             
@@ -1730,9 +1738,9 @@ def main():
                 if args.background and os.getpid() != os.getppid():
                     sys.exit(1)
         
-        elif args.command == 'run-all':
+        elif args.command == 'run':
             # Run scraper and manufacturer website finder sequentially
-            print(f"Starting sequential run of competitor scraper and manufacturer website finder{' in background' if args.background else ''}...")
+            print(f"Starting run of competitor scraper and manufacturer website finder{' in background' if args.background else ''}...")
             
             # Check if we should run in background mode
             if args.background:
@@ -1788,7 +1796,7 @@ def main():
                 )
                 
                 if not args.background:
-                    print("\nSequential run completed successfully.")
+                    print("\nRun completed successfully.")
                     print("Use 'session-stats' command to view detailed results.")
                     
                 # If we're in the child process, exit
@@ -1796,8 +1804,8 @@ def main():
                     sys.exit(0)
                     
             except Exception as e:
-                logger.error(f"Error in sequential run: {str(e)}")
-                print(f"Error in sequential run: {str(e)}")
+                logger.error(f"Error in run: {str(e)}")
+                print(f"Error in run: {str(e)}")
                 if args.background and os.getpid() != os.getppid():
                     sys.exit(1)
         

@@ -1,1026 +1,1261 @@
+#!/usr/bin/env python3
+"""
+Competitor Scraper for NDAIVI
+
+This scraper crawls competitor websites to extract manufacturer and product category information,
+utilizing Claude AI for content analysis and data extraction.
+
+Improvements:
+- Enhanced error handling and logging
+- Better AI prompt engineering
+- Optimized crawling strategy with priority queue
+- Improved database session management
+- Secure API key handling
+- Comprehensive statistics tracking
+"""
+
 import requests
 import yaml
 import logging
 import time
 import os
-import re
+import uuid
+import heapq
+from urllib.parse import urlparse, urljoin
 import datetime
-import requests
-import random
-import sqlite3
 import signal
 import threading
+from typing import Optional, List, Dict, Any, Tuple, Set
+from collections import defaultdict
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import func, desc
+from sqlalchemy.orm import Session
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 import anthropic
-from scraper.claude_analyzer import ClaudeAnalyzer
-from sqlalchemy import func
-from database.schema import Base, Manufacturer, Category, Product
-from database.db_manager import get_db_manager
+from anthropic import AnthropicError
+
 # Add the project root to the Python path
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from database.db_manager import get_db_manager
 from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession
 from database.statistics_manager import StatisticsManager
 import json
-from sqlalchemy import func, desc
 
 # Global shutdown and suspension flags for signal handling
 _SHUTDOWN_REQUESTED = False
 _SUSPEND_REQUESTED = False
 
 def global_shutdown_handler(sig, frame):
-    """Global signal handler for graceful shutdown
-    
-    Args:
-        sig: Signal number
-        frame: Current stack frame
-    """
+    """Global signal handler for graceful shutdown."""
     global _SHUTDOWN_REQUESTED
     _SHUTDOWN_REQUESTED = True
-    print(f"Received shutdown signal {sig}, finishing gracefully...")
+    logging.getLogger('competitor_scraper').info(f"Received shutdown signal {sig}, finishing gracefully...")
 
 def global_suspend_handler(sig, frame):
-    """Global signal handler for process suspension (CTRL+Z)
-    
-    Args:
-        sig: Signal number
-        frame: Current stack frame
-    """
+    """Global signal handler for process suspension (CTRL+Z)."""
     global _SUSPEND_REQUESTED
     _SUSPEND_REQUESTED = True
-    print(f"Received suspension signal {sig}, marking session as interrupted...")
-    
-    # After marking as interrupted, call the default handler to actually suspend
-    # We'll use the default handler by resetting the signal and re-raising it
+    logging.getLogger('competitor_scraper').info(f"Received suspension signal {sig}, marking session as interrupted...")
     signal.signal(signal.SIGTSTP, signal.SIG_DFL)
     os.kill(os.getpid(), signal.SIGTSTP)
-    
+
 # Register global signal handlers
 signal.signal(signal.SIGINT, global_shutdown_handler)  # Ctrl+C
 signal.signal(signal.SIGTERM, global_shutdown_handler)  # kill command
-
-# Register our custom SIGTSTP handler that marks the session as interrupted before suspending
 try:
     signal.signal(signal.SIGTSTP, global_suspend_handler)  # Ctrl+Z
 except AttributeError:
-    # SIGTSTP might not be available on all platforms
+    # SIGTSTP not available on Windows
     pass
 
+
+class UrlPriority:
+    """
+    Class for determining URL crawling priority based on various factors.
+    
+    This helps optimize the crawling order to find manufacturer information faster.
+    """
+    
+    # Keyword weights for prioritization
+    PRIORITY_KEYWORDS = {
+        'manufacturer': 10,
+        'brand': 8,
+        'vendor': 8,
+        'supplier': 7,
+        'partner': 6,
+        'directory': 6,
+        'catalog': 5,
+        'product': 4,
+        'category': 3
+    }
+    
+    @staticmethod
+    def calculate_priority(url: str, depth: int, content_hint: Optional[str] = None) -> float:
+        """
+        Calculate a crawling priority score for a URL.
+        
+        Lower scores indicate higher priority.
+        
+        Args:
+            url: The URL to calculate priority for
+            depth: The link depth from the starting point
+            content_hint: Optional title or other content hint from the page
+            
+        Returns:
+            A priority score (lower is higher priority)
+        """
+        # Base priority based on depth
+        priority = depth * 10.0
+        
+        # Apply keyword boosts to lower the priority score (higher priority)
+        url_lower = url.lower()
+        for keyword, boost in UrlPriority.PRIORITY_KEYWORDS.items():
+            if keyword in url_lower:
+                priority -= boost
+        
+        # Apply content hint boosts if available
+        if content_hint and isinstance(content_hint, str):
+            content_lower = content_hint.lower()
+            for keyword, boost in UrlPriority.PRIORITY_KEYWORDS.items():
+                if keyword in content_lower:
+                    priority -= boost * 0.5  # Apply half boost for content hints
+        
+        # Limit minimum priority value
+        return max(1.0, priority)
+
+
+class PriorityUrlQueue:
+    """
+    Priority queue for URLs to be crawled.
+    
+    This optimizes the crawling order to find manufacturer information faster.
+    """
+    
+    def __init__(self):
+        """Initialize the priority queue."""
+        self._queue = []  # heapq priority queue with entries: (priority, counter, url, depth)
+        self._counter = 0  # Unique counter for stable sorting of same-priority items
+        self._url_set = set()  # Fast lookup for checking if URLs are in queue
+    
+    def push(self, url: str, depth: int, priority: Optional[float] = None, content_hint: Optional[str] = None):
+        """
+        Add a URL to the queue with calculated priority.
+        
+        Args:
+            url: The URL to add
+            depth: Current crawl depth
+            priority: Optional explicit priority (lower is higher priority)
+            content_hint: Optional content hint for priority calculation
+        
+        Returns:
+            True if URL was added, False if it was already in the queue
+        """
+        if url in self._url_set:
+            return False
+        
+        if priority is None:
+            # Calculate priority based on URL characteristics and depth
+            priority = UrlPriority.calculate_priority(url, depth, content_hint)
+        
+        # Use a counter to ensure stable ordering for same-priority items
+        entry = (priority, self._counter, url, depth)
+        self._counter += 1
+        
+        heapq.heappush(self._queue, entry)
+        self._url_set.add(url)
+        return True
+    
+    def pop(self) -> Tuple[str, int]:
+        """
+        Get the highest priority URL from the queue.
+        
+        Returns:
+            Tuple of (url, depth) for the highest priority URL
+        
+        Raises:
+            IndexError: If the queue is empty
+        """
+        if not self._queue:
+            raise IndexError("Priority queue is empty")
+        
+        # Get and return the highest priority (lowest score) URL
+        _, _, url, depth = heapq.heappop(self._queue)
+        self._url_set.remove(url)
+        return url, depth
+    
+    def __len__(self) -> int:
+        """Get the number of URLs in the queue."""
+        return len(self._queue)
+    
+    def __contains__(self, url: str) -> bool:
+        """Check if a URL is in the queue."""
+        return url in self._url_set
+
+
 class CompetitorScraper:
+    """Web scraper for extracting manufacturer information from competitor websites."""
+    
     def __init__(self, config_path='config.yaml'):
+        """
+        Initialize the competitor scraper.
+        
+        Args:
+            config_path: Path to the configuration YAML file
+        """
+        # Setup logging first
+        self._setup_logging()
+        
         # Load configuration
         self.config = self._load_config(config_path)
         
-        # Setup logging
-        self._setup_logging()
+        # Initialize database with singleton database manager
+        self._initialize_database()
         
-        # Initialize database with our singleton database manager
-        # This prevents race conditions and database locks
-        try:
-            # First, ensure the database exists with all required tables
-            from database.schema import init_db
-            db_path = self.config['database']['path']
-            
-            # Create database directory if it doesn't exist
-            db_dir = os.path.dirname(db_path)
-            if not os.path.exists(db_dir):
-                os.makedirs(db_dir, exist_ok=True)
-                self.logger.info(f"Created database directory {db_dir}")
-            
-            # Initialize database if it doesn't exist or force initialization
-            if not os.path.exists(db_path):
-                self.logger.info(f"Database not found. Initializing database at {db_path}")
-                init_db(db_path, config_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml'))
-                self.logger.info("Database initialized successfully")
-            
-            # Now get the database manager singleton
-            self.db_manager = get_db_manager(self.config['database']['path'])
-            # Ensure the database manager is actually initialized
-            if not hasattr(self.db_manager, '_initialized') or not self.db_manager._initialized:
-                self.db_manager.initialize(self.config['database']['path'])
-            self.logger.info(f"Database manager initialized for {self.config['database']['path']}")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize database manager: {str(e)}")
-            raise
-        
-        # No separate session creation - we'll use the db_manager.session() context manager
-        # This ensures proper locking and transaction handling
-        
-        # Initialize AI clients
+        # Initialize AI client
         self._setup_ai_clients()
         
         # Set up crawling variables
         self.visited_urls = self._load_visited_urls()
-        self.url_queue = []
+        self.url_queue = PriorityUrlQueue()
         self.current_depth = 0
         
-        # Initialize StatisticsManager
-        self.statistics_manager = StatisticsManager(self.db_manager)
+        # Throttling settings
+        self.last_request_time = 0
+        self.min_request_interval = self.config['scraper'].get('min_request_interval', 0.5)
         
-        self.logger.info("Competitor Scraper initialized successfully")
-    
-    def _load_config(self, config_path):
-        """Load configuration from YAML file"""
-        with open(config_path, 'r') as file:
-            return yaml.safe_load(file)
+        # Session ID for tracing
+        self.session_uuid = str(uuid.uuid4())
+        
+        # Initialize StatisticsManager
+        self.statistics_manager = StatisticsManager('scraper', self.db_manager)
+        self.session_id = self.statistics_manager.session_id
+        
+        # Initialize control flags
+        self.shutdown_requested = False
+        self.suspend_handled = False
+        
+        self.logger.info(f"Competitor Scraper initialized successfully (session {self.session_uuid})")
+
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """
+        Load configuration from YAML file.
+        
+        Args:
+            config_path: Path to the configuration file
+            
+        Returns:
+            Dictionary containing the configuration
+        """
+        try:
+            with open(config_path, 'r') as file:
+                config = yaml.safe_load(file)
+                # Only log if logger is already initialized
+                if hasattr(self, 'logger'):
+                    self.logger.info(f"Configuration loaded from {config_path}")
+                return config
+        except Exception as e:
+            error_msg = f"Failed to load configuration from {config_path}: {str(e)}"
+            if hasattr(self, 'logger'):
+                self.logger.error(error_msg)
+            raise ValueError(error_msg)
     
     def _setup_logging(self):
-        """Set up logging configuration"""
+        """Set up logging configuration."""
         log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
         os.makedirs(log_dir, exist_ok=True)
-        
         log_file = os.path.join(log_dir, 'competitor_scraper.log')
         
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
+            handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
         )
-        
         self.logger = logging.getLogger('competitor_scraper')
     
+    def _initialize_database(self):
+        """Initialize the database connection."""
+        try:
+            db_path = self.config['database']['path']
+            db_dir = os.path.dirname(db_path)
+            
+            # Create database directory if it doesn't exist
+            if not os.path.exists(db_dir):
+                os.makedirs(db_dir, exist_ok=True)
+                self.logger.info(f"Created database directory {db_dir}")
+            
+            # Initialize database if it doesn't exist
+            if not os.path.exists(db_path):
+                self.logger.info(f"Database not found. Initializing database at {db_path}")
+                config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
+                init_db(db_path, config_path=config_path)
+                self.logger.info("Database initialized successfully")
+            
+            # Get database manager singleton
+            self.db_manager = get_db_manager(db_path)
+            if not hasattr(self.db_manager, '_initialized') or not self.db_manager._initialized:
+                self.db_manager.initialize(db_path)
+            
+            self.logger.info(f"Database manager initialized for {db_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize database manager: {str(e)}")
+            raise
+    
     def _setup_ai_clients(self):
-        """Initialize AI API clients"""
-        # Anthropic setup only - without proxy configuration
+        """Initialize Anthropic API client."""
         anthropic_config = self.config['ai_apis']['anthropic']
         
-        # Get API key from environment variables, fallback to config
-        self.anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY')
+        # Get API key securely from environment or config
+        self.anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY', anthropic_config.get('api_key'))
         if not self.anthropic_api_key:
-            self.anthropic_api_key = anthropic_config.get('api_key')
-            if not self.anthropic_api_key:
-                self.logger.error("No Anthropic API key found in environment or config")
-                raise ValueError("Anthropic API key is required. Set ANTHROPIC_API_KEY environment variable or in config.yaml")
+            self.logger.error("No Anthropic API key found in environment or config")
+            raise ValueError(
+                "Anthropic API key is required. Set ANTHROPIC_API_KEY environment variable or in config.yaml"
+            )
         
-        self.anthropic_model = anthropic_config['model']
-        self.anthropic_sonnet_model = anthropic_config.get('sonnet_model')
+        # Get model names from config
+        self.anthropic_model = anthropic_config.get('model', 'claude-3-haiku-20240307')
+        self.anthropic_sonnet_model = anthropic_config.get('sonnet_model', 'claude-3-sonnet-20240229')
         
-        # Initialize the Claude analyzer
-        self.claude_analyzer = ClaudeAnalyzer(
-            api_key=self.anthropic_api_key,
-            model=self.anthropic_model,
-            sonnet_model=self.anthropic_sonnet_model
-        )
+        # Initialize client
+        self.anthropic_client = anthropic.Anthropic(api_key=self.anthropic_api_key)
         
         self.logger.info("Anthropic API configuration loaded successfully")
-
-    def _log_to_db(self, level, message):
-        """Log message to database using the database manager to prevent locks"""
-        # Truncate extremely long messages to prevent excessive database load
+    
+    def _log_to_db(self, level: str, message: str):
+        """
+        Log message to database.
+        
+        Args:
+            level: Log level (INFO, WARNING, ERROR)
+            message: Log message text
+        """
+        # Truncate long messages to avoid database issues
         if len(message) > 2000:
             message = message[:1997] + '...'
-            
-        # Use our database manager to log to the database
-        # This ensures all database access goes through a single connection
-        # with proper locking to prevent race conditions
+        
         try:
-            # Use a context manager to ensure proper transaction handling
             with self.db_manager.session() as session:
-                # Create a new log entry
-                from database.schema import ScraperLog
                 log_entry = ScraperLog(
                     timestamp=datetime.datetime.now(),
                     level=level,
                     message=message
                 )
                 session.add(log_entry)
-                # No need to commit explicitly - the context manager handles it
-                
+                session.commit()
         except Exception as e:
-            # If database logging fails, log to file
             self.logger.warning(f"Failed to log to database: {str(e)}")
-            
-            # Additional detailed error info for debugging
-            import traceback
-            self.logger.debug(f"Database logging error details: {traceback.format_exc()}")
-
     
-    def _load_visited_urls(self):
-        """Load previously visited URLs from the database using our database manager"""
+    def _load_visited_urls(self) -> Set[str]:
+        """
+        Load previously visited URLs from the database.
+        
+        Returns:
+            Set of visited URL strings
+        """
         visited_urls = set()
         try:
-            # Use the database manager to ensure proper locking
             with self.db_manager.session() as session:
-                # Get all URLs that have been visited
                 visited_records = session.query(CrawlStatus).filter_by(visited=True).all()
                 for record in visited_records:
                     visited_urls.add(record.url)
-                
             self.logger.info(f"Loaded {len(visited_urls)} previously visited URLs from database")
         except Exception as e:
             self.logger.error(f"Error loading visited URLs: {str(e)}")
         
         return visited_urls
     
-    def check_shutdown_requested(self):
-        """Check if shutdown was requested via global signal handler
+    def _is_excluded_url(self, url: str) -> bool:
+        """
+        Check if a URL should be excluded from crawling based on patterns.
+        
+        Args:
+            url: URL to check
+            
+        Returns:
+            True if the URL should be excluded, False otherwise
+        """
+        parsed_url = urlparse(url)
+        target_domain = urlparse(self.config['target_url']).netloc
+        
+        # Check if the domain is different from the target domain
+        if parsed_url.netloc and parsed_url.netloc != target_domain:
+            return True
+        
+        # Check for file extensions to exclude
+        path = parsed_url.path.lower()
+        excluded_extensions = [
+            '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.xml',
+            '.zip', '.rar', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+        ]
+        if any(path.endswith(ext) for ext in excluded_extensions):
+            return True
+        
+        # Check for negative keywords from config
+        negative_keywords = self.config.get('keywords', {}).get('negative', [])
+        if any(keyword in url.lower() for keyword in negative_keywords):
+            return True
+        
+        # Check for common paths to exclude
+        common_exclusions = [
+            '/search', '/login', '/register', '/cart', '/checkout', '/account',
+            '/privacy', '/terms', '/contact', '/about', '/faq', '/help',
+            'javascript:', 'mailto:', 'tel:', '#', '?'
+        ]
+        if any(pattern in url.lower() for pattern in common_exclusions):
+            return True
+        
+        return False
+    
+    def _check_url_in_database(self, url: str) -> Tuple[bool, bool]:
+        """
+        Check if a URL exists in the database and if it has been visited.
+        
+        Args:
+            url: URL to check
+            
+        Returns:
+            Tuple of (exists_in_db, has_been_visited)
+        """
+        try:
+            with self.db_manager.session() as session:
+                status = session.query(CrawlStatus).filter(CrawlStatus.url == url).first()
+                if status:
+                    return True, status.visited
+                return False, False
+        except Exception as e:
+            self.logger.error(f"Error checking URL in database: {str(e)}")
+            return False, False
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
+          retry=retry_if_exception_type(requests.RequestException))
+    def _fetch_url(self, url: str) -> Optional[str]:
+        """
+        Fetch URL content with retries and error handling.
+        
+        Args:
+            url: URL to fetch
+            
+        Returns:
+            HTML content as string, or None if the fetch failed
+        """
+        # Get configuration values
+        max_retries = self.config['scraper'].get('max_retries', 3)
+        retry_delay = self.config['scraper'].get('retry_delay', 1)
+        timeout = self.config['scraper'].get('request_timeout', 30)
+        user_agent = self.config['crawling'].get('user_agent', 'NDAIVI Scraper')
+        
+        # Set up headers
+        headers = {'User-Agent': user_agent}
+        
+        # Respect rate limiting
+        current_time = time.time()
+        elapsed = current_time - self.last_request_time
+        if elapsed < self.min_request_interval:
+            time.sleep(self.min_request_interval - elapsed)
+        
+        # Retry loop
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    time.sleep(retry_delay * attempt)  # Progressive delay
+                
+                # Record request time for rate limiting
+                self.last_request_time = time.time()
+                
+                # Make the request
+                response = requests.get(url, headers=headers, timeout=timeout)
+                
+                if response.status_code == 200:
+                    self.statistics_manager.increment_stat('urls_processed')
+                    return response.text
+                else:
+                    self.logger.warning(f"HTTP error {response.status_code} for URL: {url}")
+                    self.statistics_manager.increment_stat('http_errors')
+            except requests.exceptions.ConnectionError as e:
+                self.logger.warning(f"Connection error for URL {url}: {str(e)}")
+                self.statistics_manager.increment_stat('connection_errors')
+            except requests.exceptions.Timeout as e:
+                self.logger.warning(f"Timeout error for URL {url}: {str(e)}")
+                self.statistics_manager.increment_stat('timeout_errors')
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(f"Request error for URL {url}: {str(e)}")
+            
+            if attempt < max_retries:
+                self.logger.info(f"Retrying URL {url} (attempt {attempt+1}/{max_retries})")
+            else:
+                self.logger.error(f"Failed to fetch URL {url} after {max_retries} retries")
+        
+        return None
+    
+    def _extract_text_content(self, soup: BeautifulSoup) -> str:
+        """
+        Extract readable text content from the page.
+        
+        Args:
+            soup: BeautifulSoup object of the page
+            
+        Returns:
+            Cleaned text content as string
+        """
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.extract()
+        
+        # Get text and clean it
+        text = soup.get_text()
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        
+        return '\n'.join(chunk for chunk in chunks if chunk)
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
+           retry=retry_if_exception_type(AnthropicError))
+    def _analyze_with_anthropic(self, url: str, title: str, content: str) -> bool:
+        """
+        Use Claude Haiku to determine if the page is a manufacturer page.
+        
+        Args:
+            url: URL of the page
+            title: Page title
+            content: Page text content
+            
+        Returns:
+            True if the page is a manufacturer page, False otherwise
+        """
+        try:
+            # Truncate content to avoid token limits
+            truncated_content = content[:2000] + "..." if len(content) > 2000 else content
+            
+            # Craft an improved prompt for more reliable analysis
+            prompt = (
+                f"Task: Analyze the following webpage content to determine if it lists or describes manufacturers "
+                f"or their products.\n\n"
+                f"URL: {url}\n"
+                f"Title: {title}\n\n"
+                f"Content excerpt:\n{truncated_content}\n\n"
+                f"A manufacturer page typically lists company names that make products, possibly with product categories, "
+                f"brands, or industry information. Look for lists, tables, or descriptions of companies that produce "
+                f"or supply products.\n\n"
+                f"Respond with ONLY 'yes' if this is a manufacturer page, or 'no' otherwise."
+            )
+            
+            response = self.anthropic_client.messages.create(
+                model=self.anthropic_model,
+                max_tokens=10,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            result = response.content[0].text.strip().lower()
+            
+            if result not in ['yes', 'no']:
+                self.logger.warning(f"Unexpected Claude Haiku response for {url}: {result}, treating as 'no'")
+                return False
+            
+            self.logger.info(f"Claude Haiku analysis for {url}: {result}")
+            self.statistics_manager.increment_stat('ai_queries')
+            return result == 'yes'
+        
+        except AnthropicError as e:
+            self.logger.error(f"Anthropic API error for {url}: {str(e)}")
+            self._log_to_db("ERROR", f"Anthropic API error: {str(e)}")
+            self.statistics_manager.increment_stat('ai_errors')
+            raise
+        
+        except Exception as e:
+            self.logger.error(f"Error analyzing with Claude Haiku for {url}: {str(e)}")
+            self._log_to_db("ERROR", f"Error analyzing with Claude Haiku: {str(e)}")
+            self.statistics_manager.increment_stat('ai_errors')
+            return False
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
+           retry=retry_if_exception_type(AnthropicError))
+    def _analyze_with_claude_sonnet(self, url: str, title: str, content: str) -> List[Dict[str, Any]]:
+        """
+        Use Claude Sonnet to extract manufacturer and category information.
+        
+        Args:
+            url: URL of the page
+            title: Page title
+            content: Page text content
+            
+        Returns:
+            List of dictionaries with manufacturer and category information
+        """
+        try:
+            # Truncate content to avoid token limits
+            truncated_content = content[:4000] + "..." if len(content) > 4000 else content
+            
+            # Craft an improved prompt for more reliable extraction
+            prompt = (
+                f"Task: Extract manufacturer names and associated product categories from the following webpage content.\n\n"
+                f"URL: {url}\n"
+                f"Title: {title}\n\n"
+                f"Content excerpt:\n{truncated_content}\n\n"
+                f"Instructions:\n"
+                f"1. Identify company names that manufacture or supply products\n"
+                f"2. For each manufacturer, identify their product categories\n"
+                f"3. Each category name must include the manufacturer name as part of it\n"
+                f"4. Return the data as a JSON array with this exact structure:\n"
+                f"[\n"
+                f"  {{\n"
+                f"    \"manufacturer\": \"CompanyName\",\n"
+                f"    \"categories\": [\"CompanyName Product Category 1\", \"CompanyName Product Category 2\"]\n"
+                f"  }}\n"
+                f"]\n\n"
+                f"If no manufacturers are found, return an empty array: []\n"
+                f"Your response must be valid JSON only, with no additional text."
+            )
+            
+            response = self.anthropic_client.messages.create(
+                model=self.anthropic_sonnet_model,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            result_text = response.content[0].text.strip()
+            
+            # Extract JSON from the response if needed
+            if not result_text.startswith('['):
+                # Try to find JSON array in the response
+                import re
+                json_match = re.search(r'\[(.*?)\]', result_text, re.DOTALL)
+                if json_match:
+                    result_text = json_match.group(0)
+                else:
+                    self.logger.warning(f"Invalid JSON response format for {url}: {result_text}")
+                    return []
+            
+            # Parse the JSON response
+            try:
+                result = json.loads(result_text)
+                if not isinstance(result, list):
+                    self.logger.warning(f"Invalid response type for {url}: {type(result)}, expected list")
+                    return []
+                
+                self.logger.info(f"Claude Sonnet extracted {len(result)} manufacturers from {url}")
+                self.statistics_manager.increment_stat('ai_extractions')
+                return result
+            
+            except json.JSONDecodeError as e:
+                self.logger.error(f"JSON parsing error for {url}: {str(e)}\nResponse: {result_text}")
+                return []
+        
+        except AnthropicError as e:
+            self.logger.error(f"Anthropic API error for {url}: {str(e)}")
+            self._log_to_db("ERROR", f"Anthropic API error: {str(e)}")
+            self.statistics_manager.increment_stat('ai_errors')
+            raise
+        
+        except Exception as e:
+            self.logger.error(f"Error analyzing with Claude Sonnet for {url}: {str(e)}")
+            self._log_to_db("ERROR", f"Error analyzing with Claude Sonnet: {str(e)}")
+            self.statistics_manager.increment_stat('ai_errors')
+            return []
+    
+    def _translate_category(self, category: str, manufacturer_name: str) -> str:
+        """
+        Translate a category name to the target language, preserving manufacturer name.
+        
+        Args:
+            category: Original category name
+            manufacturer_name: Manufacturer name to preserve
+            
+        Returns:
+            Translated category name
+        """
+        target_lang = list(self.config['languages']['targets'].keys())[0]  # Use first target language
+        if target_lang == self.config['languages']['source']:
+            return category
+        
+        try:
+            # Detect if already in target language
+            spanish_indicators = ['de', 'para', 'con', 'del', 'y', 'las', 'los']
+            if any(word in category.lower().split() for word in spanish_indicators):
+                self.logger.info(f"Category '{category}' appears to be in Spanish, skipping translation")
+                return category
+            
+            # Create a prompt that ensures manufacturer name preservation
+            prompt = (
+                f"Translate this product category from English to {target_lang}: \"{category}\"\n"
+                f"Important rules:\n"
+                f"1. Preserve the manufacturer name '{manufacturer_name}' exactly as-is\n"
+                f"2. Only translate descriptive words\n"
+                f"3. Keep proper nouns unchanged\n"
+                f"4. Return only the translated category text"
+            )
+            
+            response = self.anthropic_client.messages.create(
+                model=self.anthropic_model,
+                max_tokens=100,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            translated = response.content[0].text.strip()
+            
+            # Verify manufacturer name is preserved
+            if manufacturer_name.lower() in translated.lower():
+                self.logger.info(f"Translated '{category}' to '{translated}'")
+                self.statistics_manager.increment_stat('translations')
+                return translated
+            else:
+                self.logger.warning(f"Translation lost manufacturer name: '{translated}'. Using original.")
+                return category
+        
+        except Exception as e:
+            self.logger.error(f"Error translating category '{category}': {str(e)}")
+            return category
+    
+    def _process_extracted_data(self, response_data: List[Dict[str, Any]], source_url: str):
+        """
+        Process and save extracted manufacturer and category data.
+        
+        Args:
+            response_data: List of dictionaries with manufacturer and category data
+            source_url: Source URL where the data was extracted from
+        """
+        if not response_data:
+            self.logger.info(f"No manufacturers found in {source_url}")
+            return
+        
+        manufacturers_added = 0
+        categories_added = 0
+        
+        try:
+            with self.db_manager.session() as session:
+                for item in response_data:
+                    manufacturer_name = item.get('manufacturer')
+                    if not manufacturer_name:
+                        self.logger.warning(f"Missing manufacturer name in data: {item}")
+                        continue
+                    
+                    manufacturer_name = manufacturer_name.strip()
+                    categories = item.get('categories', [])
+                    if not categories:
+                        self.logger.warning(f"No categories found for manufacturer {manufacturer_name}")
+                        continue
+                    
+                    # Check for existing manufacturer
+                    manufacturer = session.query(Manufacturer).filter(
+                        func.lower(Manufacturer.name) == func.lower(manufacturer_name)
+                    ).first()
+                    
+                    if not manufacturer:
+                        manufacturer = Manufacturer(name=manufacturer_name)
+                        session.add(manufacturer)
+                        manufacturers_added += 1
+                        self.statistics_manager.increment_stat('manufacturers_extracted')
+                        self.logger.info(f"Added new manufacturer: {manufacturer_name}")
+                    else:
+                        self.logger.debug(f"Manufacturer {manufacturer_name} already exists")
+                    
+                    # Process categories
+                    categories_processed = 0
+                    for category_name in categories:
+                        # Validate category contains manufacturer name
+                        if manufacturer_name.lower() not in category_name.lower():
+                            self.logger.warning(f"Skipping category '{category_name}' - missing manufacturer name")
+                            continue
+                        
+                        # Translate category if needed
+                        translated_category = self._translate_category(category_name, manufacturer_name)
+                        
+                        # Check for existing category
+                        category = session.query(Category).filter(
+                            func.lower(Category.name) == func.lower(translated_category)
+                        ).first()
+                        
+                        if not category:
+                            category = Category(name=translated_category)
+                            session.add(category)
+                            categories_added += 1
+                            self.statistics_manager.increment_stat('categories_extracted')
+                            self.logger.debug(f"Added new category: {translated_category}")
+                        
+                        # Associate category with manufacturer if not already associated
+                        if category not in manufacturer.categories:
+                            manufacturer.categories.append(category)
+                            categories_processed += 1
+                            self.logger.debug(f"Associated '{translated_category}' with '{manufacturer_name}'")
+                    
+                    # Set website if applicable
+                    manufacturer_website = item.get('website')
+                    if manufacturer_website:
+                        # Don't set internal links as manufacturer websites
+                        target_domain = urlparse(self.config['target_url']).netloc
+                        website_domain = urlparse(manufacturer_website).netloc
+                        if target_domain in website_domain:
+                            manufacturer_website = None
+                    
+                    # If not explicitly provided, check if source URL might be manufacturer website
+                    if not manufacturer_website:
+                        source_domain = urlparse(source_url).netloc
+                        target_domain = urlparse(self.config['target_url']).netloc
+                        if manufacturer_name.lower() in source_domain.lower() and source_domain != target_domain:
+                            manufacturer_website = source_url
+                    
+                    # Update manufacturer website if we found a valid one
+                    if manufacturer_website and not manufacturer.website:
+                        manufacturer.website = manufacturer_website
+                        self.statistics_manager.increment_stat('websites_found')
+                        self.logger.info(f"Set website for '{manufacturer_name}': {manufacturer_website}")
+                
+                # Commit changes to database
+                session.commit()
+            
+            self.logger.info(
+                f"Processed {len(response_data)} manufacturers from {source_url} "
+                f"(Added: {manufacturers_added} manufacturers, {categories_added} categories)"
+            )
+            self._log_to_db(
+                "INFO", 
+                f"Saved {manufacturers_added} manufacturers and {categories_added} categories from {source_url}"
+            )
+        
+        except Exception as e:
+            self.logger.error(f"Error processing extracted data for {source_url}: {str(e)}")
+            self._log_to_db("ERROR", f"Error processing extracted data: {str(e)}")
+    
+    def _extract_links(self, soup: BeautifulSoup, base_url: str) -> Dict[str, str]:
+        """
+        Extract links from a BeautifulSoup object.
+        
+        Args:
+            soup: BeautifulSoup object of the page
+            base_url: Base URL for resolving relative links
+            
+        Returns:
+            Dictionary mapping URLs to their anchor text
+        """
+        extracted_links = {}
+        try:
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                anchor_text = link.get_text().strip()
+                
+                # Skip empty or javascript links
+                if not href or href.startswith('javascript:') or href == '#':
+                    continue
+                
+                # Resolve relative URLs
+                absolute_url = urljoin(base_url, href) if not href.startswith(('http://', 'https://')) else href
+                
+                # Clean URL (remove fragments)
+                parsed_url = urlparse(absolute_url)
+                clean_url = parsed_url._replace(fragment='').geturl()
+                
+                # Check domain restrictions
+                stay_within_domain = self.config['crawling'].get('stay_within_domain', False)
+                if stay_within_domain and not self._is_same_domain(clean_url, base_url):
+                    continue
+                
+                # Check exclusion patterns
+                if self._is_excluded_url(clean_url):
+                    continue
+                
+                # Add to extracted links dict
+                if clean_url not in extracted_links:
+                    extracted_links[clean_url] = anchor_text
+            
+            self.logger.debug(f"Extracted {len(extracted_links)} links from {base_url}")
+            return extracted_links
+        
+        except Exception as e:
+            self.logger.error(f"Error extracting links from {base_url}: {str(e)}")
+            return {}
+    
+    def _is_same_domain(self, url1: str, url2: str) -> bool:
+        """
+        Check if two URLs belong to the same domain.
+        
+        Args:
+            url1: First URL
+            url2: Second URL
+            
+        Returns:
+            True if both URLs have the same domain, False otherwise
+        """
+        return urlparse(url1).netloc == urlparse(url2).netloc
+    
+    def check_shutdown_requested(self) -> bool:
+        """
+        Check if shutdown or suspension was requested via signal handler.
         
         Returns:
-            bool: True if shutdown was requested, False otherwise
+            True if shutdown was requested, False otherwise
         """
         global _SHUTDOWN_REQUESTED, _SUSPEND_REQUESTED
         
-        # Check for suspension request first
-        if _SUSPEND_REQUESTED and not getattr(self, 'suspend_handled', False):
+        # Handle suspension request
+        if _SUSPEND_REQUESTED and not self.suspend_handled:
             self.suspend_handled = True
             self.logger.info("Suspension requested via CTRL+Z, marking session as interrupted...")
             self._log_to_db("INFO", "Process suspension requested via CTRL+Z")
             
-            # Mark the current session as interrupted before suspension
-            if hasattr(self, 'session_id') and self.session_id is not None:
+            if self.session_id:
                 try:
                     with self.db_manager.session() as session:
                         scraper_session = session.query(ScraperSession).filter_by(id=self.session_id).first()
                         if scraper_session and scraper_session.status == 'running':
                             scraper_session.status = 'interrupted'
                             scraper_session.end_time = datetime.datetime.now()
+                            session.commit()
                             self.logger.info(f"Marked session {self.session_id} as interrupted due to CTRL+Z")
                 except Exception as e:
                     self.logger.error(f"Error updating session status during suspension: {str(e)}")
         
-        # Then check for shutdown request
-        if _SHUTDOWN_REQUESTED and not getattr(self, 'shutdown_requested', False):
+        # Handle shutdown request
+        if _SHUTDOWN_REQUESTED and not self.shutdown_requested:
             self.shutdown_requested = True
             self.logger.info("Shutdown requested via signal, finishing gracefully...")
             self._log_to_db("INFO", "Shutdown requested via signal")
-            # Ensure we clean up resources when shutdown is requested
             self.close()
-            
-        return getattr(self, 'shutdown_requested', False)
+        
+        return self.shutdown_requested
     
-    def start_crawling(self, max_pages=None):
+    def _mark_url_visited(self, url: str, is_manufacturer: bool = False, depth: Optional[int] = None) -> bool:
         """
-        Start the crawling process.
+        Mark a URL as visited in the database and in-memory set.
         
         Args:
-            max_pages (int, optional): Maximum number of pages to process.
-                If None, uses the value from config.
+            url: URL to mark as visited
+            is_manufacturer: Whether the URL is a manufacturer page
+            depth: Crawl depth of the URL
+            
+        Returns:
+            True if the operation was successful, False otherwise
         """
-        self.statistics_manager.start_session('scraper')
-        # Log to file only first to avoid any startup database contention issues
-        self.logger.info("Starting crawling process")
+        if url not in self.visited_urls:
+            self.visited_urls.add(url)
         
-        # Store session ID from statistics manager
-        self.session_id = self.statistics_manager.session_id
-        self.logger.info(f"Created new scraper session with ID {self.session_id}")
-        
-        # Initialize shutdown flag
-        self.shutdown_requested = False
-        
-        # Check if shutdown was already requested before we even started
-        self.check_shutdown_requested()
-        
-        # Initialize the URL queue with the target URL and unvisited URLs from database
-        if not self.url_queue:
-            self._load_initial_urls()
-            self._load_unvisited_urls()
-            
-        # Use process_batch to handle the actual crawling
-        # This ensures that max_pages is properly respected
-        batch_stats = self.process_batch(max_pages=max_pages)
-        
-        # Update session record with final status
         try:
-            # Let the statistics manager handle the session update
-            self.statistics_manager.update_session_in_database(completed=True)
-            self.logger.info(f"Updated session {self.session_id} - marked as completed")
-        except Exception as e:
-            self.logger.error(f"Failed to update scraper session: {str(e)}")
-            
-        # Log completion
-        self.logger.info(f"Crawling finished. Processed {batch_stats.get('pages_crawled', 0)} pages.")
-        
-        return batch_stats
-    
-    def generate_sitemap_files(self):
-        """Generate sitemap files from database information"""
-        try:
-            # Create output directory if it doesn't exist
-            output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output')
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Get sitemap data from database
-            sitemap = []
             with self.db_manager.session() as session:
-                # Get all visited URLs with title and outgoing links
-                entries = session.query(CrawlStatus).filter_by(visited=True).all()
+                status = session.query(CrawlStatus).filter(CrawlStatus.url == url).first()
+                current_time = datetime.datetime.now()
                 
-                for entry in entries:
-                    if entry.url:
-                        sitemap.append({
-                            'url': entry.url,
-                            'title': entry.title if entry.title else "",
-                            'depth': entry.depth if entry.depth is not None else 0,
-                            'links': entry.outgoing_links if entry.outgoing_links is not None else 0
-                        })
-            
-            if not sitemap:
-                self.logger.warning("No sitemap data found in database")
-                return
+                if status:
+                    # Update existing record
+                    status.visited = True
+                    status.last_visited = current_time
+                    status.is_manufacturer_page = is_manufacturer
+                    if depth is not None and (status.depth is None or depth < status.depth):
+                        status.depth = depth
+                    self.logger.debug(f"Updated existing URL in database as visited: {url}")
+                else:
+                    # Create new record
+                    url_depth = depth if depth is not None else 0
+                    status = CrawlStatus(
+                        url=url,
+                        visited=True,
+                        depth=url_depth,
+                        last_visited=current_time,
+                        is_manufacturer_page=is_manufacturer
+                    )
+                    session.add(status)
+                    self.logger.debug(f"Added new URL to database as visited: {url} with depth {url_depth}")
                 
-            # Save as JSON
-            sitemap_path = os.path.join(output_dir, 'sitemap.json')
-            with open(sitemap_path, 'w') as f:
-                json.dump(sitemap, f, indent=2)
-            
-            # Also save as XML (standard sitemap format)
-            xml_path = os.path.join(output_dir, 'sitemap.xml')
-            with open(xml_path, 'w') as f:
-                f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
-                
-                for entry in sitemap:
-                    f.write('  <url>\n')
-                    f.write(f'    <loc>{entry["url"]}</loc>\n')
-                    f.write('  </url>\n')
-                
-                f.write('</urlset>')
-            
-            self.logger.info(f"Sitemap generated with {len(sitemap)} URLs and saved to {sitemap_path} and {xml_path}")
-            self._log_to_db("INFO", f"Sitemap generated with {len(sitemap)} URLs and saved to {sitemap_path} and {xml_path}")
-            
+                session.commit()
+                return True
+        
         except Exception as e:
-            self.logger.error(f"Error generating sitemap: {str(e)}")
-            self._log_to_db("ERROR", f"Error generating sitemap: {str(e)}")
+            self.logger.error(f"Error marking URL as visited in database: {url}, Error: {str(e)}")
+            return False
     
     def _load_initial_urls(self):
-        """Load initial URLs from configuration"""
-        # Get initial URLs from config or use target_url if not defined
+        """Load initial URLs from configuration."""
         initial_urls = self.config['crawling'].get('initial_urls', [self.config['target_url']])
-        
-        # Add URLs to the queue if not already visited
         added_count = 0
+        
         for url in initial_urls:
             if url not in self.visited_urls:
-                self.url_queue.append((url, 0))
+                self.url_queue.push(url, 0, priority=1.0)  # High priority for initial URLs
                 added_count += 1
             
-            # Add to database if not exists using our database manager
             try:
                 with self.db_manager.session() as session:
                     existing_status = session.query(CrawlStatus).filter_by(url=url).first()
                     if not existing_status:
                         status = CrawlStatus(url=url, depth=0)
                         session.add(status)
-                    # No explicit commit needed - handled by context manager
+                        session.commit()
             except Exception as e:
-                self.logger.warning(f"Error adding URL to database: {str(e)}")
-        self.logger.info(f"Added {added_count} initial URLs to the queue")
+                self.logger.warning(f"Error adding initial URL to database: {str(e)}")
         
+        self.logger.info(f"Added {added_count} initial URLs to the queue")
+    
     def _load_unvisited_urls(self):
-        """Load unvisited URLs from the database to resume scraping"""
+        """Load unvisited URLs from the database to resume scraping."""
         try:
-            # Use our database manager to get unvisited URLs
             with self.db_manager.session() as session:
-                # Get all URLs that have been added but not visited yet
-                # Limit to a reasonable number to avoid memory issues
-                unvisited_records = session.query(CrawlStatus).filter_by(visited=False).limit(1000).all()
-                added_count = 0
+                # Get unvisited URLs sorted by depth (shallow first)
+                unvisited_records = (
+                    session.query(CrawlStatus)
+                    .filter_by(visited=False)
+                    .order_by(CrawlStatus.depth)
+                    .limit(1000)
+                    .all()
+                )
                 
+                added_count = 0
                 for record in unvisited_records:
-                    if record.url not in self.visited_urls and not any(record.url == url for url, _ in self.url_queue):
-                        self.url_queue.append((record.url, record.depth))
+                    if record.url not in self.visited_urls:
+                        # Priority based on depth
+                        priority = record.depth * 10.0 if record.depth is not None else 100.0
+                        self.url_queue.push(record.url, record.depth or 0, priority=priority)
                         added_count += 1
                 
-                # If no URLs were loaded, add the initial URL as a fallback
+                # If no unvisited URLs, add target URL as fallback
                 if added_count == 0 and len(self.url_queue) == 0:
                     target_url = self.config['target_url']
                     self.logger.info(f"No unvisited URLs found in database, adding target URL: {target_url}")
-                    self.url_queue.append((target_url, 0))
                     
-                    # Make sure it's in the database - reusing the same session
+                    self.url_queue.push(target_url, 0, priority=1.0)
+                    
                     existing_status = session.query(CrawlStatus).filter_by(url=target_url).first()
                     if not existing_status:
                         status = CrawlStatus(url=target_url, depth=0)
                         session.add(status)
-                        # No explicit commit needed - handled by context manager
+                        session.commit()
+                    
                     added_count = 1
-            
-            self.logger.info(f"Loaded {added_count} unvisited URLs from database to resume scraping")
+                
+                self.logger.info(f"Loaded {added_count} unvisited URLs from database")
+        
         except Exception as e:
             self.logger.error(f"Error loading unvisited URLs: {str(e)}")
+            
+            # Add target URL as fallback
+            if len(self.url_queue) == 0:
+                target_url = self.config['target_url']
+                self.logger.info(f"Adding target URL as fallback after error: {target_url}")
+                self.url_queue.push(target_url, 0, priority=1.0)
     
-    def _crawl_page(self, url):
-        """Crawl a single page and return the soup and new URLs"""
-        headers = {
-            'User-Agent': self.config['crawling']['user_agent']
-        }
-        
+    def generate_sitemap_files(self):
+        """Generate sitemap files from database information."""
         try:
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
+            output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output')
+            os.makedirs(output_dir, exist_ok=True)
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract all links from the page
-            new_urls = []
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                absolute_url = urljoin(url, href)
-                
-                # Only include URLs from the same domain
-                if self._is_same_domain(url, absolute_url):
-                    new_urls.append(absolute_url)
-            
-            return soup, new_urls
-            
-        except Exception as e:
-            self.logger.error(f"Error fetching {url}: {str(e)}")
-            return None, []
-    
-    def _is_same_domain(self, url1, url2):
-        """Check if two URLs belong to the same domain"""
-        domain1 = urlparse(url1).netloc
-        domain2 = urlparse(url2).netloc
-        return domain1 == domain2
-    
-    def _process_page(self, url, soup, depth):
-        """Process the page content to extract manufacturer and category information"""
-        # Get the page title and content text
-        title = soup.title.string if soup.title else ""
-        content = self._extract_text_content(soup)
-        
-        # Check if the page matches any positive keywords
-        positive_keywords = self.config['keywords']['positive']
-        negative_keywords = self.config['keywords']['negative']
-        
-        # Check for positive keywords in URL, title, and content
-        positive_match = any(keyword.lower() in url.lower() or 
-                            keyword.lower() in title.lower() or 
-                            keyword.lower() in content.lower() 
-                            for keyword in positive_keywords)
-        
-        # Check for negative keywords
-        negative_match = any(keyword.lower() in url.lower() or 
-                            keyword.lower() in title.lower() 
-                            for keyword in negative_keywords)
-        
-        # Update crawl status using our database manager
-        try:
+            # Get visited URLs from database
+            sitemap = []
             with self.db_manager.session() as session:
-                status = session.query(CrawlStatus).filter_by(url=url).first()
-                
-                if not status:
-                    self.logger.warning(f"No status record found for URL: {url}")
-                    return
-                    
-                if positive_match and not negative_match:
-                    self.logger.info(f"Found potential manufacturer page: {url}")
-                    # Use Claude Sonnet for detailed analysis
-                    self._analyze_with_claude_sonnet(url, title, content)
-                    status.analyzed = True
-                    status.is_manufacturer_page = True
-                else:
-                    # Use Claude Haiku for cheaper analysis to determine if it's a manufacturer page
-                    is_manufacturer = self._analyze_with_anthropic(url, title, content)
-                    status.analyzed = True
-                    status.is_manufacturer_page = is_manufacturer
-                    
-                    if is_manufacturer:
-                        self.logger.info(f"Claude identified manufacturer page: {url}")
-                        # Use Claude Sonnet for detailed analysis
-                        self._analyze_with_claude_sonnet(url, title, content)
-                # No explicit commit needed - handled by context manager
-        except Exception as e:
-            self.logger.warning(f"Error updating URL status: {str(e)}")
-    
-    def _extract_text_content(self, soup):
-        """Extract readable text content from the page"""
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.extract()
-        
-        # Get text
-        text = soup.get_text()
-        
-        # Break into lines and remove leading and trailing space on each
-        lines = (line.strip() for line in text.splitlines())
-        
-        # Break multi-headlines into a line each
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        
-        # Drop blank lines
-        text = '\n'.join(chunk for chunk in chunks if chunk)
-        
-        return text
-    
-    def _analyze_with_anthropic(self, url, title, content):
-        """Use Claude Haiku to determine if the page is a manufacturer page"""
-        try:
-            # Import prompt templates
-            from scraper.prompt_templates import MANUFACTURER_DETECTION_PROMPT, SYSTEM_PROMPT
+                entries = session.query(CrawlStatus).filter_by(visited=True).all()
+                for entry in entries:
+                    if entry.url:
+                        sitemap.append({
+                            'url': entry.url,
+                            'title': entry.title if entry.title else "",
+                            'depth': entry.depth if entry.depth is not None else 0,
+                            'links': entry.outgoing_links if entry.outgoing_links is not None else 0,
+                            'is_manufacturer': entry.is_manufacturer_page
+                        })
             
-            # Prepare a truncated version of the content to avoid token limits
-            truncated_content = content[:2000] + "..." if len(content) > 2000 else content
-            
-            # Format the prompt with the page details
-            prompt = MANUFACTURER_DETECTION_PROMPT.format(
-                url=url,
-                title=title,
-                truncated_content=truncated_content
-            )
-            
-            # Use requests to make a direct API call instead of using the client
-            headers = {
-                "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"  # Use the appropriate API version
-            }
-            
-            payload = {
-                "model": self.anthropic_model,
-                "max_tokens": 10,
-                "system": "You are a data extraction assistant specialized in identifying manufacturers and their specific product categories. Always ensure categories are associated with their manufacturer names for clarity.",
-                "messages": [
-                    {"role": "user", "content": prompt + " Respond in  format."}
-                ]
-            }
-            
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload
-            )
-            
-            # Handle the response
-            if response.status_code == 200:
-                response_data = response.json()
-                answer = response_data["content"][0]["text"].strip().lower()
-                
-                # Log the response
-                self.logger.info(f"Claude analysis for {url}: {answer}")
-                
-                return answer == "yes"
-            else:
-                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
-                return False
-            
-        except Exception as e:
-            self.logger.error(f"Error analyzing with Claude: {str(e)}")
-            self._log_to_db("ERROR", f"Error analyzing with Claude: {str(e)}")
-            return False
-    
-    def _analyze_with_claude_sonnet(self, url, title, content):
-        """Use Claude 3.7 Sonnet to extract manufacturer and category information"""
-        try:
-            # Import prompt templates
-            from scraper.prompt_templates import MANUFACTURER_EXTRACTION_PROMPT, MANUFACTURER_DETECTION_PROMPT
-            
-            # Prepare a truncated version of the content to avoid token limits
-            truncated_content = content[:4000] + "..." if len(content) > 4000 else content
-            
-            # Step 1: Check if this is a manufacturer page
-            detection_prompt = MANUFACTURER_DETECTION_PROMPT.format(
-                url=url,
-                title=title,
-                truncated_content=truncated_content
-            )
-            
-            # Use requests to make a direct API call instead of using the client
-            headers = {
-                "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"  # Use the appropriate API version
-            }
-            
-            # First check if it's a manufacturer page
-            detection_payload = {
-                "model": self.anthropic_sonnet_model,
-                "max_tokens": 100,
-                "system": "You are a data extraction assistant that ONLY responds in a strict delimited format between # RESPONSE_START and # RESPONSE_END markers.",
-                "messages": [
-                    {"role": "user", "content": detection_prompt}
-                ]
-            }
-            
-            detection_response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=detection_payload
-            )
-            
-            if detection_response.status_code == 200:
-                detection_data = detection_response.json()
-                if 'content' in detection_data and len(detection_data['content']) > 0:
-                    detection_result = detection_data['content'][0]['text']
-                    
-                    # Parse detection result
-                    claude_analyzer = ClaudeAnalyzer(
-                        api_key=self.anthropic_api_key,
-                        model=self.anthropic_model,
-                        sonnet_model=self.anthropic_sonnet_model,
-                        logger=self.logger
-                    )
-                    is_manufacturer = claude_analyzer._parse_delimited_response(detection_result)
-                    
-                    if not is_manufacturer:
-                        self.logger.info(f"Not a manufacturer page: {url}")
-                        return
-            else:
-                self.logger.error(f"Error from Anthropic API during detection: {detection_response.status_code} - {detection_response.text}")
+            if not sitemap:
+                self.logger.warning("No sitemap data found in database")
                 return
             
-            # Step 2: Extract manufacturer data
-            extraction_prompt = MANUFACTURER_EXTRACTION_PROMPT.format(
-                url=url,
-                title=title,
-                truncated_content=truncated_content
-            )
+            # Save JSON sitemap
+            sitemap_path = os.path.join(output_dir, 'sitemap.json')
+            with open(sitemap_path, 'w') as f:
+                json.dump(sitemap, f, indent=2)
             
-            extraction_payload = {
-                "model": self.anthropic_sonnet_model,
-                "max_tokens": 4000,
-                "system": "You are a data extraction assistant that ONLY responds in a strict delimited format between # RESPONSE_START and # RESPONSE_END markers.",
-                "messages": [
-                    {"role": "user", "content": extraction_prompt}
-                ]
-            }
+            # Save XML sitemap
+            xml_path = os.path.join(output_dir, 'sitemap.xml')
+            with open(xml_path, 'w') as f:
+                f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                f.write('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n')
+                for entry in sitemap:
+                    f.write('  <url>\n')
+                    f.write(f'    <loc>{entry["url"]}</loc>\n')
+                    f.write('  </url>\n')
+                f.write('</urlset>')
             
-            extraction_response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=extraction_payload
-            )
-            
-            # Handle the extraction response
-            if extraction_response.status_code == 200:
-                extraction_data = extraction_response.json()
-                if 'content' in extraction_data and len(extraction_data['content']) > 0:
-                    result = extraction_data['content'][0]['text']
-                    self.logger.info(f"Raw extraction response:\n{result[:500]}...")
-                else:
-                    self.logger.error("Invalid response format from Anthropic API")
-                    return
-            else:
-                self.logger.error(f"Error from Anthropic API during extraction: {extraction_response.status_code} - {extraction_response.text}")
-                return
-            
-            # Process the extracted data
-            self._process_extracted_data(result, url)
-            
+            self.logger.info(f"Sitemap generated with {len(sitemap)} URLs")
+            self._log_to_db("INFO", f"Sitemap generated with {len(sitemap)} URLs")
+        
         except Exception as e:
-            self.logger.error(f"Error analyzing with Claude Sonnet: {str(e)}")
-            self._log_to_db("ERROR", f"Error analyzing with Claude Sonnet: {str(e)}")
+            self.logger.error(f"Error generating sitemap: {str(e)}")
+            self._log_to_db("ERROR", f"Error generating sitemap: {str(e)}")
     
-    def _translate_category(self, category, manufacturer_name):
-        """Translate a category name directly using Claude API"""
-        try:
-            # Skip translation if already in Spanish (contains common Spanish words)
-            spanish_indicators = ['de', 'para', 'con', 'del', 'y', 'las', 'los']
-            if any(word in category.lower().split() for word in spanish_indicators):
-                self.logger.info(f"Category '{category}' appears to already be in Spanish, skipping translation")
-                return category
-                
-            # Prepare a prompt for translation that preserves the manufacturer name
-            prompt = f"""
-            Please translate this product category from English to Spanish: "{category}"
-            
-            Important rules:
-            1. The manufacturer name '{manufacturer_name}' MUST be preserved exactly as-is
-            2. Only translate the rest of the text (descriptive words)
-            3. Keep proper nouns unchanged
-            4. Response format must be ONLY the translated category with no explanation
-            """
-            
-            # Use Claude API directly for translation
-            headers = {
-                "x-api-key": self.anthropic_api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            payload = {
-                "model": self.anthropic_sonnet_model,  # Use the faster/smaller model for translations
-                "max_tokens": 100,
-                "system": "You are a precise translator from English to Spanish. Only respond with the translated text, nothing else.",
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
-            
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload,
-                timeout=10  # Short timeout for quick translations
-            )
-            
-            if response.status_code == 200:
-                response_data = response.json()
-                if 'content' in response_data and len(response_data['content']) > 0:
-                    translated_text = response_data['content'][0]['text'].strip()
-                    
-                    # Verify manufacturer name is still present
-                    if manufacturer_name.lower() in translated_text.lower():
-                        self.logger.info(f"Successfully translated '{category}' to '{translated_text}'")
-                        return translated_text
-                    else:
-                        self.logger.warning(f"Translation lost manufacturer name: '{translated_text}'. Using original.")
-                        return category
-            
-            self.logger.error(f"Failed to translate category '{category}': {response.status_code}")
-            return category  # Return original if translation fails
-                
-        except Exception as e:
-            self.logger.error(f"Error translating category '{category}': {str(e)}")
-            return category  # Return original on error
-    
-    def _process_extracted_data(self, response_text, source_url):
-        """Process the extracted manufacturer and category data using the unified parser"""
-        try:
-            # Log the raw response for debugging
-            self.logger.info(f"Raw Claude response for {source_url}: {response_text[:500]}...")
-            
-            # Use the ClaudeAnalyzer's unified parser
-            claude_analyzer = ClaudeAnalyzer(
-                api_key=self.anthropic_api_key,
-                model=self.anthropic_model,
-                sonnet_model=self.anthropic_sonnet_model,
-                logger=self.logger
-            )
-            parsed_data = claude_analyzer._parse_delimited_response(response_text)
-            
-            # Log the parsed data
-            self.logger.info(f"Parsed data: {parsed_data}")
-            
-            if not parsed_data or 'manufacturers' not in parsed_data or not parsed_data['manufacturers']:
-                self.logger.info(f"No manufacturers found in {source_url}")
-                return
-            
-            # ===== NEW APPROACH: PREPARE DATA FOR BATCH PROCESSING =====
-            # Process and validate the data before saving
-            processed_manufacturers = []
-            
-            # Process each manufacturer from the parsed data
-            for mfr_data in parsed_data['manufacturers']:
-                # Get manufacturer name
-                manufacturer_name = mfr_data.get('name')
-                if not manufacturer_name:
-                    self.logger.warning(f"Missing manufacturer name in data: {mfr_data}")
-                    continue
-                
-                # Normalize manufacturer name
-                manufacturer_name = manufacturer_name.strip()
-                
-                # Validate categories - each must include manufacturer name
-                categories = mfr_data.get('categories', [])
-                if not categories:
-                    self.logger.warning(f"No categories found for manufacturer {manufacturer_name}")
-                    continue
-                
-                # Filter categories to ensure they include manufacturer name
-                valid_categories = []
-                for category in categories:
-                    if manufacturer_name.lower() in category.lower():
-                        # Translate the category immediately using Claude
-                        translated_category = self._translate_category(category.strip(), manufacturer_name)
-                        valid_categories.append(translated_category or category.strip())
-                    else:
-                        self.logger.warning(f"Skipping invalid category '{category}' - must include manufacturer name '{manufacturer_name}'")
-                
-                if not valid_categories:
-                    self.logger.warning(f"No valid categories found for manufacturer {manufacturer_name}")
-                    continue
-                
-                # Get manufacturer website
-                manufacturer_website = mfr_data.get('website')
-                
-                # Skip website if it's the same domain as our target (competitor) website
-                if manufacturer_website:
-                    target_domain = urlparse(self.config['target_url']).netloc
-                    website_domain = urlparse(manufacturer_website).netloc
-                    
-                    # Check if website is the same domain as our target or contains the target domain
-                    if target_domain in website_domain:
-                        self.logger.info(f"Skipping website {manufacturer_website} for {manufacturer_name} - matches target domain")
-                        manufacturer_website = None
-                
-                # Only use source_url as a fallback if it's likely a manufacturer website
-                if not manufacturer_website:
-                    source_domain = urlparse(source_url).netloc
-                    target_domain = urlparse(self.config['target_url']).netloc
-                    
-                    if manufacturer_name.lower() in source_domain.lower() and source_domain != target_domain:
-                        manufacturer_website = source_url
-                    else:
-                        manufacturer_website = None
-                
-                # Add this manufacturer to our processed list
-                processed_manufacturers.append({
-                    'name': manufacturer_name,
-                    'website': manufacturer_website,
-                    'categories': valid_categories
-                })
-            
-            # If we have manufacturers to process, save them directly to the database
-            if processed_manufacturers:
-                self.logger.info(f"Saving {len(processed_manufacturers)} manufacturers from {source_url} directly to database")
-                
-                # Process each manufacturer and save directly to database
-                # using our database manager with proper locking
-                saved_count = 0
-                for mfr_data in processed_manufacturers:
-                    try:
-                        # Use the database manager session context to handle locking
-                        with self.db_manager.session() as session:
-                            # Check if manufacturer already exists
-                            existing_manufacturer = session.query(Manufacturer).filter(
-                                func.lower(Manufacturer.name) == func.lower(mfr_data['name'])
-                            ).first()
-                            
-                            if existing_manufacturer:
-                                self.logger.info(f"Manufacturer {mfr_data['name']} already exists, updating")
-                                manufacturer = existing_manufacturer
-                                # Update website if needed
-                                if mfr_data['website'] and not manufacturer.website:
-                                    manufacturer.website = mfr_data['website']
-                            else:
-                                # Create new manufacturer
-                                manufacturer = Manufacturer(
-                                    name=mfr_data['name'],
-                                    website=mfr_data['website']
-                                )
-                                session.add(manufacturer)
-                                session.flush()  # Get manufacturer ID without committing
-                            
-                            # Process categories - all translated already
-                            for category_name in mfr_data['categories']:
-                                # Check if category already exists for this manufacturer
-                                existing_category = None
-                                for cat in manufacturer.categories:
-                                    if func.lower(cat.name) == func.lower(category_name):
-                                        existing_category = cat
-                                        break
-                                
-                                if not existing_category:
-                                    # Check if category exists in general
-                                    existing_category = session.query(Category).filter(
-                                        func.lower(Category.name) == func.lower(category_name)
-                                    ).first()
-                                    
-                                    if not existing_category:
-                                        # Create new category
-                                        existing_category = Category(name=category_name)
-                                        session.add(existing_category)
-                                        session.flush()
-                                    
-                                    # Add category to manufacturer
-                                    manufacturer.categories.append(existing_category)
-                            
-                            # No explicit commit needed - the context manager handles it
-                        
-                        # If we got here, the transaction was successful
-                        saved_count += 1
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error saving manufacturer {mfr_data['name']}: {str(e)}")
-                
-                self.logger.info(f"Successfully saved {saved_count} of {len(processed_manufacturers)} manufacturers to database")
-                self._log_to_db("INFO", f"Saved {saved_count} manufacturers from {source_url} to database")
-            else:
-                self.logger.info(f"No valid manufacturers found in {source_url}")
-            
-        except Exception as e:
-            self.logger.error(f"Unhandled error in _process_extracted_data: {str(e)}")
-            self._log_to_db("ERROR", f"Unhandled error in _process_extracted_data: {str(e)}")
-            # No need to explicitly roll back - database manager's context manager handles this
-    
-    def process_batch(self, max_pages=0, max_runtime_minutes=0):
+    def process_batch(self, max_pages: int = 0, max_runtime_minutes: int = 0) -> Dict[str, Any]:
         """
         Process a batch of URLs with time and page limits.
         
         Args:
-            max_pages (int, optional): Maximum number of pages to process in this batch.
-                If 0, no limit is applied.
-            max_runtime_minutes (int, optional): Maximum runtime in minutes.
-                If 0, runs until max_pages is reached.
-                
+            max_pages: Maximum number of pages to process (0 for unlimited)
+            max_runtime_minutes: Maximum runtime in minutes (0 for unlimited)
+            
         Returns:
-            dict: Statistics about the batch processing.
+            Dictionary of batch statistics
         """
         self.logger.info(f"Starting batch processing with max_pages={max_pages}, max_runtime_minutes={max_runtime_minutes}")
-        
-        # Start a new batch in the statistics manager
         self.statistics_manager.start_batch()
         
-        # Initialize the URL queue with the target URL and unvisited URLs from database if empty
-        if not self.url_queue:
+        # Initialize URL queue if empty
+        if len(self.url_queue) == 0:
             self._load_initial_urls()
+            self._load_unvisited_urls()
         
-        # Calculate end time if max_runtime_minutes is specified
-        end_time = None
-        if max_runtime_minutes > 0:
-            end_time = time.time() + (max_runtime_minutes * 60)
-            self.logger.info(f"Batch will run until {time.strftime('%H:%M:%S', time.localtime(end_time))}")
+        # Process the batch
+        batch_stats = self._process_batch(max_pages, max_runtime_minutes)
         
-        # Process URLs until the queue is empty, we reach the maximum number of pages,
-        # or we exceed the maximum runtime
+        # Update session status in database
+        try:
+            self.statistics_manager.update_session_in_database(completed=True)
+            self.logger.info(f"Updated session {self.session_id} - marked as completed")
+        except Exception as e:
+            self.logger.error(f"Failed to update scraper session: {str(e)}")
+        
+        self.logger.info(f"Crawling finished. Processed {batch_stats.get('pages_crawled', 0)} pages.")
+        return batch_stats
+    
+    def _process_batch(self, max_pages: int = 0, max_runtime_minutes: int = 0) -> Dict[str, Any]:
+        """
+        Process a batch of URLs with time and page limits.
+        
+        Args:
+            max_pages: Maximum number of pages to process (0 for unlimited)
+            max_runtime_minutes: Maximum runtime in minutes (0 for unlimited)
+            
+        Returns:
+            Dictionary of batch statistics
+        """
+        # Calculate end time if runtime limit is set
+        end_time = time.time() + (max_runtime_minutes * 60) if max_runtime_minutes > 0 else None
+        self.logger.info(f"URL queue contains {len(self.url_queue)} URLs to process")
+        
+        # Initialize batch variables
         pages_crawled = 0
-        while self.url_queue and (max_pages == 0 or pages_crawled < max_pages):
-            # Check if shutdown was requested (either locally or via global flag)
+        batch_start_time = time.time()
+        
+        # Main processing loop
+        while len(self.url_queue) > 0 and (max_pages == 0 or pages_crawled < max_pages):
+            # Check for shutdown/suspension
             if self.check_shutdown_requested():
                 self.logger.info("Shutdown requested, stopping batch processing")
                 break
-                
-            # Check if we've exceeded the maximum runtime
+            
+            # Check runtime limit
             if end_time and time.time() >= end_time:
                 self.logger.info(f"Reached maximum runtime of {max_runtime_minutes} minutes")
                 break
-                
-            # Get the next URL from the queue
-            url = self.url_queue.pop(0)
-            
-            # Skip if already visited
-            if url in self.visited_urls:
-                continue
-                
-            # Skip if URL is in excluded patterns
-            if self._is_excluded_url(url):
-                self.logger.debug(f"Skipping excluded URL: {url}")
-                continue
             
             try:
+                # Get next URL from priority queue
+                url, depth = self.url_queue.pop()
+                
+                # Skip if already visited
+                url_exists, is_visited = self._check_url_in_database(url)
+                if is_visited or url in self.visited_urls:
+                    self.logger.debug(f"Skipping already visited URL: {url}")
+                    continue
+                
+                # Skip excluded URLs
+                if self._is_excluded_url(url):
+                    self.logger.debug(f"Skipping excluded URL: {url}")
+                    continue
+                
                 # Process the URL
                 self.logger.info(f"Processing URL: {url} [Queue: {len(self.url_queue)}]")
                 
-                # Check if URL exists in database
-                url_exists, is_visited = self._check_url_in_database(url)
+                # Ensure URL is in database
+                if not url_exists:
+                    with self.db_manager.session() as session:
+                        status = CrawlStatus(url=url, depth=depth)
+                        session.add(status)
+                        session.commit()
                 
-                # Skip if already visited
-                if is_visited:
+                # Fetch content
+                content = self._fetch_url(url)
+                if not content:
+                    self.logger.warning(f"Failed to fetch content for URL: {url}")
                     continue
-                    
-                # Fetch the page content
-                response = self._fetch_url(url)
-                if not response:
-                    continue
-                    
-                # Parse the page
-                soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Extract page title for logging
+                # Parse with BeautifulSoup
+                soup = BeautifulSoup(content, 'html.parser')
                 title = soup.title.text.strip() if soup.title else "No title"
                 self.logger.info(f"Page title: {title}")
                 
-                # Check if this is a manufacturer page using Claude
-                is_manufacturer, manufacturer_data = self._check_manufacturer_page(url, soup)
+                # Extract text content for analysis
+                content_text = self._extract_text_content(soup)
                 
-                # If it's a manufacturer page, extract and save the data
-                if is_manufacturer and manufacturer_data:
+                # Analyze with Claude Haiku to determine if it's a manufacturer page
+                is_manufacturer = self._analyze_with_anthropic(url, title, content_text)
+                if is_manufacturer:
                     self.logger.info(f"Found manufacturer page: {url}")
-                    self.logger.info(f"Manufacturer data: {manufacturer_data}")
                     
-                    # Save manufacturer to database
-                    manufacturer_id = self._save_manufacturer(manufacturer_data)
+                    # Extract detailed manufacturer data with Claude Sonnet
+                    extracted_data = self._analyze_with_claude_sonnet(url, title, content_text)
                     
-                    # Update statistics
+                    # Process and save the extracted data
+                    self._process_extracted_data(extracted_data, url)
                     self.statistics_manager.increment_stat('manufacturers_found')
-                    
-                    # Save categories if available
-                    if 'categories' in manufacturer_data and manufacturer_data['categories']:
-                        for category_name in manufacturer_data['categories']:
-                            category_id = self._save_category(category_name)
-                            if category_id and manufacturer_id:
-                                self._link_manufacturer_to_category(manufacturer_id, category_id)
-                                # Update statistics
-                                self.statistics_manager.increment_stat('categories_found')
                 
-                # Extract links from the page
+                # Extract and process links
                 links = self._extract_links(soup, url)
+                self.logger.info(f"Extracted {len(links)} links from {url}")
                 
-                # Add new links to the queue
-                for link in links:
-                    if link not in self.visited_urls and link not in self.url_queue:
-                        self.url_queue.append(link)
+                # Update outgoing link count in database
+                with self.db_manager.session() as session:
+                    status = session.query(CrawlStatus).filter(CrawlStatus.url == url).first()
+                    if status:
+                        status.outgoing_links = len(links)
+                        status.title = title
+                        session.commit()
+                
+                # Add extracted links to queue
+                added_links = 0
+                for link_url, anchor_text in links.items():
+                    # Skip if already visited or in queue
+                    if link_url in self.visited_urls:
+                        continue
+                    
+                    link_in_queue = link_url in self.url_queue
+                    link_exists, link_visited = self._check_url_in_database(link_url)
+                    
+                    if not link_visited and not link_in_queue:
+                        # Add to queue with properly calculated priority
+                        self.url_queue.push(link_url, depth + 1, content_hint=anchor_text)
+                        added_links += 1
+                        
+                        # Add to database if not already there
+                        if not link_exists:
+                            with self.db_manager.session() as session:
+                                status = CrawlStatus(
+                                    url=link_url,
+                                    depth=depth + 1,
+                                    parent_url=url
+                                )
+                                session.add(status)
+                                session.commit()
+                
+                self.logger.info(f"Added {added_links} new links to the queue")
                 
                 # Mark URL as visited
                 self.visited_urls.add(url)
-                self._mark_url_visited(url, is_manufacturer)
+                self._mark_url_visited(url, is_manufacturer, depth)
                 
-                # Increment pages crawled counter
+                # Update statistics
                 pages_crawled += 1
-                
-                # Update stats
                 self.statistics_manager.increment_stat('pages_crawled')
                 
-                # Log progress every 10 pages
-                if pages_crawled % 10 == 0:
+                # Log progress periodically
+                if pages_crawled % 10 == 0 or max_pages < 10:
                     self.logger.info(f"Progress: {pages_crawled} pages crawled, {len(self.url_queue)} URLs in queue")
+            
             except Exception as e:
-                self.logger.error(f"Error processing URL {url}: {str(e)}")
+                self.logger.error(f"Error processing URL: {str(e)}")
                 import traceback
                 self.logger.debug(f"Crawling error details: {traceback.format_exc()}")
         
-        # End the batch in the statistics manager
+        # Generate sitemap
+        self.generate_sitemap_files()
+        
+        # Finalize statistics
         self.statistics_manager.end_batch()
         
-        # Add shutdown status to stats
+        # Determine final status
         if self.check_shutdown_requested():
             self.statistics_manager.update_stat('status', 'interrupted')
             status_message = "Crawling interrupted by user"
@@ -1029,18 +1264,64 @@ class CompetitorScraper:
             status_message = f"Crawling finished. Processed {pages_crawled} pages."
         
         self.logger.info(status_message)
-        
-        # Return the statistics
         return self.statistics_manager.get_all_stats()
     
-    def get_statistics(self):
-        """Get statistics about the scraping process"""
+    def start_crawling(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Start the crawling process.
+        
+        Args:
+            max_pages: Maximum number of pages to process (None for unlimited)
+            
+        Returns:
+            Dictionary of statistics about the crawling session
+        """
+        self.logger.info("Starting crawling process")
+        self.session_id = self.statistics_manager.session_id
+        self.logger.info(f"Using scraper session with ID {self.session_id}")
+        
+        # Reset shutdown flag
+        self.shutdown_requested = False
+        self.check_shutdown_requested()
+        
+        # Initialize URL queue if empty
+        if len(self.url_queue) == 0:
+            self._load_initial_urls()
+            self._load_unvisited_urls()
+        
+        # Process the batch
+        batch_stats = self.process_batch(max_pages=max_pages)
+        
+        # Update session status in database
+        try:
+            self.statistics_manager.update_session_in_database(completed=True)
+            self.logger.info(f"Updated session {self.session_id} - marked as completed")
+        except Exception as e:
+            self.logger.error(f"Failed to update scraper session: {str(e)}")
+        
+        self.logger.info(f"Crawling finished. Processed {batch_stats.get('pages_crawled', 0)} pages.")
+        return batch_stats
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        Get statistics about the scraping process.
+        
+        Returns:
+            Dictionary of statistics
+        """
         return self.statistics_manager.get_batch_stats()
     
-    def get_top_manufacturers_by_category_count(self, limit=5):
-        """Get the top manufacturers by category count"""
+    def get_top_manufacturers_by_category_count(self, limit: int = 5) -> List[Tuple[str, int]]:
+        """
+        Get the top manufacturers by category count.
+        
+        Args:
+            limit: Maximum number of manufacturers to return
+            
+        Returns:
+            List of tuples containing (manufacturer_name, category_count)
+        """
         try:
-            # Query to count categories per manufacturer using our database manager
             with self.db_manager.session() as session:
                 query = session.query(
                     Manufacturer.name,
@@ -1055,29 +1336,28 @@ class CompetitorScraper:
                 
                 results = query.all()
                 return [(name, count) for name, count in results]
-            
         except Exception as e:
             self.logger.error(f"Error getting top manufacturers: {str(e)}")
             return []
     
     def close(self):
-        """Close the scraper and release resources"""
+        """Close the scraper and release resources."""
         self.logger.info("Closing scraper and database connections")
         
-        # If we have an active session that wasn't properly closed, mark it as interrupted
-        if hasattr(self, 'session_id') and self.session_id is not None:
+        # Mark session as interrupted if still running
+        if self.session_id:
             try:
                 with self.db_manager.session() as session:
                     scraper_session = session.query(ScraperSession).filter_by(id=self.session_id).first()
                     if scraper_session and scraper_session.status == 'running':
                         scraper_session.status = 'interrupted'
                         scraper_session.end_time = datetime.datetime.now()
+                        session.commit()
                         self.logger.info(f"Marked session {self.session_id} as interrupted during close")
             except Exception as e:
                 self.logger.error(f"Error updating session status during close: {str(e)}")
         
-        # Explicitly call the database manager's shutdown method to ensure
-        # all connections are properly closed
+        # Close database connections
         try:
             self.db_manager.shutdown()
             self.logger.info("Database connections closed successfully")
@@ -1085,3 +1365,48 @@ class CompetitorScraper:
             self.logger.error(f"Error closing database connections: {str(e)}")
         
         self.logger.info("Scraper closed successfully")
+
+
+if __name__ == "__main__":
+    # When run directly, start the scraper
+    logging.basicConfig(level=logging.INFO)
+    
+    try:
+        # Create the scraper
+        scraper = CompetitorScraper()
+        
+        # Parse command-line arguments
+        import argparse
+        parser = argparse.ArgumentParser(description='NDAIVI Competitor Scraper')
+        parser.add_argument('--max-pages', type=int, default=0, help='Maximum number of pages to crawl (0 for unlimited)')
+        parser.add_argument('--max-runtime', type=int, default=0, help='Maximum runtime in minutes (0 for unlimited)')
+        args = parser.parse_args()
+        
+        # Start crawling with parsed arguments
+        stats = scraper.process_batch(max_pages=args.max_pages, max_runtime_minutes=args.max_runtime)
+        
+        # Output final statistics
+        print("\nCrawling Statistics:")
+        print(f"Pages Crawled: {stats.get('pages_crawled', 0)}")
+        print(f"Manufacturers Found: {stats.get('manufacturers_found', 0)}")
+        print(f"Manufacturers Extracted: {stats.get('manufacturers_extracted', 0)}")
+        print(f"Categories Extracted: {stats.get('categories_extracted', 0)}")
+        print(f"Websites Found: {stats.get('websites_found', 0)}")
+        print(f"Status: {stats.get('status', 'unknown')}")
+        
+        # Show top manufacturers
+        top_manufacturers = scraper.get_top_manufacturers_by_category_count(10)
+        if top_manufacturers:
+            print("\nTop Manufacturers by Category Count:")
+            for name, count in top_manufacturers:
+                print(f"  {name}: {count} categories")
+    
+    except Exception as e:
+        logging.error(f"Error in main: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
+    
+    finally:
+        # Ensure resources are properly released
+        if 'scraper' in locals():
+            scraper.close()
