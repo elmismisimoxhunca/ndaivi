@@ -496,3 +496,65 @@ class StatisticsManager:
             return {}
             
         return self.batch_stats
+        
+    def get_session_stats(self, session_type=None, limit=10):
+        """
+        Get statistics for completed sessions from the database.
+        
+        Args:
+            session_type: Type of sessions to retrieve ('scraper', 'finder', or 'combined')
+                          If None, retrieve all session types
+            limit: Maximum number of sessions to retrieve
+            
+        Returns:
+            Dictionary with session statistics
+        """
+        try:
+            with self.db_manager.session() as db_session:
+                query = db_session.query(ScraperSession)
+                
+                # Filter by session type if specified
+                if session_type and session_type != 'all':
+                    query = query.filter(ScraperSession.session_type == session_type)
+                
+                # Order by start time (descending - newest first)
+                query = query.order_by(ScraperSession.start_time.desc())
+                
+                # Limit results
+                if limit:
+                    query = query.limit(limit)
+                
+                sessions = query.all()
+                
+                # Format session data for display
+                session_data = []
+                for session in sessions:
+                    session_dict = {
+                        'id': session.id,
+                        'session_type': session.session_type,
+                        'start_time': session.start_time,
+                        'end_time': session.end_time,
+                        'status': session.status,
+                        'runtime_seconds': session.runtime_seconds,
+                        'pages_crawled': session.pages_crawled,
+                        'manufacturers_extracted': session.manufacturers_extracted,
+                        'manufacturers_found': session.manufacturers_found,
+                        'categories_extracted': session.categories_extracted,
+                        'urls_processed': session.urls_processed,
+                        'errors': session.errors
+                    }
+                    session_data.append(session_dict)
+                
+                return {
+                    'sessions': session_data,
+                    'count': len(session_data),
+                    'type_filter': session_type or 'all'
+                }
+                
+        except Exception as e:
+            self.logger.error(f"Error retrieving session stats: {str(e)}")
+            return {
+                'sessions': [],
+                'count': 0,
+                'error': str(e)
+            }
