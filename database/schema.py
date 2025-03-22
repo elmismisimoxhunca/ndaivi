@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Table, MetaData, Boolean, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Table, MetaData, Boolean, DateTime, Text, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 import os
@@ -96,7 +96,13 @@ class Manufacturer(Base):
     __tablename__ = 'manufacturers'
     
     id = Column(Integer, primary_key=True)
-    name = Column(String(100), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    __table_args__ = (
+        # Create a unique index that uses the lower-case version of the name
+        # This ensures case-insensitive uniqueness
+        UniqueConstraint('name', name='uix_manufacturer_name_case_insensitive',
+                        info={'case_sensitive': False}),
+    )
     website = Column(String(255), nullable=True)
     website_validated = Column(Boolean, default=False)  # Indicates if the website has been validated
     description = Column(Text, nullable=True)
@@ -158,15 +164,37 @@ class ScraperSession(Base):
     __tablename__ = 'scraper_sessions'
     
     id = Column(Integer, primary_key=True)
-    session_type = Column(String(20), nullable=False)  # 'scraper' or 'finder'
+    session_type = Column(String(20), nullable=False)  # 'scraper', 'finder', or 'combined'
     start_time = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     end_time = Column(DateTime, nullable=True)
+    runtime_seconds = Column(Integer, default=0)  # Added runtime_seconds field
     status = Column(String(20), default='running')  # 'running', 'completed', 'interrupted'
+    
+    # Common statistics
     urls_processed = Column(Integer, default=0)
     manufacturers_extracted = Column(Integer, default=0)
+    manufacturers_found = Column(Integer, default=0)  # Added for tracking manufacturer pages found
     categories_extracted = Column(Integer, default=0)
     websites_found = Column(Integer, default=0)
+    translations = Column(Integer, default=0)  # Added for tracking translations
+    
+    # Page tracking
+    pages_crawled = Column(Integer, default=0)
+    pages_analyzed = Column(Integer, default=0)
+    manual_links_found = Column(Integer, default=0)  # Added for tracking manual links
+    
+    # Error tracking
+    http_errors = Column(Integer, default=0)
+    connection_errors = Column(Integer, default=0)
+    timeout_errors = Column(Integer, default=0)
+    dns_resolution_errors = Column(Integer, default=0)
+    errors = Column(Integer, default=0)  # General error counter
+    
+    # Batch configuration
     max_pages = Column(Integer, nullable=True)
+    max_runtime_minutes = Column(Integer, nullable=True)
+    
+    # Error information
     error = Column(Text, nullable=True)
     
     def __repr__(self):

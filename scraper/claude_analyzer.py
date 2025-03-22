@@ -15,7 +15,7 @@ class ClaudeAnalyzer:
         self.logger = logger or logging.getLogger('claude_analyzer')
     
     def is_manufacturer_page(self, url, title, content):
-        """Check if the page is a manufacturer page using Claude"""
+        """Check if the page is a manufacturer page using Claude Haiku"""
         try:
             # Prepare a truncated version of the content
             truncated_content = content[:2000] + "..." if len(content) > 2000 else content
@@ -38,9 +38,9 @@ class ClaudeAnalyzer:
             }
             
             payload = {
-                "model": self.model,
-                "max_tokens": 10,
-                "system": "You are a data extraction assistant specialized in identifying manufacturers and their specific product categories. Always ensure categories are associated with their manufacturer names for clarity.",
+                "model": self.model,  # Using Haiku model for this task
+                "max_tokens": 50,
+                "system": SYSTEM_PROMPT,
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -58,24 +58,50 @@ class ClaudeAnalyzer:
                 answer = response_data["content"][0]["text"].strip()
                 
                 # Log the response
-                self.logger.info(f"Claude analysis for {url}: {answer}")
+                self.logger.info(f"Claude Haiku manufacturer detection for {url}: {answer}")
                 
-                return self._parse_delimited_response(answer)
+                # Parse the response for manufacturer detection
+                # Check for delimited format
+                response_pattern = r'# RESPONSE_START\s+(.*?)\s*# RESPONSE_END'
+                response_match = re.search(response_pattern, answer, re.DOTALL)
+                
+                if response_match:
+                    content = response_match.group(1).strip()
+                    # Look for IS_MANUFACTURER: yes/no
+                    is_mfr_match = re.search(r'IS_MANUFACTURER:\s*(yes|no)', content, re.IGNORECASE)
+                    if is_mfr_match:
+                        result = is_mfr_match.group(1).strip().lower() == 'yes'
+                        self.logger.info(f"Manufacturer detection result for {url}: {result}")
+                        return result
+                    else:
+                        self.logger.error(f"Missing IS_MANUFACTURER field in response: {content}")
+                        return False
+                else:
+                    self.logger.error(f"Response missing RESPONSE_START/END markers: {answer}")
+                    return False
             else:
                 self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
                 return False
             
         except Exception as e:
-            self.logger.error(f"Error analyzing with Claude: {str(e)}")
+            self.logger.error(f"Error analyzing with Claude Haiku: {str(e)}")
             return False
     
     def extract_manufacturers(self, url, title, content):
-        """Extract manufacturer and category information using Claude 3.7 Sonnet"""
+        """Extract manufacturer and category information using Claude Sonnet"""
         try:
             # Prepare a truncated version of the content to avoid token limits
             truncated_content = content[:4000] + "..." if len(content) > 4000 else content
             
-            prompt = f"""URL: {url}\nTitle: {title}\n\nContent: {truncated_content}\n\nTask: Extract manufacturer names and product categories from this webpage. \n\nIf this is a manufacturer/brand page, identify:\n1. The manufacturer/brand name(s)\n2. All product categories associated with each manufacturer - be specific and detailed (e.g., 'Samsung washing machines' rather than just 'washing machines')\n3. The manufacturer's website URL if mentioned\n\nIt's CRITICAL that each category is specific to the manufacturer and not generic. For example:\n- GOOD: "LG Refrigerators", "Samsung Smartphones", "Sony Televisions"\n- BAD: "Refrigerators", "Smartphones", "Televisions"\n\nFormat your response as YAML:\n\nmanufacturers:\n  - name: Manufacturer Name\n    categories:\n      - ManufacturerName Category1\n      - ManufacturerName Category2\n    website: https://manufacturer-website.com  # or null if not found\n\nIf no manufacturers or categories are found, return an empty list like this:\n\nmanufacturers: []\n"""
+            # Import prompt templates
+            from scraper.prompt_templates import MANUFACTURER_EXTRACTION_PROMPT, SYSTEM_PROMPT
+            
+            # Format the prompt with the page details
+            prompt = MANUFACTURER_EXTRACTION_PROMPT.format(
+                url=url,
+                title=title,
+                truncated_content=truncated_content
+            )
             
             # Use requests to make a direct API call
             headers = {
@@ -85,9 +111,9 @@ class ClaudeAnalyzer:
             }
             
             payload = {
-                "model": self.sonnet_model,
+                "model": self.model,  # Using Haiku model for all operations
                 "max_tokens": 4000,
-                "system": "You are a data extraction assistant specialized in identifying manufacturers and their specific product categories. Always ensure categories are associated with their manufacturer names for clarity.",
+                "system": SYSTEM_PROMPT,
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -103,13 +129,22 @@ class ClaudeAnalyzer:
             if response.status_code == 200:
                 response_data = response.json()
                 result = response_data["content"][0]["text"]
-                return self._parse_delimited_response(result)
+                self.logger.info(f"Claude Haiku manufacturer extraction for {url}: Response received")
+                
+                # Parse the response to extract manufacturers and categories
+                parsed_data = self._parse_delimited_response(result)
+                if parsed_data:
+                    self.logger.info(f"Extracted {len(parsed_data.get('manufacturers', []))} manufacturers from {url}")
+                else:
+                    self.logger.warning(f"No manufacturers extracted from {url}")
+                    
+                return parsed_data
             else:
                 self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
                 return None
             
         except Exception as e:
-            self.logger.error(f"Error analyzing with Claude Sonnet: {str(e)}")
+            self.logger.error(f"Error analyzing with Claude Haiku extraction: {str(e)}")
             return None
     
     def _parse_delimited_response(self, response_text):
@@ -124,9 +159,9 @@ class ClaudeAnalyzer:
                 return {"manufacturers": []}
                 
             content = response_match.group(1).strip()
-            self.logger.info(f"Found delimited content:\n{content[:500]}...")
+            self.logger.info(f"Found delimited content of length {len(content)}")
             
-            # For manufacturer detection response
+            # For manufacturer detection response (is_manufacturer_page method)
             if 'IS_MANUFACTURER:' in content:
                 is_mfr_match = re.search(r'IS_MANUFACTURER:\s*(yes|no)', content, re.IGNORECASE)
                 if not is_mfr_match:
@@ -134,13 +169,31 @@ class ClaudeAnalyzer:
                     return False
                 return is_mfr_match.group(1).strip().lower() == 'yes'
             
-            # For manufacturer data extraction
+            # For manufacturer data extraction (extract_manufacturers method)
             manufacturers = []
             manufacturer_pattern = r'# MANUFACTURER_START\s+([\s\S]*?)# MANUFACTURER_END'
+            manufacturer_matches = list(re.finditer(manufacturer_pattern, content, re.DOTALL))
             
-            for match in re.finditer(manufacturer_pattern, content, re.DOTALL):
+            if not manufacturer_matches:
+                self.logger.info("No MANUFACTURER_START/END blocks found in response")
+                # Try YAML parsing as fallback
+                try:
+                    # Check if content looks like YAML
+                    if 'manufacturers:' in content:
+                        yaml_data = yaml.safe_load(content)
+                        if yaml_data and 'manufacturers' in yaml_data:
+                            self.logger.info(f"Parsed {len(yaml_data['manufacturers'])} manufacturers from YAML")
+                            return yaml_data
+                except Exception as yaml_error:
+                    self.logger.warning(f"Failed to parse as YAML: {str(yaml_error)}")
+                    
+                # If we reach here, try regex extraction as last resort
+                return self._extract_with_regex(response_text)
+            
+            # Process each manufacturer block
+            for match in manufacturer_matches:
                 manufacturer_block = match.group(1).strip()
-                self.logger.info(f"Found manufacturer block:\n{manufacturer_block}")
+                self.logger.info(f"Processing manufacturer block of length {len(manufacturer_block)}")
                 
                 # Extract manufacturer name (required)
                 name_match = re.search(r'NAME:\s*(.*?)(?:\n|$)', manufacturer_block)
@@ -181,61 +234,13 @@ class ClaudeAnalyzer:
                     
                 manufacturers.append(manufacturer)
             
-            self.logger.info(f"Successfully parsed {len(manufacturers)} manufacturers")
-            return {"manufacturers": manufacturers}
-            
-            # If no manufacturers found, return empty list
-            self.logger.info("No manufacturers found in delimited response")
-            return {"manufacturers": []}
-            
-        except Exception as e:
-            self.logger.error(f"Error parsing delimited response: {str(e)}")
-            return {"manufacturers": []}
-            
-            # Parse manufacturer information from delimited format
-            manufacturers = []
-            manufacturer_pattern = r'# MANUFACTURER_START\s+([\s\S]*?)# MANUFACTURER_END'
-            
-            for match in re.finditer(manufacturer_pattern, content, re.DOTALL):
-                manufacturer_block = match.group(1).strip()
-                self.logger.info(f"Found manufacturer block:\n{manufacturer_block}")
-                
-                # Extract manufacturer name
-                name_match = re.search(r'NAME:\s*(.*?)(?:\n|$)', manufacturer_block)
-                if not name_match:
-                    self.logger.warning("Manufacturer block missing NAME field, skipping")
-                    continue
-                    
-                name = name_match.group(1).strip()
-                
-                # Find all categories
-                categories = []
-                for category_match in re.finditer(r'CATEGORY:\s*(.*?)(?:\n|$)', manufacturer_block):
-                    categories.append(category_match.group(1).strip())
-                
-                # Extract website if present
-                website = None
-                website_match = re.search(r'WEBSITE:\s*(.*?)(?:\n|$)', manufacturer_block)
-                if website_match:
-                    website = website_match.group(1).strip()
-                
-                # Build manufacturer object
-                manufacturer = {
-                    "name": name,
-                    "categories": categories
-                }
-                
-                if website:
-                    manufacturer["website"] = website
-                    
-                manufacturers.append(manufacturer)
-            
             if manufacturers:
-                self.logger.info(f"Extracted {len(manufacturers)} manufacturers using delimited format")
+                self.logger.info(f"Successfully parsed {len(manufacturers)} manufacturers")
                 return {"manufacturers": manufacturers}
             
-            # APPROACH 4: Last resort - try regex extraction on the entire content
-            return self._extract_with_regex(response_text)
+            # If no manufacturers found after processing all blocks, return empty list
+            self.logger.info("No valid manufacturers found in delimited response")
+            return {"manufacturers": []}
             
         except Exception as e:
             self.logger.error(f"Error parsing delimited response: {str(e)}")
@@ -313,3 +318,87 @@ class ClaudeAnalyzer:
         
         # Fallback to empty list
         return {'manufacturers': []}
+        
+    def translate_text(self, text, source_lang, target_lang, preserve_text=None):
+        """
+        Translate text from source language to target language using Claude.
+        
+        Args:
+            text: Text to translate
+            source_lang: Source language (e.g., 'english')
+            target_lang: Target language (e.g., 'spanish')
+            preserve_text: Text to preserve in the translation (e.g., manufacturer name)
+            
+        Returns:
+            Translated text
+        """
+        try:
+            # Skip translation if text is too short
+            if len(text) < 3:
+                return text
+                
+            # For Spanish, check if it already contains Spanish words
+            if target_lang.lower() == 'spanish':
+                spanish_indicators = ['de', 'para', 'con', 'del', 'y', 'las', 'los']
+                if any(word in text.lower().split() for word in spanish_indicators):
+                    self.logger.info(f"Text '{text}' appears to already be in Spanish, skipping translation")
+                    return text
+            
+            # Prepare the translation prompt
+            base_prompt = "Translate the following text from {0} to {1}:\n\n{2}"
+            prompt = base_prompt.format(source_lang, target_lang, text)
+            
+            # Add instruction to preserve specific text if provided
+            if preserve_text:
+                prompt += "\n\nImportant: Preserve the term '{0}' exactly as it appears in the original text.".format(preserve_text)
+            
+            # Use requests to make a direct API call
+            headers = {
+                "x-api-key": self.api_key,
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
+            payload = {
+                "model": self.model,  # Using Haiku model for simple translation
+                "max_tokens": 100,
+                "system": "You are a professional translator. Translate text accurately while preserving any technical terms, brand names, or proper nouns.",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload
+            )
+            
+            # Handle the response
+            if response.status_code == 200:
+                response_data = response.json()
+                translated_text = response_data["content"][0]["text"].strip()
+                
+                # Remove any instructions that might have been included in the response
+                if "Important:" in translated_text:
+                    translated_text = translated_text.split("Important:")[0].strip()
+                if "Importante:" in translated_text:
+                    translated_text = translated_text.split("Importante:")[0].strip()
+                
+                # Verify the preserved text is still present if specified
+                if preserve_text and preserve_text.lower() not in translated_text.lower():
+                    self.logger.warning(f"Translation lost preserved text '{preserve_text}': '{translated_text}'")
+                    # Try to reinsert the preserved text
+                    translated_text = translated_text.replace(
+                        preserve_text.lower().capitalize(), 
+                        preserve_text
+                    )
+                
+                # Logging moved to CompetitorScraper to avoid duplication
+                return translated_text
+            else:
+                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+                return text  # Return original text on error
+        except Exception as e:
+            self.logger.error(f"Error translating text: {str(e)}")
+            return text  # Return original text on error

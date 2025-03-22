@@ -318,8 +318,14 @@ class CompetitorScraper:
         self.anthropic_model = anthropic_config.get('model', 'claude-3-haiku-20240307')
         self.anthropic_sonnet_model = anthropic_config.get('sonnet_model', 'claude-3-sonnet-20240229')
         
-        # Initialize client
-        self.anthropic_client = anthropic.Anthropic(api_key=self.anthropic_api_key)
+        # Initialize Claude analyzer with direct API access
+        from scraper.claude_analyzer import ClaudeAnalyzer
+        self.claude_analyzer = ClaudeAnalyzer(
+            api_key=self.anthropic_api_key,
+            model=self.anthropic_model,
+            sonnet_model=self.anthropic_sonnet_model,
+            logger=self.logger
+        )
         
         self.logger.info("Anthropic API configuration loaded successfully")
     
@@ -510,8 +516,7 @@ class CompetitorScraper:
         
         return '\n'.join(chunk for chunk in chunks if chunk)
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
-           retry=retry_if_exception_type(AnthropicError))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def _analyze_with_anthropic(self, url: str, title: str, content: str) -> bool:
         """
         Use Claude Haiku to determine if the page is a manufacturer page.
@@ -525,55 +530,33 @@ class CompetitorScraper:
             True if the page is a manufacturer page, False otherwise
         """
         try:
-            # Truncate content to avoid token limits
-            truncated_content = content[:2000] + "..." if len(content) > 2000 else content
+            # Use the claude_analyzer to check if it's a manufacturer page
+            result = self.claude_analyzer.is_manufacturer_page(url, title, content)
             
-            # Craft an improved prompt for more reliable analysis
-            prompt = (
-                f"Task: Analyze the following webpage content to determine if it lists or describes manufacturers "
-                f"or their products.\n\n"
-                f"URL: {url}\n"
-                f"Title: {title}\n\n"
-                f"Content excerpt:\n{truncated_content}\n\n"
-                f"A manufacturer page typically lists company names that make products, possibly with product categories, "
-                f"brands, or industry information. Look for lists, tables, or descriptions of companies that produce "
-                f"or supply products.\n\n"
-                f"Respond with ONLY 'yes' if this is a manufacturer page, or 'no' otherwise."
-            )
-            
-            response = self.anthropic_client.messages.create(
-                model=self.anthropic_model,
-                max_tokens=10,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            result = response.content[0].text.strip().lower()
-            
-            if result not in ['yes', 'no']:
-                self.logger.warning(f"Unexpected Claude Haiku response for {url}: {result}, treating as 'no'")
-                return False
-            
+            # is_manufacturer_page returns a boolean directly
             self.logger.info(f"Claude Haiku analysis for {url}: {result}")
-            self.statistics_manager.increment_stat('ai_queries')
-            return result == 'yes'
-        
-        except AnthropicError as e:
-            self.logger.error(f"Anthropic API error for {url}: {str(e)}")
-            self._log_to_db("ERROR", f"Anthropic API error: {str(e)}")
-            self.statistics_manager.increment_stat('ai_errors')
-            raise
+            
+            # Update statistics - make sure this stat exists in StatisticsManager
+            try:
+                self.statistics_manager.increment_stat('pages_analyzed')
+            except Exception as stats_error:
+                self.logger.warning(f"Could not update statistics: {str(stats_error)}")
+                
+            return result
         
         except Exception as e:
             self.logger.error(f"Error analyzing with Claude Haiku for {url}: {str(e)}")
             self._log_to_db("ERROR", f"Error analyzing with Claude Haiku: {str(e)}")
-            self.statistics_manager.increment_stat('ai_errors')
+            try:
+                self.statistics_manager.increment_stat('errors')
+            except:
+                pass
             return False
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
-           retry=retry_if_exception_type(AnthropicError))
-    def _analyze_with_claude_sonnet(self, url: str, title: str, content: str) -> List[Dict[str, Any]]:
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def _analyze_with_claude_haiku(self, url: str, title: str, content: str) -> List[Dict[str, Any]]:
         """
-        Use Claude Sonnet to extract manufacturer and category information.
+        Use Claude Haiku to extract manufacturer and category information.
         
         Args:
             url: URL of the page
@@ -584,74 +567,42 @@ class CompetitorScraper:
             List of dictionaries with manufacturer and category information
         """
         try:
-            # Truncate content to avoid token limits
-            truncated_content = content[:4000] + "..." if len(content) > 4000 else content
+            # Use the claude_analyzer to extract manufacturer information
+            result = self.claude_analyzer.extract_manufacturers(url, title, content)
             
-            # Craft an improved prompt for more reliable extraction
-            prompt = (
-                f"Task: Extract manufacturer names and associated product categories from the following webpage content.\n\n"
-                f"URL: {url}\n"
-                f"Title: {title}\n\n"
-                f"Content excerpt:\n{truncated_content}\n\n"
-                f"Instructions:\n"
-                f"1. Identify company names that manufacture or supply products\n"
-                f"2. For each manufacturer, identify their product categories\n"
-                f"3. Each category name must include the manufacturer name as part of it\n"
-                f"4. Return the data as a JSON array with this exact structure:\n"
-                f"[\n"
-                f"  {{\n"
-                f"    \"manufacturer\": \"CompanyName\",\n"
-                f"    \"categories\": [\"CompanyName Product Category 1\", \"CompanyName Product Category 2\"]\n"
-                f"  }}\n"
-                f"]\n\n"
-                f"If no manufacturers are found, return an empty array: []\n"
-                f"Your response must be valid JSON only, with no additional text."
-            )
-            
-            response = self.anthropic_client.messages.create(
-                model=self.anthropic_sonnet_model,
-                max_tokens=1000,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            result_text = response.content[0].text.strip()
-            
-            # Extract JSON from the response if needed
-            if not result_text.startswith('['):
-                # Try to find JSON array in the response
-                import re
-                json_match = re.search(r'\[(.*?)\]', result_text, re.DOTALL)
-                if json_match:
-                    result_text = json_match.group(0)
-                else:
-                    self.logger.warning(f"Invalid JSON response format for {url}: {result_text}")
-                    return []
-            
-            # Parse the JSON response
-            try:
-                result = json.loads(result_text)
-                if not isinstance(result, list):
-                    self.logger.warning(f"Invalid response type for {url}: {type(result)}, expected list")
-                    return []
+            if result and 'manufacturers' in result:
+                manufacturers = result['manufacturers']
+                # Convert from ClaudeAnalyzer format to CompetitorScraper format
+                converted_result = [
+                    {
+                        "manufacturer": mfr["name"],
+                        "categories": mfr["categories"]
+                    }
+                    for mfr in manufacturers
+                ]
                 
-                self.logger.info(f"Claude Sonnet extracted {len(result)} manufacturers from {url}")
-                self.statistics_manager.increment_stat('ai_extractions')
-                return result
+                self.logger.info(f"Claude Sonnet extracted {len(converted_result)} manufacturers from {url}")
+                
+                # Update statistics with existing keys
+                try:
+                    self.statistics_manager.increment_stat('manufacturers_extracted', len(converted_result))
+                except Exception as stats_error:
+                    self.logger.warning(f"Could not update statistics: {str(stats_error)}")
+                    
+                return converted_result
             
-            except json.JSONDecodeError as e:
-                self.logger.error(f"JSON parsing error for {url}: {str(e)}\nResponse: {result_text}")
-                return []
-        
-        except AnthropicError as e:
-            self.logger.error(f"Anthropic API error for {url}: {str(e)}")
-            self._log_to_db("ERROR", f"Anthropic API error: {str(e)}")
-            self.statistics_manager.increment_stat('ai_errors')
-            raise
+            return []
         
         except Exception as e:
             self.logger.error(f"Error analyzing with Claude Sonnet for {url}: {str(e)}")
             self._log_to_db("ERROR", f"Error analyzing with Claude Sonnet: {str(e)}")
-            self.statistics_manager.increment_stat('ai_errors')
+            
+            # Update error statistics with existing keys
+            try:
+                self.statistics_manager.increment_stat('errors')
+            except:
+                pass
+                
             return []
     
     def _translate_category(self, category: str, manufacturer_name: str) -> str:
@@ -676,23 +627,18 @@ class CompetitorScraper:
                 self.logger.info(f"Category '{category}' appears to be in Spanish, skipping translation")
                 return category
             
-            # Create a prompt that ensures manufacturer name preservation
-            prompt = (
-                f"Translate this product category from English to {target_lang}: \"{category}\"\n"
-                f"Important rules:\n"
-                f"1. Preserve the manufacturer name '{manufacturer_name}' exactly as-is\n"
-                f"2. Only translate descriptive words\n"
-                f"3. Keep proper nouns unchanged\n"
-                f"4. Return only the translated category text"
-            )
-            
-            response = self.anthropic_client.messages.create(
-                model=self.anthropic_model,
-                max_tokens=100,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            translated = response.content[0].text.strip()
+            # Use the claude_analyzer to translate the category
+            try:
+                translated = self.claude_analyzer.translate_text(
+                    text=category,
+                    source_lang='english',
+                    target_lang=target_lang,
+                    preserve_text=manufacturer_name
+                )
+            except Exception as e:
+                self.logger.error(f"Error translating category: {str(e)}")
+                # If translation fails, return original category
+                return category
             
             # Verify manufacturer name is preserved
             if manufacturer_name.lower() in translated.lower():

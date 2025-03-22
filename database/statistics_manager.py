@@ -64,13 +64,18 @@ class StatisticsManager:
                 **base_stats,
                 "urls_processed": 0,
                 "manufacturers_extracted": 0,
+                "manufacturers_found": 0,  # Added for tracking manufacturer pages found
+                "categories_extracted": 0,  # Added for tracking categories extracted
                 "websites_found": 0,
                 "pages_crawled": 0,
+                "pages_analyzed": 0,  # Added for Claude Haiku analysis
                 "manual_links_found": 0,
+                "translations": 0,  # Added for tracking translations
                 "http_errors": 0,
                 "connection_errors": 0,
                 "timeout_errors": 0,
                 "dns_resolution_errors": 0,
+                "errors": 0,  # General error counter
                 "status": "running",
             }
         elif self.component_type == 'finder':
@@ -138,14 +143,29 @@ class StatisticsManager:
                     'combined': 'combined'
                 }
                 
-                # Create new session record
+                # Create new session record with all fields initialized
                 new_session = ScraperSession(
                     session_type=session_type_map.get(self.component_type, 'unknown'),
                     start_time=datetime.datetime.now(),
                     status='running',
+                    runtime_seconds=0,
+                    # Common statistics
                     urls_processed=0,
                     manufacturers_extracted=0,
-                    websites_found=0
+                    manufacturers_found=0,
+                    categories_extracted=0,
+                    websites_found=0,
+                    translations=0,
+                    # Page tracking
+                    pages_crawled=0,
+                    pages_analyzed=0,
+                    manual_links_found=0,
+                    # Error tracking
+                    http_errors=0,
+                    connection_errors=0,
+                    timeout_errors=0,
+                    dns_resolution_errors=0,
+                    errors=0
                 )
                 
                 db_session.add(new_session)
@@ -228,9 +248,32 @@ class StatisticsManager:
         
         self.logger.info(f"=== {self.component_type.upper()} STATISTICS ===")
         
+        # Display session information
+        self.logger.info(f"Session ID: {self.session_id}")
+        self.logger.info(f"Status: {stats.get('status', 'running').upper()}")
+        
         # Display runtime statistics
-        runtime_minutes = stats["runtime_seconds"] / 60
-        self.logger.info(f"Runtime: {runtime_minutes:.2f} minutes")
+        runtime_seconds = int(stats["runtime_seconds"])
+        hours = runtime_seconds // 3600
+        minutes = (runtime_seconds % 3600) // 60
+        seconds = runtime_seconds % 60
+        self.logger.info(f"Runtime: {hours}h {minutes}m {seconds}s")
+        
+        # Display error statistics if any errors occurred
+        total_errors = sum([
+            stats.get('http_errors', 0),
+            stats.get('connection_errors', 0),
+            stats.get('timeout_errors', 0),
+            stats.get('dns_resolution_errors', 0)
+        ])
+        
+        if total_errors > 0 or detailed:
+            self.logger.info("\n=== ERROR STATISTICS ===")
+            self.logger.info(f"HTTP Errors: {stats.get('http_errors', 0)}")
+            self.logger.info(f"Connection Errors: {stats.get('connection_errors', 0)}")
+            self.logger.info(f"Timeout Errors: {stats.get('timeout_errors', 0)}")
+            self.logger.info(f"DNS Resolution Errors: {stats.get('dns_resolution_errors', 0)}")
+            self.logger.info(f"Total Errors: {total_errors}")
         
         # Display component-specific statistics
         if self.component_type == 'scraper':
@@ -251,6 +294,7 @@ class StatisticsManager:
             stats: Statistics dictionary
             detailed: Whether to display detailed statistics
         """
+        self.logger.info("\n=== SCRAPING STATISTICS ===")
         self.logger.info(f"URLs processed: {stats.get('urls_processed', 0)}")
         self.logger.info(f"Manufacturers extracted: {stats.get('manufacturers_extracted', 0)}")
         self.logger.info(f"Websites found: {stats.get('websites_found', 0)}")
@@ -258,10 +302,14 @@ class StatisticsManager:
         self.logger.info(f"Manual links found: {stats.get('manual_links_found', 0)}")
         
         if detailed:
-            self.logger.info(f"HTTP errors: {stats.get('http_errors', 0)}")
-            self.logger.info(f"Connection errors: {stats.get('connection_errors', 0)}")
-            self.logger.info(f"Timeout errors: {stats.get('timeout_errors', 0)}")
-            self.logger.info(f"DNS resolution errors: {stats.get('dns_resolution_errors', 0)}")
+            success_rate = 0
+            if stats.get('urls_processed', 0) > 0:
+                success_rate = (stats.get('manufacturers_extracted', 0) / stats.get('urls_processed', 0)) * 100
+            self.logger.info(f"Success rate: {success_rate:.2f}%")
+            self.logger.info(f"Categories extracted: {stats.get('categories_extracted', 0)}")
+            if stats.get('manufacturers_extracted', 0) > 0:
+                categories_per_manufacturer = stats.get('categories_extracted', 0) / stats.get('manufacturers_extracted', 0)
+                self.logger.info(f"Categories per manufacturer: {categories_per_manufacturer:.2f}")
     
     def _display_finder_statistics(self, stats: Dict[str, Any], detailed: bool) -> None:
         """
@@ -271,24 +319,36 @@ class StatisticsManager:
             stats: Statistics dictionary
             detailed: Whether to display detailed statistics
         """
+        self.logger.info("\n=== WEBSITE FINDER STATISTICS ===")
         processed = stats.get('manufacturers_processed', 0)
         claude_found = stats.get('claude_found', 0)
         search_found = stats.get('search_engine_found', 0)
         validation_failed = stats.get('validation_failed', 0)
-        success_rate = (claude_found + search_found - validation_failed) / processed * 100 if processed > 0 else 0
+        websites_found = claude_found + search_found - validation_failed
+        success_rate = (websites_found / processed * 100) if processed > 0 else 0
         
         self.logger.info(f"Manufacturers processed: {processed}")
-        self.logger.info(f"Websites found via Claude: {claude_found}")
-        self.logger.info(f"Websites found via search engines: {search_found}")
+        self.logger.info(f"Total websites found: {websites_found}")
+        self.logger.info(f"Found via Claude: {claude_found}")
+        self.logger.info(f"Found via search engines: {search_found}")
         self.logger.info(f"Validation failures: {validation_failed}")
         self.logger.info(f"Success rate: {success_rate:.2f}%")
         
         if detailed:
-            self.logger.info(f"Total manufacturers: {stats.get('total_manufacturers', 0)}")
-            self.logger.info(f"Manufacturers with website: {stats.get('manufacturers_with_website', 0)}")
-            self.logger.info(f"DNS resolution errors: {stats.get('dns_resolution_errors', 0)}")
-            self.logger.info(f"Connection errors: {stats.get('connection_errors', 0)}")
-            self.logger.info(f"Timeout errors: {stats.get('timeout_errors', 0)}")
+            self.logger.info("\n=== DETAILED FINDER STATISTICS ===")
+            total_manufacturers = stats.get('total_manufacturers', 0)
+            manufacturers_with_website = stats.get('manufacturers_with_website', 0)
+            self.logger.info(f"Total manufacturers in database: {total_manufacturers}")
+            self.logger.info(f"Manufacturers with website: {manufacturers_with_website}")
+            if total_manufacturers > 0:
+                coverage = (manufacturers_with_website / total_manufacturers) * 100
+                self.logger.info(f"Database coverage: {coverage:.2f}%")
+            
+            # Search engine usage
+            if 'search_engine_usage' in stats:
+                self.logger.info("\n=== SEARCH ENGINE USAGE ===")
+                for engine, count in stats['search_engine_usage'].items():
+                    self.logger.info(f"{engine}: {count} queries")
     
     def update_session_in_database(self, completed: bool = False) -> None:
         """
@@ -310,11 +370,29 @@ class StatisticsManager:
                     self.logger.warning(f"Session with ID {self.session_id} not found in database")
                     return
                 
-                # Update session statistics based on component type
+                # Update common statistics
+                current_session.http_errors = self.stats.get('http_errors', 0)
+                current_session.connection_errors = self.stats.get('connection_errors', 0)
+                current_session.timeout_errors = self.stats.get('timeout_errors', 0)
+                current_session.dns_resolution_errors = self.stats.get('dns_resolution_errors', 0)
+                
+                # Update runtime
+                if self.stats["start_time"]:
+                    end_time = self.stats["end_time"] or datetime.datetime.now()
+                    current_session.runtime_seconds = int((end_time - self.stats["start_time"]).total_seconds())
+                
+                # Update component-specific statistics
                 if self.component_type in ['scraper', 'combined']:
                     current_session.urls_processed = self.stats.get('urls_processed', 0)
                     current_session.manufacturers_extracted = self.stats.get('manufacturers_extracted', 0)
+                    current_session.manufacturers_found = self.stats.get('manufacturers_found', 0)
+                    current_session.categories_extracted = self.stats.get('categories_extracted', 0)
                     current_session.websites_found = self.stats.get('websites_found', 0)
+                    current_session.translations = self.stats.get('translations', 0)
+                    current_session.pages_crawled = self.stats.get('pages_crawled', 0)
+                    current_session.pages_analyzed = self.stats.get('pages_analyzed', 0)
+                    current_session.manual_links_found = self.stats.get('manual_links_found', 0)
+                    current_session.errors = self.stats.get('errors', 0)
                 
                 elif self.component_type == 'finder':
                     current_session.manufacturers_extracted = self.stats.get('manufacturers_processed', 0)
@@ -327,6 +405,7 @@ class StatisticsManager:
                         self.stats.get('search_engine_found', 0) - 
                         self.stats.get('validation_failed', 0)
                     )
+                    current_session.errors = self.stats.get('errors', 0)
                 
                 # Mark session as completed if requested
                 if completed:
