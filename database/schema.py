@@ -208,6 +208,51 @@ class ScraperSession(Base):
         return f"<ScraperSession(id={self.id}, type='{self.session_type}', status='{self.status}')>"
 
 
+class CrawlQueue(Base):
+    """
+    Queue for URLs to be crawled.
+    
+    This table stores URLs that are waiting to be crawled, along with their priority
+    and other metadata.
+    """
+    __tablename__ = 'crawl_queue'
+    
+    id = Column(Integer, primary_key=True)
+    url = Column(String(255), unique=True, nullable=False)
+    domain = Column(String(255), nullable=False)
+    priority = Column(Integer, default=100)  # Lower values = higher priority
+    depth = Column(Integer, default=0)
+    added_at = Column(DateTime, default=datetime.datetime.utcnow)
+    status = Column(String(20), default='pending')  # 'pending', 'processing', 'completed', 'error'
+    parent_url = Column(String(255), nullable=True)
+    
+    def __repr__(self):
+        return f"<CrawlQueue(url='{self.url}', priority={self.priority}, status='{self.status}')>"
+
+
+class ErrorLog(Base):
+    """
+    Log of errors encountered during crawling.
+    
+    This table stores detailed information about errors that occur during the
+    crawling process, including the URL, error type, and error message.
+    """
+    __tablename__ = 'error_logs'
+    
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+    url = Column(String(255), nullable=True)
+    error_type = Column(String(50), nullable=False)  # 'http', 'connection', 'timeout', 'dns', 'other'
+    error_message = Column(Text, nullable=False)
+    session_id = Column(Integer, ForeignKey('scraper_sessions.id'), nullable=True)
+    
+    # Relationship with session
+    session = relationship('ScraperSession')
+    
+    def __repr__(self):
+        return f"<ErrorLog(timestamp='{self.timestamp}', error_type='{self.error_type}', url='{self.url}')>"
+
+
 def get_db_engine(db_path):
     """
     Create a SQLAlchemy engine with optimized settings for SQLite.

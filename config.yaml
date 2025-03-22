@@ -68,6 +68,67 @@ crawling:
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
   initial_urls:
     - "https://www.manualslib.com"
+  # Maximum URLs to crawl per domain
+  max_urls_per_domain: 1
+  # Request timeout in seconds
+  request_timeout: 30
+  # Maximum number of retries for failed requests
+  max_retries: 3
+  # Delay between retries in seconds
+  retry_delay: 5
+  # Whether to follow external links
+  follow_external_links: false
+
+# URL priority settings
+url_priority:
+  # Base priority values (lower is higher priority)
+  seed_url_priority: 10
+  manufacturer_page_priority: 20
+  category_page_priority: 30
+  product_page_priority: 40
+  default_priority: 100
+  # Priority modifiers
+  depth_modifier: 5  # Priority decreases by this amount per depth level
+  query_params_modifier: 10  # URLs with query parameters get lower priority
+  keyword_match_bonus: -15  # Priority bonus for URLs with keyword matches
+
+# Content extraction settings
+content_extraction:
+  # Maximum content length to extract (in characters)
+  max_content_length: 50000
+  # HTML elements to prioritize for extraction
+  priority_elements:
+    - "h1"
+    - "h2"
+    - "h3"
+    - "title"
+    - "meta[name='description']"
+    - "meta[property='og:title']"
+    - "meta[property='og:description']"
+  # Elements to exclude from extraction
+  exclude_elements:
+    - "script"
+    - "style"
+    - "footer"
+    - "nav"
+    - "aside"
+  # Maximum links to extract per page
+  max_links_per_page: 100
+
+# Claude analyzer settings
+claude_analyzer:
+  # Enable caching of Claude responses
+  enable_cache: true
+  # Cache expiration time in days
+  cache_expiration_days: 7
+  # Maximum tokens to use in requests
+  max_tokens: 4000
+  # Temperature for Claude API calls
+  temperature: 0.1
+  # Enable quick keyword pre-check before using Claude
+  enable_keyword_precheck: true
+  # Minimum confidence threshold for manufacturer detection
+  min_confidence_threshold: 0.7
 
 # Keywords for filtering
 keywords:
@@ -101,7 +162,11 @@ scraper:
   
   # Delay between retries in seconds
   retry_delay: 5
-
+  
+  # Seed URLs for the scraper
+  seed_urls:
+    - "https://www.manualslib.com/"
+  
 # Manufacturer website finder configuration
 manufacturer_finder:
   # Maximum number of manufacturers to process in a single batch
