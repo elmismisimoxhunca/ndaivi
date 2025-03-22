@@ -29,6 +29,7 @@ from typing import Optional, List, Dict, Any, Tuple, Set
 from collections import defaultdict
 from bs4 import BeautifulSoup
 from sqlalchemy import func, desc
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 import anthropic
@@ -39,7 +40,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.db_manager import get_db_manager
-from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession
+from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession, _created_category_tables
 from database.statistics_manager import StatisticsManager
 import json
 
@@ -88,13 +89,42 @@ class UrlPriority:
         'directory': 6,
         'catalog': 5,
         'product': 4,
-        'category': 3
+        'category': 3,
+        # New category-specific keywords
+        'products': 5,
+        'categories': 4,
+        'brands': 8,
+        'manufacturers': 10,
+        'suppliers': 7,
+        'partners': 6,
+        'catalog': 5,
+        'shop': 3,
+        'store': 3
+    }
+    
+    # HTML structure weights
+    HTML_WEIGHTS = {
+        'nav': 3,  # Navigation menus often contain category hierarchies
+        'breadcrumb': 2,  # Breadcrumbs show category structure
+        'sidebar': 2,  # Sidebars often contain category lists
+        'menu': 2,  # Menu structures often have categories
+        'list': 1,  # Lists might contain categories
+        'table': 1  # Tables might contain product/category info
+    }
+    
+    # URL path segment weights
+    PATH_WEIGHTS = {
+        'catalog': 4,
+        'products': 4,
+        'categories': 4,
+        'brands': 6,
+        'manufacturers': 8
     }
     
     @staticmethod
-    def calculate_priority(url: str, depth: int, content_hint: Optional[str] = None) -> float:
+    def calculate_priority(url: str, depth: int, content_hint: Optional[str] = None, html_structure: Optional[Dict] = None) -> float:
         """
-        Calculate a crawling priority score for a URL.
+        Calculate a crawling priority score for a URL with enhanced analysis.
         
         Lower scores indicate higher priority.
         
@@ -102,6 +132,7 @@ class UrlPriority:
             url: The URL to calculate priority for
             depth: The link depth from the starting point
             content_hint: Optional title or other content hint from the page
+            html_structure: Optional dict containing info about HTML structure
             
         Returns:
             A priority score (lower is higher priority)
@@ -109,7 +140,17 @@ class UrlPriority:
         # Base priority based on depth
         priority = depth * 10.0
         
-        # Apply keyword boosts to lower the priority score (higher priority)
+        # Parse URL for analysis
+        parsed_url = urlparse(url)
+        path_segments = parsed_url.path.lower().split('/')
+        
+        # Apply path segment boosts
+        for segment in path_segments:
+            for key, boost in UrlPriority.PATH_WEIGHTS.items():
+                if key in segment:
+                    priority -= boost
+        
+        # Apply keyword boosts to URL
         url_lower = url.lower()
         for keyword, boost in UrlPriority.PRIORITY_KEYWORDS.items():
             if keyword in url_lower:
@@ -120,7 +161,22 @@ class UrlPriority:
             content_lower = content_hint.lower()
             for keyword, boost in UrlPriority.PRIORITY_KEYWORDS.items():
                 if keyword in content_lower:
-                    priority -= boost * 0.5  # Apply half boost for content hints
+                    priority -= boost * 0.5  # Half boost for content hints
+        
+        # Apply HTML structure boosts if available
+        if html_structure:
+            for element_type, count in html_structure.items():
+                if element_type.lower() in UrlPriority.HTML_WEIGHTS:
+                    boost = UrlPriority.HTML_WEIGHTS[element_type.lower()]
+                    priority -= boost * min(count, 3)  # Cap the boost for each type
+        
+        # Special adjustments
+        if 'category' in path_segments or 'categories' in path_segments:
+            priority -= 5  # Extra boost for explicit category pages
+        
+        if parsed_url.query and any(param in parsed_url.query.lower() 
+                                  for param in ['category', 'brand', 'manufacturer']):
+            priority -= 3  # Boost for relevant query parameters
         
         # Limit minimum priority value
         return max(1.0, priority)
@@ -128,36 +184,65 @@ class UrlPriority:
 
 class PriorityUrlQueue:
     """
-    Priority queue for URLs to be crawled.
-    
-    This optimizes the crawling order to find manufacturer information faster.
+    Priority queue for URLs to be crawled with enhanced prioritization.
     """
     
     def __init__(self):
         """Initialize the priority queue."""
-        self._queue = []  # heapq priority queue with entries: (priority, counter, url, depth)
-        self._counter = 0  # Unique counter for stable sorting of same-priority items
-        self._url_set = set()  # Fast lookup for checking if URLs are in queue
+        self._queue = []  # heapq priority queue with entries: (priority, counter, url, depth, metadata)
+        self._counter = 0  # Unique counter for stable sorting
+        self._url_set = set()  # Fast lookup for URLs
+        self._url_metadata = {}  # Store metadata about URLs
     
-    def push(self, url: str, depth: int, priority: Optional[float] = None, content_hint: Optional[str] = None):
+    def __contains__(self, url):
+        """Enable 'in' operator support for direct URL checking
+        
+        Args:
+            url: URL to check
+            
+        Returns:
+            True if the URL is in the queue, False otherwise
         """
-        Add a URL to the queue with calculated priority.
+        return url in self._url_set
+        
+    def has_url(self, url: str) -> bool:
+        """Check if a URL is in the queue
+        
+        Args:
+            url: URL to check
+            
+        Returns:
+            True if the URL is in the queue, False otherwise
+        """
+        return url in self._url_set
+    
+    def push(self, url: str, depth: int, priority: Optional[float] = None, 
+             content_hint: Optional[str] = None, html_structure: Optional[Dict] = None,
+             metadata: Optional[Dict] = None):
+        """
+        Add a URL to the queue with calculated priority and metadata.
         
         Args:
             url: The URL to add
             depth: Current crawl depth
             priority: Optional explicit priority (lower is higher priority)
             content_hint: Optional content hint for priority calculation
+            html_structure: Optional dict containing info about HTML structure
+            metadata: Optional metadata about the URL
         
         Returns:
-            True if URL was added, False if it was already in the queue
+            True if URL was added, False if it was already in queue
         """
         if url in self._url_set:
             return False
         
         if priority is None:
-            # Calculate priority based on URL characteristics and depth
-            priority = UrlPriority.calculate_priority(url, depth, content_hint)
+            # Calculate priority based on all available information
+            priority = UrlPriority.calculate_priority(url, depth, content_hint, html_structure)
+        
+        # Store metadata
+        if metadata:
+            self._url_metadata[url] = metadata
         
         # Use a counter to ensure stable ordering for same-priority items
         entry = (priority, self._counter, url, depth)
@@ -167,12 +252,12 @@ class PriorityUrlQueue:
         self._url_set.add(url)
         return True
     
-    def pop(self) -> Tuple[str, int]:
+    def pop(self) -> Tuple[str, int, Optional[Dict]]:
         """
         Get the highest priority URL from the queue.
         
         Returns:
-            Tuple of (url, depth) for the highest priority URL
+            Tuple of (url, depth, metadata) for the highest priority URL
         
         Raises:
             IndexError: If the queue is empty
@@ -183,7 +268,24 @@ class PriorityUrlQueue:
         # Get and return the highest priority (lowest score) URL
         _, _, url, depth = heapq.heappop(self._queue)
         self._url_set.remove(url)
-        return url, depth
+        
+        # Get and remove metadata if it exists
+        metadata = self._url_metadata.pop(url, None)
+        
+        return url, depth, metadata
+    
+    def update_priority(self, url: str, new_priority: float):
+        """Update the priority of a URL in the queue"""
+        if url not in self._url_set:
+            return False
+        
+        # Find and update the entry
+        for i, (_, counter, u, depth) in enumerate(self._queue):
+            if u == url:
+                self._queue[i] = (new_priority, counter, url, depth)
+                heapq.heapify(self._queue)
+                return True
+        return False
     
     def __len__(self) -> int:
         """Get the number of URLs in the queue."""
@@ -192,12 +294,27 @@ class PriorityUrlQueue:
     def __contains__(self, url: str) -> bool:
         """Check if a URL is in the queue."""
         return url in self._url_set
+    
+    def has_url(self, url: str) -> bool:
+        """Check if a URL is in the queue - compatibility method."""
+        return url in self._url_set
+    
+    def get_depth(self, url: str) -> Optional[int]:
+        """Get the depth of a URL if it's in the queue."""
+        if url not in self._url_set:
+            return None
+        
+        # Find the URL in the queue and return its depth
+        for _, _, u, depth in self._queue:
+            if u == url:
+                return depth
+        return None
 
 
 class CompetitorScraper:
     """Web scraper for extracting manufacturer information from competitor websites."""
     
-    def __init__(self, config_path='config.yaml'):
+    def __init__(self, config_path: str = 'config.yaml'):
         """
         Initialize the competitor scraper.
         
@@ -234,7 +351,20 @@ class CompetitorScraper:
         
         # Initialize control flags
         self.shutdown_requested = False
+        
+        # Initialize caching and other internal variables
+        self._initialize_caching()
+        
+    # URL queue methods are accessed directly through self.url_queue
+        
+    def _initialize_caching(self):
+        """Initialize caching and other internal variables"""
         self.suspend_handled = False
+        
+        # Add caching
+        self._manufacturer_cache = {}  # Cache for manufacturer lookups
+        self._category_cache = {}      # Cache for category lookups
+        self._batch_size = 10          # Number of URLs to process in each batch
         
         self.logger.info(f"Competitor Scraper initialized successfully (session {self.session_uuid})")
 
@@ -285,12 +415,17 @@ class CompetitorScraper:
                 os.makedirs(db_dir, exist_ok=True)
                 self.logger.info(f"Created database directory {db_dir}")
             
+            # Store config path for later use
+            self.config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
+            
             # Initialize database if it doesn't exist
             if not os.path.exists(db_path):
                 self.logger.info(f"Database not found. Initializing database at {db_path}")
-                config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
-                init_db(db_path, config_path=config_path)
+                init_db(db_path, config_path=self.config_path)
                 self.logger.info("Database initialized successfully")
+            else:
+                # Ensure language tables exist even if database already exists
+                init_db(db_path, config_path=self.config_path)
             
             # Get database manager singleton
             self.db_manager = get_db_manager(db_path)
@@ -605,53 +740,50 @@ class CompetitorScraper:
                 
             return []
     
-    def _translate_category(self, category: str, manufacturer_name: str) -> str:
+    def _translate_category(self, category: str, manufacturer_name: str) -> Dict[str, str]:
         """
-        Translate a category name to the target language, preserving manufacturer name.
+        Translate a category name to all target languages, preserving manufacturer name.
         
         Args:
             category: Original category name
             manufacturer_name: Manufacturer name to preserve
             
         Returns:
-            Translated category name
+            Dictionary mapping language codes to translated category names
         """
-        target_lang = list(self.config['languages']['targets'].keys())[0]  # Use first target language
-        if target_lang == self.config['languages']['source']:
-            return category
+        translations = {}
+        source_lang = self.config['languages']['source']
+        target_langs = self.config['languages']['targets']
         
-        try:
-            # Detect if already in target language
-            spanish_indicators = ['de', 'para', 'con', 'del', 'y', 'las', 'los']
-            if any(word in category.lower().split() for word in spanish_indicators):
-                self.logger.info(f"Category '{category}' appears to be in Spanish, skipping translation")
-                return category
-            
-            # Use the claude_analyzer to translate the category
+        # Add source language version
+        translations[source_lang] = category
+        
+        # Skip translation if category appears to be already in Spanish
+        spanish_indicators = ['de', 'para', 'con', 'del', 'y', 'las', 'los']
+        if any(word in category.lower().split() for word in spanish_indicators):
+            self.logger.debug(f"Category '{category}' appears to be in Spanish, skipping translation")
+            for lang in target_langs:
+                translations[lang] = category
+            return translations
+        
+        # Translate to each target language
+        for target_lang in target_langs:
+            if target_lang == source_lang:
+                continue
+                
             try:
-                translated = self.claude_analyzer.translate_text(
-                    text=category,
-                    source_lang='english',
-                    target_lang=target_lang,
-                    preserve_text=manufacturer_name
-                )
+                translated = self.claude_analyzer.translate_category(category, manufacturer_name, target_lang)
+                if translated and translated != category:
+                    self.logger.info(f"Translated '{category}' to '{translated}' ({target_lang})")
+                    translations[target_lang] = translated
+                    self.statistics_manager.increment_stat('translations')
+                else:
+                    translations[target_lang] = category
             except Exception as e:
-                self.logger.error(f"Error translating category: {str(e)}")
-                # If translation fails, return original category
-                return category
-            
-            # Verify manufacturer name is preserved
-            if manufacturer_name.lower() in translated.lower():
-                self.logger.info(f"Translated '{category}' to '{translated}'")
-                self.statistics_manager.increment_stat('translations')
-                return translated
-            else:
-                self.logger.warning(f"Translation lost manufacturer name: '{translated}'. Using original.")
-                return category
+                self.logger.error(f"Translation error for {target_lang}: {str(e)}")
+                translations[target_lang] = category
         
-        except Exception as e:
-            self.logger.error(f"Error translating category '{category}': {str(e)}")
-            return category
+        return translations
     
     def _process_extracted_data(self, response_data: List[Dict[str, Any]], source_url: str):
         """
@@ -665,8 +797,14 @@ class CompetitorScraper:
             self.logger.info(f"No manufacturers found in {source_url}")
             return
         
+        # Log initial extraction summary
+        total_manufacturers = len(response_data)
+        total_categories = sum(len(item.get('categories', [])) for item in response_data)
+        self.logger.info(f"Claude Haiku extracted {total_manufacturers} manufacturers and {total_categories} categories from {source_url}")
+        
         manufacturers_added = 0
         categories_added = 0
+        translations_added = 0
         
         try:
             with self.db_manager.session() as session:
@@ -696,34 +834,106 @@ class CompetitorScraper:
                     else:
                         self.logger.debug(f"Manufacturer {manufacturer_name} already exists")
                     
+                    # Log manufacturer and categories
+                    self.logger.info(f"Extracted manufacturer: {manufacturer_name} with {len(categories)} categories:")
+                    for i, category_name in enumerate(categories, 1):
+                        self.logger.info(f"  {i}. {category_name}")
+                    
                     # Process categories
+                    self.logger.info(f"Processing {len(categories)} categories for manufacturer '{manufacturer_name}'")
                     categories_processed = 0
-                    for category_name in categories:
+                    for i, category_name in enumerate(categories, 1):
+                        self.logger.info(f"  Category {i}: {category_name}")
+                        
                         # Validate category contains manufacturer name
                         if manufacturer_name.lower() not in category_name.lower():
                             self.logger.warning(f"Skipping category '{category_name}' - missing manufacturer name")
                             continue
                         
-                        # Translate category if needed
-                        translated_category = self._translate_category(category_name, manufacturer_name)
-                        
-                        # Check for existing category
-                        category = session.query(Category).filter(
-                            func.lower(Category.name) == func.lower(translated_category)
-                        ).first()
-                        
-                        if not category:
-                            category = Category(name=translated_category)
-                            session.add(category)
-                            categories_added += 1
-                            self.statistics_manager.increment_stat('categories_extracted')
-                            self.logger.debug(f"Added new category: {translated_category}")
-                        
-                        # Associate category with manufacturer if not already associated
-                        if category not in manufacturer.categories:
-                            manufacturer.categories.append(category)
-                            categories_processed += 1
-                            self.logger.debug(f"Associated '{translated_category}' with '{manufacturer_name}'")
+                        try:
+                            # Get translations for all target languages
+                            translations = self._translate_category(category_name, manufacturer_name)
+                            
+                            # Store base category in main categories table
+                            source_lang = self.config['languages']['source']
+                            base_category = translations[source_lang]
+                            
+                            # Find or create base category
+                            try:
+                                # Use case-insensitive search for existing category
+                                category = session.query(Category).filter(
+                                    func.lower(Category.name) == func.lower(base_category)
+                                ).first()
+                                
+                                if not category:
+                                    # Create new category
+                                    category = Category(name=base_category)
+                                    session.add(category)
+                                    try:
+                                        session.flush()  # Get the ID
+                                        self.logger.debug(f"Created new category: {base_category}")
+                                        categories_added += 1
+                                        self.statistics_manager.increment_stat('categories_extracted')
+                                    except SQLAlchemyError as flush_err:
+                                        session.rollback()
+                                        self.logger.warning(f"Error creating category '{base_category}': {str(flush_err)}")
+                                        raise
+                                
+                                # Handle many-to-many relationship
+                                if manufacturer not in category.manufacturers:
+                                    category.manufacturers.append(manufacturer)
+                                    categories_processed += 1
+                                    self.logger.debug(f"Associated category '{base_category}' with manufacturer '{manufacturer.name}'")
+                                    
+                                # Commit the changes
+                                try:
+                                    session.flush()
+                                except SQLAlchemyError as flush_err:
+                                    session.rollback()
+                                    self.logger.warning(f"Error associating category '{base_category}' with manufacturer: {str(flush_err)}")
+                                    raise
+                                    
+                            except SQLAlchemyError as db_err:
+                                self.logger.error(f"Database error processing category '{base_category}': {str(db_err)}")
+                                raise
+                            
+                            # Ensure base category operations are committed
+                            session.flush()
+                            
+                            # Store translations in language-specific tables
+                            for lang, translated_name in translations.items():
+                                if lang == source_lang:
+                                    continue
+                                    
+                                # Get the appropriate category table class for this language
+                                category_table = _created_category_tables.get(lang)
+                                if not category_table:
+                                    self.logger.warning(f"No table found for language {lang}, skipping translation")
+                                    continue
+                                
+                                # Check if translation already exists
+                                existing_translation = session.query(category_table).filter(
+                                    category_table.category_id == category.id,
+                                    func.lower(category_table.category_name) == func.lower(translated_name)
+                                ).first()
+                                
+                                if not existing_translation:
+                                    # Create new translation entry
+                                    translation_entry = category_table(
+                                        category_id=category.id,
+                                        category_name=translated_name
+                                    )
+                                    session.add(translation_entry)
+                                    translations_added += 1
+                                    self.logger.info(f"Added translation for '{base_category}' in {lang}: '{translated_name}'")
+                                    
+                            # Commit after processing each category's translations
+                            session.commit()
+                            
+                        except Exception as e:
+                            session.rollback()
+                            self.logger.error(f"Error processing category '{category_name}': {str(e)}")
+                            continue
                     
                     # Set website if applicable
                     manufacturer_website = item.get('website')
@@ -752,11 +962,11 @@ class CompetitorScraper:
             
             self.logger.info(
                 f"Processed {len(response_data)} manufacturers from {source_url} "
-                f"(Added: {manufacturers_added} manufacturers, {categories_added} categories)"
+                f"(Added: {manufacturers_added} manufacturers, {categories_added} categories, {translations_added} translations)"
             )
             self._log_to_db(
                 "INFO", 
-                f"Saved {manufacturers_added} manufacturers and {categories_added} categories from {source_url}"
+                f"Saved {manufacturers_added} manufacturers, {categories_added} categories, and {translations_added} translations from {source_url}"
             )
         
         except Exception as e:
@@ -877,35 +1087,41 @@ class CompetitorScraper:
         
         try:
             with self.db_manager.session() as session:
-                status = session.query(CrawlStatus).filter(CrawlStatus.url == url).first()
-                current_time = datetime.datetime.now()
-                
-                if status:
-                    # Update existing record
-                    status.visited = True
-                    status.last_visited = current_time
-                    status.is_manufacturer_page = is_manufacturer
-                    if depth is not None and (status.depth is None or depth < status.depth):
-                        status.depth = depth
-                    self.logger.debug(f"Updated existing URL in database as visited: {url}")
-                else:
-                    # Create new record
-                    url_depth = depth if depth is not None else 0
-                    status = CrawlStatus(
-                        url=url,
-                        visited=True,
-                        depth=url_depth,
-                        last_visited=current_time,
-                        is_manufacturer_page=is_manufacturer
-                    )
-                    session.add(status)
-                    self.logger.debug(f"Added new URL to database as visited: {url} with depth {url_depth}")
-                
-                session.commit()
-                return True
-        
+                try:
+                    status = session.query(CrawlStatus).filter(CrawlStatus.url == url).first()
+                    current_time = datetime.datetime.now()
+                    
+                    if status:
+                        # Update existing record
+                        status.visited = True
+                        status.last_visited = current_time
+                        status.is_manufacturer_page = is_manufacturer
+                        if depth is not None and (status.depth is None or depth < status.depth):
+                            status.depth = depth
+                        self.logger.debug(f"Updated existing URL in database as visited: {url}")
+                    else:
+                        # Create new record
+                        url_depth = depth if depth is not None else 0
+                        status = CrawlStatus(
+                            url=url,
+                            visited=True,
+                            depth=url_depth,
+                            last_visited=current_time,
+                            is_manufacturer_page=is_manufacturer
+                        )
+                        session.add(status)
+                        self.logger.debug(f"Added new URL to database as visited: {url} with depth {url_depth}")
+                    
+                    session.commit()
+                    return True
+                    
+                except SQLAlchemyError as sql_err:
+                    session.rollback()
+                    self.logger.warning(f"Database error marking URL as visited: {url}, Error: {str(sql_err)}")
+                    return False
+                    
         except Exception as e:
-            self.logger.error(f"Error marking URL as visited in database: {url}, Error: {str(e)}")
+            self.logger.error(f"Unexpected error marking URL as visited: {url}, Error: {str(e)}")
             return False
     
     def _load_initial_urls(self):
@@ -1042,158 +1258,140 @@ class CompetitorScraper:
         if len(self.url_queue) == 0:
             self._load_initial_urls()
             self._load_unvisited_urls()
-        
-        # Process the batch
-        batch_stats = self._process_batch(max_pages, max_runtime_minutes)
-        
-        # Update session status in database
-        try:
-            self.statistics_manager.update_session_in_database(completed=True)
-            self.logger.info(f"Updated session {self.session_id} - marked as completed")
-        except Exception as e:
-            self.logger.error(f"Failed to update scraper session: {str(e)}")
-        
-        self.logger.info(f"Crawling finished. Processed {batch_stats.get('pages_crawled', 0)} pages.")
-        return batch_stats
-    
-    def _process_batch(self, max_pages: int = 0, max_runtime_minutes: int = 0) -> Dict[str, Any]:
-        """
-        Process a batch of URLs with time and page limits.
-        
-        Args:
-            max_pages: Maximum number of pages to process (0 for unlimited)
-            max_runtime_minutes: Maximum runtime in minutes (0 for unlimited)
             
-        Returns:
-            Dictionary of batch statistics
-        """
+        self.logger.info(f"URL queue contains {len(self.url_queue)} URLs to process")
+        
         # Calculate end time if runtime limit is set
         end_time = time.time() + (max_runtime_minutes * 60) if max_runtime_minutes > 0 else None
-        self.logger.info(f"URL queue contains {len(self.url_queue)} URLs to process")
         
         # Initialize batch variables
         pages_crawled = 0
         batch_start_time = time.time()
         
-        # Main processing loop
+        # Process URLs in batches
         while len(self.url_queue) > 0 and (max_pages == 0 or pages_crawled < max_pages):
             # Check for shutdown/suspension
             if self.check_shutdown_requested():
                 self.logger.info("Shutdown requested, stopping batch processing")
                 break
-            
+                
             # Check runtime limit
             if end_time and time.time() >= end_time:
                 self.logger.info(f"Reached maximum runtime of {max_runtime_minutes} minutes")
                 break
             
+            # Calculate batch size
+            remaining_pages = max_pages - pages_crawled if max_pages > 0 else self._batch_size
+            current_batch_size = min(self._batch_size, remaining_pages) if max_pages > 0 else self._batch_size
+            
             try:
-                # Get next URL from priority queue
-                url, depth = self.url_queue.pop()
+                # Process a batch of URLs
+                processed_urls = []
+                extracted_data_batch = []
                 
-                # Skip if already visited
-                url_exists, is_visited = self._check_url_in_database(url)
-                if is_visited or url in self.visited_urls:
-                    self.logger.debug(f"Skipping already visited URL: {url}")
-                    continue
-                
-                # Skip excluded URLs
-                if self._is_excluded_url(url):
-                    self.logger.debug(f"Skipping excluded URL: {url}")
-                    continue
-                
-                # Process the URL
-                self.logger.info(f"Processing URL: {url} [Queue: {len(self.url_queue)}]")
-                
-                # Ensure URL is in database
-                if not url_exists:
-                    with self.db_manager.session() as session:
-                        status = CrawlStatus(url=url, depth=depth)
-                        session.add(status)
-                        session.commit()
-                
-                # Fetch content
-                content = self._fetch_url(url)
-                if not content:
-                    self.logger.warning(f"Failed to fetch content for URL: {url}")
-                    continue
-                
-                # Parse with BeautifulSoup
-                soup = BeautifulSoup(content, 'html.parser')
-                title = soup.title.text.strip() if soup.title else "No title"
-                self.logger.info(f"Page title: {title}")
-                
-                # Extract text content for analysis
-                content_text = self._extract_text_content(soup)
-                
-                # Analyze with Claude Haiku to determine if it's a manufacturer page
-                is_manufacturer = self._analyze_with_anthropic(url, title, content_text)
-                if is_manufacturer:
-                    self.logger.info(f"Found manufacturer page: {url}")
+                for _ in range(current_batch_size):
+                    if len(self.url_queue) == 0:
+                        break
+                        
+                    url, depth, metadata = self.url_queue.pop()
                     
-                    # Extract detailed manufacturer data with Claude Sonnet
-                    extracted_data = self._analyze_with_claude_sonnet(url, title, content_text)
-                    
-                    # Process and save the extracted data
-                    self._process_extracted_data(extracted_data, url)
-                    self.statistics_manager.increment_stat('manufacturers_found')
-                
-                # Extract and process links
-                links = self._extract_links(soup, url)
-                self.logger.info(f"Extracted {len(links)} links from {url}")
-                
-                # Update outgoing link count in database
-                with self.db_manager.session() as session:
-                    status = session.query(CrawlStatus).filter(CrawlStatus.url == url).first()
-                    if status:
-                        status.outgoing_links = len(links)
-                        status.title = title
-                        session.commit()
-                
-                # Add extracted links to queue
-                added_links = 0
-                for link_url, anchor_text in links.items():
-                    # Skip if already visited or in queue
-                    if link_url in self.visited_urls:
+                    if url in self.visited_urls:
                         continue
                     
-                    link_in_queue = link_url in self.url_queue
-                    link_exists, link_visited = self._check_url_in_database(link_url)
-                    
-                    if not link_visited and not link_in_queue:
-                        # Add to queue with properly calculated priority
-                        self.url_queue.push(link_url, depth + 1, content_hint=anchor_text)
-                        added_links += 1
+                    try:
+                        # Fetch and analyze page
+                        html_content = self._fetch_url(url)
+                        if not html_content:
+                            continue
+                            
+                        is_manufacturer, extracted_data, new_urls = self._analyze_page(url, html_content)
                         
-                        # Add to database if not already there
-                        if not link_exists:
-                            with self.db_manager.session() as session:
-                                status = CrawlStatus(
-                                    url=link_url,
-                                    depth=depth + 1,
-                                    parent_url=url
-                                )
-                                session.add(status)
+                        # Add new URLs to queue
+                        for new_url, hint, structure, meta in new_urls:
+                            self.url_queue.push(new_url, depth + 1, 
+                                             content_hint=hint,
+                                             html_structure=structure,
+                                             metadata=meta)
+                        
+                        # Collect extracted data for batch processing
+                        if extracted_data:
+                            extracted_data_batch.extend(
+                                {'url': url, 'data': data} for data in extracted_data
+                            )
+                        
+                        processed_urls.append(url)
+                        pages_crawled += 1
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing URL {url}: {str(e)}", exc_info=True)
+                        continue
+                
+                # Batch process all extracted data
+                if extracted_data_batch:
+                    self._batch_process_data(extracted_data_batch)
+                
+                # Batch update visited URLs with improved error handling
+                with self.db_manager.session() as session:
+                    current_time = datetime.datetime.now()
+                    for url in processed_urls:
+                        try:
+                            # First try to update existing record
+                            updated = session.query(CrawlStatus).filter(
+                                CrawlStatus.url == url
+                            ).update({
+                                'visited': True,
+                                'last_visited': current_time,
+                                'depth': self.url_queue.get_depth(url) if url in self.url_queue else 0
+                            }, synchronize_session=False)
+                            
+                            if not updated:
+                                # If no existing record was updated, try to create new one
+                                try:
+                                    new_status = CrawlStatus(
+                                        url=url,
+                                        visited=True,
+                                        last_visited=current_time,
+                                        depth=self.url_queue.get_depth(url) if url in self.url_queue else 0
+                                    )
+                                    session.add(new_status)
+                                except SQLAlchemyError as add_err:
+                                    # If we get a unique constraint error, another process might have created it
+                                    # Try to update one more time
+                                    session.rollback()
+                                    session.query(CrawlStatus).filter(
+                                        CrawlStatus.url == url
+                                    ).update({
+                                        'visited': True,
+                                        'last_visited': current_time
+                                    }, synchronize_session=False)
+                            
+                            try:
                                 session.commit()
+                                self.visited_urls.add(url)
+                            except SQLAlchemyError as commit_err:
+                                session.rollback()
+                                self.logger.warning(f"Failed to commit URL {url}: {str(commit_err)}")
+                                continue
+                                
+                        except SQLAlchemyError as sql_err:
+                            session.rollback()
+                            self.logger.warning(f"Database error processing URL {url}: {str(sql_err)}")
+                        except Exception as url_err:
+                            session.rollback()
+                            self.logger.error(f"Unexpected error processing URL {url}: {str(url_err)}")
                 
-                self.logger.info(f"Added {added_links} new links to the queue")
-                
-                # Mark URL as visited
-                self.visited_urls.add(url)
-                self._mark_url_visited(url, is_manufacturer, depth)
+                self.visited_urls.update(processed_urls)
                 
                 # Update statistics
-                pages_crawled += 1
-                self.statistics_manager.increment_stat('pages_crawled')
+                self.statistics_manager.update_stat('pages_crawled', len(processed_urls), increment=True)
                 
-                # Log progress periodically
+                # Log progress
                 if pages_crawled % 10 == 0 or max_pages < 10:
                     self.logger.info(f"Progress: {pages_crawled} pages crawled, {len(self.url_queue)} URLs in queue")
-            
+                
             except Exception as e:
-                self.logger.error(f"Error processing URL: {str(e)}")
-                import traceback
-                self.logger.debug(f"Crawling error details: {traceback.format_exc()}")
+                self.logger.error(f"Error in batch processing: {str(e)}", exc_info=True)
+                continue
         
         # Generate sitemap
         self.generate_sitemap_files()
@@ -1211,7 +1409,272 @@ class CompetitorScraper:
         
         self.logger.info(status_message)
         return self.statistics_manager.get_all_stats()
-    
+
+    def _extract_html_structure(self, soup: BeautifulSoup) -> Dict[str, int]:
+        """Extract information about HTML structure for priority calculation"""
+        structure = defaultdict(int)
+        
+        # Count navigation elements
+        structure['nav'] = len(soup.find_all('nav'))
+        
+        # Count and analyze lists
+        lists = soup.find_all(['ul', 'ol'])
+        structure['list'] = len([l for l in lists if len(l.find_all('li')) > 3])
+        
+        # Count menu-like elements
+        structure['menu'] = len(soup.find_all(class_=lambda x: x and 'menu' in str(x).lower()))
+        
+        # Count sidebar elements
+        structure['sidebar'] = len(soup.find_all(class_=lambda x: x and 'sidebar' in str(x).lower()))
+        
+        # Count breadcrumb elements
+        structure['breadcrumb'] = len(soup.find_all(class_=lambda x: x and 'breadcrumb' in str(x).lower()))
+        
+        # Count tables
+        structure['table'] = len(soup.find_all('table'))
+        
+        return dict(structure)
+
+    def _analyze_page(self, url: str, html_content: str) -> Tuple[bool, List[Dict], List[Tuple]]:
+        """Analyze a page for manufacturer information and extract links."""
+        try:
+            # Parse HTML
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Extract text content
+            title = soup.title.string if soup.title else ""
+            text_content = self._extract_text_content(soup)
+            
+            # Extract HTML structure information
+            html_structure = self._extract_html_structure(soup)
+            
+            # Log page analysis start with structure info
+            self.logger.info(f"Analyzing page structure for {url}:")
+            self.logger.info(f"Found structure: nav={html_structure.get('nav', 0)}, "
+                           f"lists={html_structure.get('list', 0)}, "
+                           f"menus={html_structure.get('menu', 0)}")
+            
+            # Check if it's a manufacturer page
+            is_manufacturer = self.claude_analyzer.is_manufacturer_page(url, title, text_content)
+            
+            extracted_data = []
+            if is_manufacturer:
+                self.logger.info(f"Found manufacturer page {url}, extracting data...")
+                # Extract manufacturer data with enhanced processing
+                result = self.claude_analyzer.extract_manufacturers(
+                    url=url,
+                    title=title,
+                    content=text_content,
+                    html_content=html_content
+                )
+                if result and 'manufacturers' in result:
+                    extracted_data = result['manufacturers']
+                    for mfr in extracted_data:
+                        self.logger.info(f"Extracted manufacturer: {mfr.get('manufacturer', 'unknown')}")
+                        if 'categories' in mfr:
+                            self.logger.info(f"Found {len(mfr['categories'])} categories")
+                            category_sample = ', '.join(mfr['categories'][:5])
+                            self.logger.debug(f"Categories sample: {category_sample}...")
+            
+            # Extract and prioritize links
+            new_urls = []
+            for link in soup.find_all('a', href=True):
+                href = link.get('href')
+                if href:
+                    absolute_url = urljoin(url, href)
+                    if self._should_crawl_url(absolute_url):
+                        # Get content hint from link text and title
+                        content_hint = f"{link.get_text()} {link.get('title', '')}"
+                        
+                        # Store link metadata
+                        metadata = {
+                            'text': link.get_text(strip=True),
+                            'title': link.get('title', ''),
+                            'class': link.get('class', []),
+                            'parent_tag': link.parent.name if link.parent else None
+                        }
+                        
+                        new_urls.append((absolute_url, content_hint, html_structure, metadata))
+            
+            self.logger.info(f"Found {len(new_urls)} new URLs to process")
+            return is_manufacturer, extracted_data, new_urls
+            
+        except Exception as e:
+            self.logger.error(f"Error analyzing page {url}: {str(e)}", exc_info=True)
+            return False, [], []
+
+    def _should_crawl_url(self, url: str) -> bool:
+        """Check if a URL should be crawled based on the current configuration"""
+        # Check if the URL is already in the queue or has been visited
+        if url in self.visited_urls or self.url_queue.has_url(url):
+            return False
+        
+        # Check if the URL matches the target domain
+        target_domain = urlparse(self.config['target_url']).netloc
+        if urlparse(url).netloc != target_domain:
+            return False
+        
+        # Check if the URL has a valid scheme
+        if not urlparse(url).scheme:
+            return False
+        
+        return True
+        
+    def _batch_process_data(self, data_batch: List[Dict]):
+        """Process a batch of extracted data efficiently"""
+        try:
+            with self.db_manager.session() as session:
+                # Group by manufacturer to minimize database queries
+                manufacturer_data = {}
+                for item in data_batch:
+                    mfr_name = item['data'].get('manufacturer') or item['data'].get('name')
+                    if mfr_name not in manufacturer_data:
+                        manufacturer_data[mfr_name] = {
+                            'website': item['data'].get('website'),
+                            'categories': set(),
+                            'urls': []
+                        }
+                    manufacturer_data[mfr_name]['categories'].update(
+                        item['data'].get('categories', [])
+                    )
+                    manufacturer_data[mfr_name]['urls'].append(item['url'])
+                
+                # Batch create/update manufacturers and categories
+                for mfr_name, mfr_info in manufacturer_data.items():
+                    try:
+                        manufacturer = self._get_or_create_manufacturer(
+                            session, 
+                            name=mfr_name,
+                            website=mfr_info['website']
+                        )
+                        
+                        # Batch create categories
+                        categories = []
+                        for category_name in mfr_info['categories']:
+                            try:
+                                category = self._get_or_create_category(
+                                    session,
+                                    manufacturer=manufacturer,
+                                    name=category_name
+                                )
+                                categories.append(category)
+                            except Exception as e:
+                                self.logger.warning(
+                                    f"Error processing category {category_name}: {str(e)}"
+                                )
+                                continue
+                        
+                        # Batch update statistics
+                        if categories:
+                            self.statistics_manager.update_stat(
+                                'categories_extracted', 
+                                len(categories), 
+                                increment=True
+                            )
+                        
+                        # Update URL priorities
+                        if len(categories) > 5:
+                            for url in mfr_info['urls']:
+                                self._update_url_priority(url, session, priority_boost=-5)
+                        
+                        # Update manufacturer statistics
+                        self.statistics_manager.update_stat('manufacturers_extracted', 1, increment=True)
+                        if mfr_info['website']:
+                            self.statistics_manager.update_stat('websites_found', 1, increment=True)
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error processing manufacturer {mfr_name}: {str(e)}")
+                        continue
+                
+                # Commit all changes
+                try:
+                    session.commit()
+                except Exception as e:
+                    self.logger.error(f"Error committing batch: {str(e)}")
+                    session.rollback()
+                    raise
+                    
+        except Exception as e:
+            self.logger.error(f"Error in batch data processing: {str(e)}")
+            if 'session' in locals():
+                session.rollback()
+
+    def _get_or_create_manufacturer(self, session, name: str, website: str = None) -> Manufacturer:
+        """Get or create a manufacturer record with caching"""
+        cache_key = name.lower()
+        if cache_key in self._manufacturer_cache:
+            return self._manufacturer_cache[cache_key]
+            
+        manufacturer = session.query(Manufacturer).filter_by(name=name).first()
+        if not manufacturer:
+            manufacturer = Manufacturer(name=name, website=website)
+            session.add(manufacturer)
+            session.flush()
+        
+        self._manufacturer_cache[cache_key] = manufacturer
+        return manufacturer
+
+    def _get_or_create_category(self, session, manufacturer: Manufacturer, name: str) -> Category:
+        """Get or create a category record with caching and proper error handling"""
+        try:
+            # First check the cache
+            cache_key = f"{manufacturer.id}:{name.lower()}"
+            if cache_key in self._category_cache:
+                return self._category_cache[cache_key]
+            
+            # Look for an existing category with this name using case-insensitive search
+            try:
+                category = session.query(Category).filter(
+                    func.lower(Category.name) == func.lower(name)
+                ).first()
+                
+                if not category:
+                    # Create new category with proper error handling
+                    category = Category(name=name)
+                    session.add(category)
+                    try:
+                        session.flush()  # Get the ID
+                        self.logger.debug(f"Created new category: {name}")
+                        self.statistics_manager.increment_stat('categories_extracted')
+                    except SQLAlchemyError as flush_err:
+                        session.rollback()
+                        self.logger.warning(f"Error creating category '{name}': {str(flush_err)}")
+                        raise
+                
+                # Handle many-to-many relationship
+                if category not in manufacturer.categories:
+                    manufacturer.categories.append(category)
+                    self.logger.debug(f"Associated category '{name}' with manufacturer '{manufacturer.name}'")
+                
+                # Update cache and return
+                self._category_cache[cache_key] = category
+                return category
+                
+            except SQLAlchemyError as db_err:
+                self.logger.error(f"Database error in _get_or_create_category for '{name}': {str(db_err)}")
+                raise
+                
+        except Exception as e:
+            self.logger.error(f"Unexpected error in _get_or_create_category for '{name}': {str(e)}")
+            raise
+
+    def _update_url_priority(self, url: str, session, priority_boost: float):
+        """Update the priority of a URL based on its content value"""
+        try:
+            # Update in database
+            crawl_status = session.query(CrawlStatus).filter_by(url=url).first()
+            if crawl_status and crawl_status.priority:
+                crawl_status.priority += priority_boost
+                session.commit()
+            
+            # Update in queue if present
+            if url in self.url_queue:
+                self.url_queue.update_priority(url, priority_boost)
+                
+        except Exception as e:
+            self.logger.error(f"Error updating URL priority for {url}: {str(e)}")
+            session.rollback()
+
     def start_crawling(self, max_pages: Optional[int] = None) -> Dict[str, Any]:
         """
         Start the crawling process.
@@ -1312,7 +1775,6 @@ class CompetitorScraper:
         
         self.logger.info("Scraper closed successfully")
 
-
 if __name__ == "__main__":
     # When run directly, start the scraper
     logging.basicConfig(level=logging.INFO)
@@ -1329,7 +1791,7 @@ if __name__ == "__main__":
         args = parser.parse_args()
         
         # Start crawling with parsed arguments
-        stats = scraper.process_batch(max_pages=args.max_pages, max_runtime_minutes=args.max_runtime)
+        stats = scraper.process_batch(max_pages=args.max_pages)
         
         # Output final statistics
         print("\nCrawling Statistics:")

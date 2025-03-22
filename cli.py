@@ -368,6 +368,58 @@ def list_manufacturers(config, limit=None, with_categories=False):
     finally:
         session.close()
 
+def display_category_translations(config, limit=None):
+    """
+    Display categories with their translations in all available languages.
+    
+    Args:
+        config: Configuration dictionary
+        limit: Maximum number of categories to display
+    """
+    db_manager = get_db_manager(config['database']['path'])
+    logger = logging.getLogger('cli')
+    
+    try:
+        with db_manager.session() as session:
+            # Get categories with optional limit
+            query = session.query(Category)
+            if limit:
+                query = query.limit(limit)
+            categories = query.all()
+            
+            if not categories:
+                print("No categories found in database.")
+                return
+            
+            print("\n" + "=" * 80)
+            print("CATEGORIES WITH TRANSLATIONS")
+            print("=" * 80 + "\n")
+            
+            # Get available language tables
+            from database.schema import _created_category_tables
+            languages = list(_created_category_tables.keys())
+            
+            # Display each category with its translations
+            for i, category in enumerate(categories, 1):
+                print(f"{i}. {category.name}")
+                
+                # Get translations for each language
+                for lang in languages:
+                    table = _created_category_tables[lang]
+                    translation = session.query(table).filter_by(category_id=category.id).first()
+                    if translation:
+                        print(f"   {lang}: {translation.category_name}")
+                    else:
+                        print(f"   {lang}: No translation available")
+                
+                # Display associated manufacturers
+                if category.manufacturers:
+                    print("   Manufacturers:", ", ".join(m.name for m in category.manufacturers))
+                print()
+                
+    except Exception as e:
+        logger.error(f"Error displaying category translations: {str(e)}")
+
 def list_categories(config, limit=None, with_manufacturers=False):
     """List categories in the database"""
     session = get_db_session(config)
@@ -1048,6 +1100,7 @@ def interactive_mode(config):
                 print("  session-stats [--type scraper|finder] [--limit N]\tList detailed statistics for past sessions")
                 print("  list-manufacturers [--limit N] [--with-categories]\tList manufacturers")
                 print("  list-categories [--limit N] [--with-manufacturers]\tList categories")
+                print("  show-translations [--limit N]\t\t\tShow categories with translations")
                 print("  search <term> [--type manufacturer|category]\t\tSearch the database")
                 print("  export [--output PATH]\t\t\tExport database to JSON")
                 print("  validate\t\t\t\t\tValidate database consistency")
@@ -1210,6 +1263,26 @@ def interactive_mode(config):
                     except Exception as e:
                         logger.error(f"Error in finder: {str(e)}")
                         print(f"Error: {str(e)}")
+            
+            elif command.startswith('show-translations'):
+                args = command.split()[1:] if len(command.split()) > 1 else []
+                limit = None
+                
+                # Parse arguments
+                i = 0
+                while i < len(args):
+                    if args[i] == '--limit' and i + 1 < len(args):
+                        try:
+                            limit = int(args[i + 1])
+                            i += 2
+                        except ValueError:
+                            print("Error: --limit requires a number")
+                            break
+                    else:
+                        print(f"Unrecognized argument: {args[i]}")
+                        i += 1
+                
+                display_category_translations(config, limit)
             
             elif command.startswith('run-all'):
                 args = command.split()[1:] if len(command.split()) > 1 else []

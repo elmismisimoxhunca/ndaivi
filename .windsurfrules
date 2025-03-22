@@ -71,15 +71,4 @@
 -We should be able to run both sequentially using the "run-all" command, run in the background, and consult progress.
 
 CURRENT ISSUES:
-
-ndaivi> scrape --max-pages 4
-Starting competitor scraper...
-2025-03-21 21:06:30,102 - competitor_scraper - INFO - Configuration loaded from config.yaml
-2025-03-21 21:06:30,102 - db_manager - INFO - Initializing database connection to database/manuals.db
-2025-03-21 21:06:30,108 - db_manager - INFO - SQLite pragmas set successfully
-2025-03-21 21:06:30,108 - db_manager - INFO - Database connection initialized successfully
-2025-03-21 21:06:30,108 - competitor_scraper - INFO - Database manager initialized for database/manuals.db
-2025-03-21 21:06:30,108 - cli - ERROR - Error in interactive mode: Client.__init__() got an unexpected keyword argument 'proxies'
-Error: Client.__init__() got an unexpected keyword argument 'proxies'
-
-This is an error we have encountered before, and its caused by CLAUDE unknowingly coding with an old version of Anthropic SDK, the "proxies" field is deprecated, cause we need the functionaltiy, we need to bypass the SDK and call the API Directly.
+Scraper gets database errors and we are improving its logic, so Claude gets just headers, text in links, to extract categories, instead of dumping the full code of the page.

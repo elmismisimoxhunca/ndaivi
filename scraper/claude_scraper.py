@@ -9,7 +9,7 @@ import requests
 import datetime
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
 
 # Add the project root to the Python path
@@ -318,19 +318,24 @@ class ClaudeScraper:
                         # Normalize category name
                         category_name = category_name.strip()
                         
-                        # Check if category exists
-                        category = session.query(Category).filter_by(
-                            name=category_name,
-                            manufacturer_id=manufacturer.id
+                        # Check if category exists - use case-insensitive search
+                        category = session.query(Category).filter(
+                            func.lower(Category.name) == func.lower(category_name)
                         ).first()
                         
                         if not category:
+                            # Create new category without manufacturer_id - we'll use the relationship instead
                             category = Category(
-                                name=category_name,
-                                manufacturer_id=manufacturer.id
+                                name=category_name
                             )
                             session.add(category)
+                            session.flush()  # Get the ID
                             self.logger.info(f"Added new category: {category_name} for {manufacturer_name}")
+                            
+                        # Associate category with manufacturer using the ORM relationship
+                        if category not in manufacturer.categories:
+                            manufacturer.categories.append(category)
+                            self.logger.debug(f"Associated category '{category_name}' with manufacturer '{manufacturer.name}'")
                 
                 # Only commit if we created our own session
                 # Otherwise the caller will handle the commit

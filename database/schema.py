@@ -53,7 +53,7 @@ def create_category_table(lang_code):
             # Add extend_existing to handle tables that already exist
             '__table_args__': {'extend_existing': True},
             'id': Column(Integer, primary_key=True),
-            'product_id': Column(Integer, ForeignKey('products.id'), nullable=False),
+            'category_id': Column(Integer, ForeignKey('categories.id'), nullable=False),
             'category_name': Column(Text, nullable=False),
             'created_at': Column(DateTime, default=datetime.datetime.utcnow),
             'updated_at': Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow),
@@ -69,10 +69,16 @@ def create_category_table(lang_code):
 # Note: This will be called with the config_path when init_db is called
 def create_language_tables(config_path=None):
     """Create tables for all languages specified in the config"""
-    for lang in get_supported_languages(config_path):
-        # Skip if the table class already exists to avoid duplicate definitions
-        if f'Category_{lang}' not in globals():
-            globals()[f'Category_{lang}'] = create_category_table(lang)
+    # Get supported languages from config
+    languages = get_supported_languages(config_path)
+    
+    # Create tables for each language
+    for lang in languages:
+        # Create table class if it doesn't exist
+        if lang not in _created_category_tables:
+            create_category_table(lang)
+    
+    return _created_category_tables
 
 # Tables will be created when init_db is called with the specific config path
 # No default creation here to avoid creating tables for languages not in config
@@ -283,11 +289,11 @@ def init_db(db_path, config_path=None):
     # Get database engine with optimized settings
     engine = get_db_engine(db_path)
     
-    # Create base tables
-    Base.metadata.create_all(engine)
-    
     # Create language-specific tables based on config
     create_language_tables(config_path)
+    
+    # Create all tables including language-specific ones
+    Base.metadata.create_all(engine)
     
     return engine
 

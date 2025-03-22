@@ -3,6 +3,52 @@ import re
 import yaml
 import requests
 import logging
+import json
+from bs4 import BeautifulSoup
+from typing import List, Dict, Tuple
+from urllib.parse import urljoin
+
+# Define prompt templates directly in this file to avoid import issues
+MANUFACTURER_DETECTION_PROMPT = """
+URL: {url}
+Title: {title}
+
+Content: {truncated_content}
+
+Question: Is this webpage about a manufacturer or does it contain a list of manufacturers or brands?
+
+Respond using this exact format without any explanations:
+
+# RESPONSE_START
+IS_MANUFACTURER: yes  # Replace with 'no' if not a manufacturer page
+# RESPONSE_END
+"""
+
+# System prompts
+MANUFACTURER_SYSTEM_PROMPT = """You are a specialized AI trained to analyze web content and identify manufacturers and their product categories.
+Your task is to analyze structured navigation data from web pages and identify manufacturers/brands ONLY."""
+
+CATEGORY_SYSTEM_PROMPT = """You are a specialized AI trained to analyze web content and identify product categories for a specific manufacturer.
+Your task is to analyze structured navigation data from web pages and identify product categories belonging to the manufacturer."""
+
+# General system prompt used for other tasks
+SYSTEM_PROMPT = """You are Claude, an AI assistant specialized in analyzing web content to extract structured information about manufacturers and their product categories.
+
+Your task is to carefully analyze the provided content and extract the requested information following the exact format specified in each instruction."""
+
+# Import other less essential prompt templates from the original file
+try:
+    from scraper.prompt_templates import (
+        MANUFACTURER_EXTRACTION_PROMPT, CATEGORY_EXTRACTION_PROMPT, 
+        CATEGORY_VALIDATION_PROMPT, TRANSLATION_PROMPT
+    )
+except ImportError:
+    # Fallback minimal templates if imports fail
+    MANUFACTURER_EXTRACTION_PROMPT = "Extract manufacturers from this content: {content}"
+    CATEGORY_EXTRACTION_PROMPT = "Extract categories for {manufacturer_name} from this content: {content}"
+    CATEGORY_VALIDATION_PROMPT = "Validate these categories for {manufacturer}: {categories}"
+    TRANSLATION_PROMPT = "Translate {category} to {target_language}"
+
 
 class ClaudeAnalyzer:
     """A class to handle Claude API interactions for analyzing web content"""
@@ -13,15 +59,15 @@ class ClaudeAnalyzer:
         self.model = model
         self.sonnet_model = sonnet_model
         self.logger = logger or logging.getLogger('claude_analyzer')
-    
+        self.category_count = 0  # Track categories found in initial pass
+
     def is_manufacturer_page(self, url, title, content):
         """Check if the page is a manufacturer page using Claude Haiku"""
         try:
             # Prepare a truncated version of the content
             truncated_content = content[:2000] + "..." if len(content) > 2000 else content
             
-            # Import prompt templates
-            from scraper.prompt_templates import MANUFACTURER_DETECTION_PROMPT, SYSTEM_PROMPT
+            # Use the module-level imports for prompt templates
             
             # Format the prompt with the page details
             prompt = MANUFACTURER_DETECTION_PROMPT.format(
@@ -40,7 +86,7 @@ class ClaudeAnalyzer:
             payload = {
                 "model": self.model,  # Using Haiku model for this task
                 "max_tokens": 50,
-                "system": SYSTEM_PROMPT,
+                "system": MANUFACTURER_SYSTEM_PROMPT,
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -87,14 +133,445 @@ class ClaudeAnalyzer:
             self.logger.error(f"Error analyzing with Claude Haiku: {str(e)}")
             return False
     
-    def extract_manufacturers(self, url, title, content):
+    def _extract_structured_content(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """Extract content from important HTML structures"""
+        structured_content = []
+        
+        # Extract navigation menus (often contain category hierarchies)
+        nav_elements = soup.find_all(['nav', 'ul', 'ol'])
+        for nav in nav_elements:
+            if len(nav.get_text(strip=True)) > 50:  # Only consider substantial nav elements
+                structured_content.append({
+                    'type': 'navigation',
+                    'content': nav.get_text(' ', strip=True)
+                })
+        
+        # Extract product listing sections
+        product_sections = soup.find_all(['div', 'section'], class_=lambda x: x and any(term in str(x).lower() for term in ['product', 'category', 'catalog']))
+        for section in product_sections:
+            structured_content.append({
+                'type': 'product_section',
+                'content': section.get_text(' ', strip=True)
+            })
+        
+        # Extract breadcrumb navigation
+        breadcrumbs = soup.find_all(['nav', 'div'], class_=lambda x: x and 'breadcrumb' in str(x).lower())
+        for crumb in breadcrumbs:
+            structured_content.append({
+                'type': 'breadcrumb',
+                'content': crumb.get_text(' > ', strip=True)
+            })
+        
+        return structured_content
+
+    def _extract_prioritized_content(self, soup: BeautifulSoup, max_chars: int = 3000) -> Tuple[str, List[str]]:
+        """
+        Extract content from HTML, prioritizing structured data up to max_chars.
+        Returns tuple of (prioritized_content, remaining_chunks)
+        """
+        content_parts = []
+        remaining_chunks = []
+        current_length = 0
+        
+        # Priority 1: Navigation menus and category lists
+        nav_elements = soup.find_all(['nav', 'ul', 'ol'], 
+                                   class_=lambda x: x and any(term in str(x).lower() 
+                                   for term in ['category', 'product', 'menu', 'nav']))
+        for nav in nav_elements:
+            text = nav.get_text(' ', strip=True)
+            if len(text) > 50:  # Only substantial content
+                if current_length + len(text) <= max_chars:
+                    content_parts.append(text)
+                    current_length += len(text)
+                else:
+                    remaining_chunks.append(text)
+        
+        # Priority 2: Breadcrumbs and structured hierarchies
+        breadcrumbs = soup.find_all(['nav', 'div'], 
+                                  class_=lambda x: x and 'breadcrumb' in str(x).lower())
+        for crumb in breadcrumbs:
+            text = crumb.get_text(' > ', strip=True)
+            if current_length + len(text) <= max_chars:
+                content_parts.append(text)
+                current_length += len(text)
+            else:
+                remaining_chunks.append(text)
+        
+        # Priority 3: Product sections and category grids
+        product_sections = soup.find_all(['div', 'section'], 
+                                       class_=lambda x: x and any(term in str(x).lower() 
+                                       for term in ['product', 'category', 'catalog']))
+        for section in product_sections:
+            text = section.get_text(' ', strip=True)
+            if len(text) > 50:
+                if current_length + len(text) <= max_chars:
+                    content_parts.append(text)
+                    current_length += len(text)
+                else:
+                    remaining_chunks.append(text)
+        
+        # Priority 4: Tables with relevant headers
+        tables = soup.find_all('table')
+        for table in tables:
+            headers = table.find_all('th')
+            if any(term in str(headers).lower() for term in ['product', 'category', 'brand', 'manufacturer']):
+                text = table.get_text(' ', strip=True)
+                if current_length + len(text) <= max_chars:
+                    content_parts.append(text)
+                    current_length += len(text)
+                else:
+                    remaining_chunks.append(text)
+        
+        # If we still have room, add any remaining relevant text
+        if current_length < max_chars:
+            main_content = soup.find('main') or soup.find('article') or soup.find('div', class_='content')
+            if main_content:
+                text = main_content.get_text(' ', strip=True)
+                if current_length + len(text) <= max_chars:
+                    content_parts.append(text)
+                else:
+                    # Only take what we can fit
+                    space_left = max_chars - current_length
+                    content_parts.append(text[:space_left])
+                    remaining_chunks.append(text[space_left:])
+        
+        return ' '.join(content_parts), remaining_chunks
+
+    def _extract_manufacturers(self, url: str, content: str) -> List[Dict]:
+        """Extract manufacturer information from structured content"""
+        try:
+            # Use the module-level imports for prompt templates
+            
+            # Format the prompt with the structured content
+            prompt = MANUFACTURER_EXTRACTION_PROMPT.format(content=content)
+            
+            # Make direct API call to Claude
+            headers = {
+                "x-api-key": self.api_key,
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
+            payload = {
+                "model": self.model,
+                "max_tokens": 4000,
+                "system": MANUFACTURER_SYSTEM_PROMPT,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                response_data = response.json()
+                result = response_data["content"][0]["text"]
+                
+                # Parse the delimited response
+                parsed_data = self._parse_manufacturer_response(result)
+                if parsed_data and parsed_data.get('manufacturers'):
+                    self.logger.info(f"Found {len(parsed_data['manufacturers'])} manufacturers in {url}")
+                    return parsed_data['manufacturers']
+                else:
+                    self.logger.info(f"No manufacturers found in {url}")
+                    return []
+            else:
+                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error extracting manufacturers: {str(e)}")
+            return []
+
+    def _extract_categories(self, url: str, manufacturer_name: str, content: str) -> List[str]:
+        """Extract category information for a specific manufacturer"""
+        try:
+            # Use the module-level imports for prompt templates
+            
+            # Format the prompt with the structured content
+            prompt = CATEGORY_EXTRACTION_PROMPT.format(
+                content=content,
+                manufacturer_name=manufacturer_name
+            )
+            
+            # Make direct API call to Claude
+            headers = {
+                "x-api-key": self.api_key,
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
+            payload = {
+                "model": self.model,
+                "max_tokens": 4000,
+                "system": CATEGORY_SYSTEM_PROMPT,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                response_data = response.json()
+                result = response_data["content"][0]["text"]
+                
+                # Parse the delimited response
+                categories = self._parse_category_response(result)
+                if categories:
+                    self.logger.info(f"Found {len(categories)} categories for {manufacturer_name} in {url}")
+                    return categories
+                else:
+                    self.logger.info(f"No categories found for {manufacturer_name} in {url}")
+                    return []
+            else:
+                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error extracting categories: {str(e)}")
+            return []
+
+    def _parse_manufacturer_response(self, response_text: str) -> Dict:
+        """Parse manufacturer response using strict delimited format"""
+        try:
+            # Initialize result structure
+            manufacturers = []
+
+            # Find content between RESPONSE_START and RESPONSE_END
+            match = re.search(r'# RESPONSE_START\s*(.*?)\s*# RESPONSE_END', response_text, re.DOTALL)
+            if not match:
+                self.logger.warning("No valid response delimiters found")
+                return {"manufacturers": []}
+
+            content = match.group(1).strip()
+            if not content:
+                return {"manufacturers": []}
+
+            # Split into manufacturer blocks
+            manufacturer_blocks = re.finditer(r'# MANUFACTURER_START\s*(.*?)\s*# MANUFACTURER_END', content, re.DOTALL)
+            
+            for block in manufacturer_blocks:
+                manufacturer_data = block.group(1).strip()
+                if not manufacturer_data:
+                    continue
+
+                # Initialize manufacturer dict
+                current_manufacturer = {
+                    "name": "",
+                    "urls": []
+                }
+
+                # Parse manufacturer data
+                for line in manufacturer_data.split('\n'):
+                    line = line.strip()
+                    if line.startswith('NAME:'):
+                        current_manufacturer["name"] = line.replace('NAME:', '').strip()
+                    elif line.startswith('URL:'):
+                        url = line.replace('URL:', '').strip()
+                        if url:
+                            current_manufacturer["urls"].append(url)
+
+                # Add manufacturer if we have a name
+                if current_manufacturer["name"]:
+                    manufacturers.append(current_manufacturer)
+
+            return {"manufacturers": manufacturers}
+
+        except Exception as e:
+            self.logger.error(f"Error parsing manufacturer response: {str(e)}")
+            return {"manufacturers": []}
+            
+    def _parse_category_response(self, response_text: str) -> List[str]:
+        """Parse category response using delimited format"""
+        try:
+            categories = []
+
+            # Find content between RESPONSE_START and RESPONSE_END
+            match = re.search(r'# RESPONSE_START\s*(.*?)\s*# RESPONSE_END', response_text, re.DOTALL)
+            if not match:
+                self.logger.warning("No valid category response delimiters found")
+                return []
+
+            content = match.group(1).strip()
+            if not content:
+                return []
+
+            # Extract all categories
+            for line in content.split('\n'):
+                line = line.strip()
+                if line.startswith('CATEGORY:'):
+                    category = line.replace('CATEGORY:', '').strip()
+                    if category:
+                        categories.append(category)
+
+            return categories
+
+        except Exception as e:
+            self.logger.error(f"Error parsing category response: {str(e)}")
+            return []
+
+    def extract_manufacturers(self, url: str, title: str, content: str, html_content: str = None) -> Dict:
+        """Extract manufacturer and category information from structured navigation elements"""
+        try:
+            if not html_content:
+                self.logger.warning(f"No HTML content provided for {url}, falling back to text analysis")
+                return {"manufacturers": []}
+
+            soup = BeautifulSoup(html_content, 'html.parser')
+            structured_content = []
+            
+            # 1. Extract navigation menus
+            for nav in soup.find_all('nav'):
+                links = nav.find_all('a')
+                if links:
+                    link_data = []
+                    for link in links:
+                        if link.get_text(strip=True):
+                            href = urljoin(url, link.get('href', '')) if link.get('href') else ''
+                            link_data.append(f"{link.get_text(strip=True)} [{href}]")
+                    if link_data:
+                        structured_content.append(f"Navigation Menu Links:\n" + "\n".join(link_data))
+
+            # 2. Extract sidebar/menu lists
+            for div in soup.find_all(['div', 'aside'], class_=lambda x: x and any(term in str(x).lower() 
+                                   for term in ['sidebar', 'menu', 'navigation'])):
+                for list_elem in div.find_all(['ul', 'ol']):
+                    links = list_elem.find_all('a')
+                    if links:
+                        link_data = []
+                        for link in links:
+                            if link.get_text(strip=True):
+                                href = urljoin(url, link.get('href', '')) if link.get('href') else ''
+                                link_data.append(f"{link.get_text(strip=True)} [{href}]")
+                        if link_data:
+                            structured_content.append(f"Menu List Links:\n" + "\n".join(link_data))
+
+            # 3. Extract category/product listings
+            for section in soup.find_all(['div', 'section'], class_=lambda x: x and any(term in str(x).lower() 
+                                       for term in ['category', 'product', 'catalog', 'listing'])):
+                links = section.find_all('a')
+                if links:
+                    link_data = []
+                    for link in links:
+                        if link.get_text(strip=True):
+                            href = urljoin(url, link.get('href', '')) if link.get('href') else ''
+                            link_data.append(f"{link.get_text(strip=True)} [{href}]")
+                    if link_data:
+                        structured_content.append(f"Category/Product Links:\n" + "\n".join(link_data))
+
+            # 4. Extract breadcrumb navigation
+            for crumb in soup.find_all(['nav', 'div', 'ol'], class_=lambda x: x and 'breadcrumb' in str(x).lower()):
+                links = crumb.find_all('a')
+                if links:
+                    link_data = []
+                    for link in links:
+                        if link.get_text(strip=True):
+                            href = urljoin(url, link.get('href', '')) if link.get('href') else ''
+                            link_data.append(f"{link.get_text(strip=True)} [{href}]")
+                    if link_data:
+                        structured_content.append(f"Breadcrumb Path:\n" + " > ".join(link_data))
+
+            # 5. Extract links with manufacturer/brand-related classes or paths
+            manufacturer_links = []
+            # Class-based detection
+            for link in soup.find_all('a', class_=lambda x: x and any(term in str(x).lower() 
+                                    for term in ['brand', 'manufacturer', 'vendor'])):
+                if link.get_text(strip=True):
+                    href = urljoin(url, link.get('href', '')) if link.get('href') else ''
+                    manufacturer_links.append(f"{link.get_text(strip=True)} [{href}]")
+            
+            # URL path-based detection
+            for link in soup.find_all('a', href=lambda x: x and any(term in str(x).lower() 
+                                    for term in ['/brand/', '/manufacturer/', '/vendor/'])):
+                if link.get_text(strip=True):
+                    href = urljoin(url, link.get('href', '')) if link.get('href') else ''
+                    manufacturer_links.append(f"{link.get_text(strip=True)} [{href}]")
+            
+            if manufacturer_links:
+                structured_content.append(f"Manufacturer/Brand Links:\n" + "\n".join(manufacturer_links))
+
+            # 6. Extract page title and main headings
+            if soup.title:
+                structured_content.insert(0, f"Page Title: {soup.title.string.strip()}")
+            
+            headings = []
+            for h in soup.find_all(['h1', 'h2']):
+                # Check if heading contains a link
+                heading_link = h.find('a')
+                if heading_link and heading_link.get('href'):
+                    href = urljoin(url, heading_link.get('href'))
+                    headings.append(f"{h.get_text(strip=True)} [{href}]")
+                else:
+                    headings.append(h.get_text(strip=True))
+            
+            if headings:
+                structured_content.insert(1, f"Main Headings:\n" + "\n".join(headings))
+
+            # Only proceed if we found structured content
+            if not structured_content:
+                self.logger.info(f"No structured content found in {url}")
+                return {"manufacturers": []}
+
+            # Add current URL for context
+            structured_content.insert(0, f"Current Page: {url}")
+
+            # Prepare the structured content for Claude
+            structured_text = "\n\n".join(structured_content)
+            self.logger.debug(f"Extracted structured content ({len(structured_text)} chars)")
+
+            # Step 1: Extract manufacturers first
+            manufacturers = self._extract_manufacturers(url, structured_text)
+            if not manufacturers:
+                self.logger.info(f"No manufacturers identified in {url}")
+                return {"manufacturers": []}
+            
+            # Step 2: For each manufacturer, extract categories in a separate call
+            result_manufacturers = []
+            for manufacturer in manufacturers:
+                manufacturer_name = manufacturer.get('name')
+                if not manufacturer_name:
+                    continue
+                    
+                # Extract categories for this manufacturer
+                categories = self._extract_categories(url, manufacturer_name, structured_text)
+                
+                # Add to result with categories
+                result_manufacturers.append({
+                    "name": manufacturer_name,
+                    "categories": categories,
+                    "urls": manufacturer.get('urls', [])
+                })
+                
+            # Return combined result
+            if result_manufacturers:
+                total_manufacturers = len(result_manufacturers)
+                total_categories = sum(len(m.get('categories', [])) for m in result_manufacturers)
+                self.logger.info(f"Found {total_manufacturers} manufacturers with {total_categories} categories in {url}")
+                return {"manufacturers": result_manufacturers}
+
+            self.logger.info(f"No valid manufacturers with categories identified in {url}")
+            return {"manufacturers": []}
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting manufacturers from HTML: {str(e)}")
+            return {"manufacturers": []}
+
+    def _extract_manufacturers_initial(self, url: str, title: str, content: str) -> Dict:
         """Extract manufacturer and category information using Claude Sonnet"""
         try:
             # Prepare a truncated version of the content to avoid token limits
             truncated_content = content[:4000] + "..." if len(content) > 4000 else content
             
-            # Import prompt templates
-            from scraper.prompt_templates import MANUFACTURER_EXTRACTION_PROMPT, SYSTEM_PROMPT
+            # Use the module-level imports for prompt templates
             
             # Format the prompt with the page details
             prompt = MANUFACTURER_EXTRACTION_PROMPT.format(
@@ -113,7 +590,7 @@ class ClaudeAnalyzer:
             payload = {
                 "model": self.model,  # Using Haiku model for all operations
                 "max_tokens": 4000,
-                "system": SYSTEM_PROMPT,
+                "system": MANUFACTURER_SYSTEM_PROMPT,
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -147,210 +624,37 @@ class ClaudeAnalyzer:
             self.logger.error(f"Error analyzing with Claude Haiku extraction: {str(e)}")
             return None
     
-    def _parse_delimited_response(self, response_text):
-        """Parse response using strict delimited format"""
-        try:
-            # Extract content between RESPONSE_START and RESPONSE_END
-            response_pattern = r'# RESPONSE_START\s+([\s\S]*?)# RESPONSE_END'
-            response_match = re.search(response_pattern, response_text)
-            
-            if not response_match:
-                self.logger.error("Response missing RESPONSE_START/END markers")
-                return {"manufacturers": []}
-                
-            content = response_match.group(1).strip()
-            self.logger.info(f"Found delimited content of length {len(content)}")
-            
-            # For manufacturer detection response (is_manufacturer_page method)
-            if 'IS_MANUFACTURER:' in content:
-                is_mfr_match = re.search(r'IS_MANUFACTURER:\s*(yes|no)', content, re.IGNORECASE)
-                if not is_mfr_match:
-                    self.logger.error("Invalid manufacturer detection response format")
-                    return False
-                return is_mfr_match.group(1).strip().lower() == 'yes'
-            
-            # For manufacturer data extraction (extract_manufacturers method)
-            manufacturers = []
-            manufacturer_pattern = r'# MANUFACTURER_START\s+([\s\S]*?)# MANUFACTURER_END'
-            manufacturer_matches = list(re.finditer(manufacturer_pattern, content, re.DOTALL))
-            
-            if not manufacturer_matches:
-                self.logger.info("No MANUFACTURER_START/END blocks found in response")
-                # Try YAML parsing as fallback
-                try:
-                    # Check if content looks like YAML
-                    if 'manufacturers:' in content:
-                        yaml_data = yaml.safe_load(content)
-                        if yaml_data and 'manufacturers' in yaml_data:
-                            self.logger.info(f"Parsed {len(yaml_data['manufacturers'])} manufacturers from YAML")
-                            return yaml_data
-                except Exception as yaml_error:
-                    self.logger.warning(f"Failed to parse as YAML: {str(yaml_error)}")
-                    
-                # If we reach here, try regex extraction as last resort
-                return self._extract_with_regex(response_text)
-            
-            # Process each manufacturer block
-            for match in manufacturer_matches:
-                manufacturer_block = match.group(1).strip()
-                self.logger.info(f"Processing manufacturer block of length {len(manufacturer_block)}")
-                
-                # Extract manufacturer name (required)
-                name_match = re.search(r'NAME:\s*(.*?)(?:\n|$)', manufacturer_block)
-                if not name_match:
-                    self.logger.warning("Manufacturer block missing NAME field, skipping")
-                    continue
-                    
-                name = name_match.group(1).strip()
-                
-                # Find all categories (at least one required)
-                categories = []
-                for category_match in re.finditer(r'CATEGORY:\s*(.*?)(?:\n|$)', manufacturer_block):
-                    category = category_match.group(1).strip()
-                    # Validate category includes manufacturer name
-                    if name.lower() in category.lower():
-                        categories.append(category)
-                    else:
-                        self.logger.warning(f"Skipping category '{category}' - must include manufacturer name '{name}'")
-                
-                if not categories:
-                    self.logger.warning(f"No valid categories found for manufacturer {name}, skipping")
-                    continue
-                
-                # Extract website (optional)
-                website = None
-                website_match = re.search(r'WEBSITE:\s*(.*?)(?:\n|$)', manufacturer_block)
-                if website_match:
-                    website = website_match.group(1).strip()
-                
-                # Build manufacturer object
-                manufacturer = {
-                    "name": name,
-                    "categories": categories
-                }
-                
-                if website:
-                    manufacturer["website"] = website
-                    
-                manufacturers.append(manufacturer)
-            
-            if manufacturers:
-                self.logger.info(f"Successfully parsed {len(manufacturers)} manufacturers")
-                return {"manufacturers": manufacturers}
-            
-            # If no manufacturers found after processing all blocks, return empty list
-            self.logger.info("No valid manufacturers found in delimited response")
-            return {"manufacturers": []}
-            
-        except Exception as e:
-            self.logger.error(f"Error parsing delimited response: {str(e)}")
-            # Fall back to extracting whatever we can from the text
-            return self._extract_with_regex(response_text)
-    
-    def _extract_with_regex(self, text):
-        """Extract data using regex patterns when YAML parsing fails"""
-        self.logger.info("Attempting to extract data with regex patterns")
-        
-        # Check if this is an is_manufacturer response
-        if 'is_manufacturer' in text.lower():
-            is_mfr = re.search(r'is_manufacturer:\s*(yes|true|y|1)', text.lower())
-            if is_mfr:
-                return True
-            return False
-        
-        # Try to extract manufacturer data
-        manufacturers = []
-        
-        # Look for manufacturer patterns
-        # Pattern 1: name: Manufacturer Name
-        manufacturer_patterns = [
-            r'name:\s*([^\n]+)',  # Simple name: value pattern
-            r'- name:\s*([^\n]+)'  # List item name pattern
-        ]
-        
-        # Find all potential manufacturer names
-        all_manufacturer_names = []
-        for pattern in manufacturer_patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                name = match.group(1).strip().strip('"').strip("'")
-                if name and len(name) < 100:  # Basic sanity check
-                    all_manufacturer_names.append(name)
-        
-        # Now extract categories and websites for each manufacturer
-        for name in all_manufacturer_names:
-            # Find the segment of text that might contain this manufacturer's details
-            name_pos = text.find(f"name: {name}")
-            if name_pos == -1:
-                name_pos = text.find(f"- name: {name}")
-            
-            if name_pos != -1:
-                # Extract text from this position to the next manufacturer or end
-                next_name_pos = text.find("name:", name_pos + 10)
-                if next_name_pos == -1:
-                    segment = text[name_pos:]
-                else:
-                    segment = text[name_pos:next_name_pos]
-                
-                # Extract categories
-                categories = []
-                category_matches = re.finditer(r'- ([^\n]+?)(?=\n|$)', segment)
-                for match in category_matches:
-                    category = match.group(1).strip()
-                    if category and len(category) < 100 and name.lower() in category.lower():
-                        categories.append(category)
-                
-                # Extract website
-                website_match = re.search(r'website:\s*(https?://[^\s\n"]+)', segment)
-                website = website_match.group(1) if website_match else None
-                
-                # Create manufacturer entry
-                manufacturer = {
-                    'name': name,
-                    'categories': categories,
-                    'website': website
-                }
-                manufacturers.append(manufacturer)
-        
-        # If we found any manufacturers, return them structured properly
-        if manufacturers:
-            return {'manufacturers': manufacturers}
-        
-        # Fallback to empty list
-        return {'manufacturers': []}
-        
-    def translate_text(self, text, source_lang, target_lang, preserve_text=None):
+    def translate_category(self, category: str, manufacturer_name: str, target_lang: str) -> str:
         """
-        Translate text from source language to target language using Claude.
+        Translate a category name to the target language.
         
         Args:
-            text: Text to translate
-            source_lang: Source language (e.g., 'english')
-            target_lang: Target language (e.g., 'spanish')
-            preserve_text: Text to preserve in the translation (e.g., manufacturer name)
+            category: Original category name
+            manufacturer_name: Manufacturer name to preserve
+            target_lang: Target language code (e.g., 'es', 'pt', 'fr', 'it')
             
         Returns:
-            Translated text
+            Translated category name
         """
         try:
-            # Skip translation if text is too short
-            if len(text) < 3:
-                return text
-                
-            # For Spanish, check if it already contains Spanish words
-            if target_lang.lower() == 'spanish':
-                spanish_indicators = ['de', 'para', 'con', 'del', 'y', 'las', 'los']
-                if any(word in text.lower().split() for word in spanish_indicators):
-                    self.logger.info(f"Text '{text}' appears to already be in Spanish, skipping translation")
-                    return text
+            # Map language codes to full names
+            language_names = {
+                'es': 'Spanish',
+                'pt': 'Portuguese',
+                'fr': 'French',
+                'it': 'Italian'
+            }
             
-            # Prepare the translation prompt
-            base_prompt = "Translate the following text from {0} to {1}:\n\n{2}"
-            prompt = base_prompt.format(source_lang, target_lang, text)
+            # Get full language name
+            target_language = language_names.get(target_lang, 'Spanish')  # Default to Spanish if unknown
             
-            # Add instruction to preserve specific text if provided
-            if preserve_text:
-                prompt += "\n\nImportant: Preserve the term '{0}' exactly as it appears in the original text.".format(preserve_text)
+            # Use the module-level imports for prompt templates
+            
+            # Format the prompt with the category and target language
+            prompt = TRANSLATION_PROMPT.format(
+                category=category,
+                target_language=target_language
+            )
             
             # Use requests to make a direct API call
             headers = {
@@ -360,11 +664,17 @@ class ClaudeAnalyzer:
             }
             
             payload = {
-                "model": self.model,  # Using Haiku model for simple translation
+                "model": self.model,
                 "max_tokens": 100,
-                "system": "You are a professional translator. Translate text accurately while preserving any technical terms, brand names, or proper nouns.",
                 "messages": [
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
                 ]
             }
             
@@ -377,28 +687,29 @@ class ClaudeAnalyzer:
             # Handle the response
             if response.status_code == 200:
                 response_data = response.json()
-                translated_text = response_data["content"][0]["text"].strip()
+                result = response_data["content"][0]["text"].strip()
                 
-                # Remove any instructions that might have been included in the response
-                if "Important:" in translated_text:
-                    translated_text = translated_text.split("Important:")[0].strip()
-                if "Importante:" in translated_text:
-                    translated_text = translated_text.split("Importante:")[0].strip()
+                # Parse the response for the translation
+                response_pattern = r'# RESPONSE_START\s+TRANSLATED:\s*(.*?)\s*# RESPONSE_END'
+                response_match = re.search(response_pattern, result, re.DOTALL)
                 
-                # Verify the preserved text is still present if specified
-                if preserve_text and preserve_text.lower() not in translated_text.lower():
-                    self.logger.warning(f"Translation lost preserved text '{preserve_text}': '{translated_text}'")
-                    # Try to reinsert the preserved text
-                    translated_text = translated_text.replace(
-                        preserve_text.lower().capitalize(), 
-                        preserve_text
-                    )
-                
-                # Logging moved to CompetitorScraper to avoid duplication
-                return translated_text
+                if response_match:
+                    translated = response_match.group(1).strip()
+                    
+                    # Validate translation contains manufacturer name
+                    if manufacturer_name.lower() not in translated.lower():
+                        self.logger.warning(f"Translation missing manufacturer name: {translated}")
+                        return category
+                    
+                    self.logger.info(f"Translated to {target_lang}: {translated}")
+                    return translated
+                else:
+                    self.logger.error(f"Invalid translation response format: {result}")
+                    return category
             else:
                 self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
-                return text  # Return original text on error
+                return category
+                
         except Exception as e:
-            self.logger.error(f"Error translating text: {str(e)}")
-            return text  # Return original text on error
+            self.logger.error(f"Error translating category: {str(e)}")
+            return category
