@@ -61,47 +61,77 @@ CATEGORY: Validated Category 2
 # RESPONSE_END
 """
 
-# Translation prompt template
+# Translation prompt templates
+TRANSLATION_BATCH_PROMPT = """
+Translate these product categories to {target_language}. Keep manufacturer names unchanged but position them naturally.
+
+# CATEGORIES
+{categories}
+
+VERY IMPORTANT RULES:
+1. Keep manufacturer names untranslated but position them naturally in the target language:
+   - Spanish: 'Laptops de {manufacturer}' or '{manufacturer} Laptops'
+   - Portuguese: 'Laptops da {manufacturer}' or '{manufacturer} Laptops'
+   - French: 'Ordinateurs portables {manufacturer}' or 'Laptops {manufacturer}'
+   - Italian: 'Laptop {manufacturer}' or 'Laptop della {manufacturer}'
+2. Maintain product type accuracy
+3. Use standard industry terminology
+4. Keep translations concise
+5. ALWAYS include the manufacturer name in each translation
+6. Position the manufacturer name according to what sounds most natural in the target language
+
+Examples:
+- 'Acer Laptops' → Spanish: 'Laptops de Acer' or 'Portátiles de Acer'
+- 'Samsung TVs' → French: 'Téléviseurs Samsung'
+- 'LG Monitors' → Portuguese: 'Monitores da LG'
+- 'Dell Servers' → Italian: 'Server Dell'
+
+Respond with translations in this EXACT format:
+# RESPONSE_START
+Translated Category 1 with manufacturer
+Translated Category 2 with manufacturer
+# RESPONSE_END
+"""
+
+# Legacy single translation prompt (for fallback)
 TRANSLATION_PROMPT = """
-Translate this product category to {target_language}:
-{category}
+Translate this product category to {target_language}, positioning the manufacturer name naturally.
 
-Rules:
-1. Keep the manufacturer name EXACTLY as is - do not translate it
-2. Format appropriately for the target language:
-   - Spanish: "[Manufacturer] de [Product]" or "[Product] de [Manufacturer]"
-   - Portuguese: "[Product] da [Manufacturer]"
-   - French: "[Product] de [Manufacturer]"
-   - Italian: "[Product] di [Manufacturer]"
-3. Use simple, clear product terms
-4. No commentary or descriptions
+Category: {category}
 
-Examples for Spanish:
-- "AEG Refrigerators" -> "Refrigeradores de AEG"
-- "Samsung TVs" -> "Televisores de Samsung"
+Rules for manufacturer name positioning:
+- Spanish: 'Laptops de {manufacturer}' or '{manufacturer} Laptops'
+- Portuguese: 'Laptops da {manufacturer}' or '{manufacturer} Laptops'
+- French: 'Ordinateurs portables {manufacturer}' or 'Laptops {manufacturer}'
+- Italian: 'Laptop {manufacturer}' or 'Laptop della {manufacturer}'
 
-Examples for Portuguese:
-- "AEG Refrigerators" -> "Refrigeradores da AEG"
-- "Samsung TVs" -> "Televisores da Samsung"
-
-Respond using this exact format:
+ALWAYS keep manufacturer names untranslated but position them according to target language norms.
 
 # RESPONSE_START
-TRANSLATED: [your translation]
+TRANSLATED: <translation with manufacturer name positioned naturally>
 # RESPONSE_END
 """
 
 # Category extraction prompt template
-CATEGORY_EXTRACTION_PROMPT = """Analyze this structured web page content to identify product categories for manufacturer: {manufacturer_name}
+CATEGORY_EXTRACTION_PROMPT = """Analyze this structured web page content to identify ONLY legitimate product categories for manufacturer: {manufacturer_name}
 
 Page Information:
 {content}
 
 Important Instructions:
-1. Focus on links in navigation menus, breadcrumbs, and category sections
-2. Look for product categories that belong to {manufacturer_name}
-3. Ignore individual products, model numbers, or accessories
-4. Only include categories, not other types of content
+1. Focus ONLY on actual product categories (like 'Refrigerators', 'TVs', 'Washing Machines')
+2. ONLY extract product categories that belong to {manufacturer_name} - DO NOT extract any other manufacturers
+3. STRICTLY IGNORE the following:
+   - UI elements (Home, Menu, Search, Login, Contact Us, etc.)
+   - Navigation controls (Next, Previous, View All, etc.)
+   - Individual products or model numbers
+   - Accessories or parts
+   - Footer links (Privacy Policy, Terms of Service, etc.)
+   - Social media links
+   - Website sections that aren't product categories
+4. Only include REAL PRODUCT CATEGORIES, not website navigation elements
+5. Ensure each category represents an actual product line or type
+6. DO NOT extract other manufacturers or brands - ONLY extract categories for {manufacturer_name}
 
 Provide your analysis in the specified delimited format:
 # RESPONSE_START
@@ -112,6 +142,41 @@ CATEGORY: {manufacturer_name} Category 2
 If no categories found, respond with empty delimiters:
 # RESPONSE_START
 # RESPONSE_END
+"""
+
+# Category validation prompt template
+CATEGORY_VALIDATION_PROMPT = """You are a specialized AI trained to validate product categories for manufacturers.
+
+I have a list of potential product categories for {manufacturer} that need validation.
+Your task is to review this list and identify ONLY the legitimate product categories.
+
+VERY IMPORTANT RULES:
+1. ONLY include actual product categories (like 'Refrigerators', 'TVs', 'Washing Machines')
+2. ALWAYS include the manufacturer name in each category (e.g., 'Acer Laptops', 'Samsung TVs')
+3. Position the manufacturer name naturally:
+   - English: '{manufacturer} Laptops' or 'Laptops by {manufacturer}'
+   - Spanish: 'Laptops de {manufacturer}' or '{manufacturer} Laptops'
+4. REMOVE any website UI elements such as:
+   - Navigation buttons (Home, Menu, Search, Login, Contact Us)
+   - Control elements (Next, Previous, View All)
+   - Footer links (Privacy Policy, Terms of Service)
+   - Social media links
+5. REMOVE any individual products or model numbers
+6. REMOVE accessories or parts unless they form a distinct product category
+7. REMOVE marketing terms, slogans, or campaign names
+8. NORMALIZE similar categories (e.g., combine 'TV' and 'Television')
+
+Here is the list of potential categories to validate:
+{categories}
+
+ALWAYS respond in this EXACT delimited format:
+
+# RESPONSE_START
+CATEGORY: {manufacturer} Valid Category 1
+CATEGORY: Valid Category 2 by {manufacturer}
+# RESPONSE_END
+
+If no valid categories found, respond with empty delimiters.
 """
 
 # System prompts
@@ -138,8 +203,21 @@ Rules:
 3. Consider breadcrumb paths to understand the site hierarchy
 4. Normalize manufacturer names (remove "Inc.", "Corp.", etc.)"""
 
-CATEGORY_SYSTEM_PROMPT = """You are a specialized AI trained to analyze web content and identify product categories for a specific manufacturer.
-Your task is to analyze structured navigation data from web pages and identify product categories belonging to the manufacturer.
+CATEGORY_SYSTEM_PROMPT = """You are a specialized AI trained to analyze web content and identify ONLY legitimate product categories for a specific manufacturer.
+Your task is to analyze structured navigation data from web pages and identify REAL product categories belonging to the manufacturer.
+
+VERY IMPORTANT RULES:
+1. ONLY extract actual product categories (like 'Refrigerators', 'TVs', 'Washing Machines', 'Home Automation Systems')
+2. NEVER include website UI elements such as:
+   - Navigation buttons (Home, Menu, Search, Login, Contact Us)
+   - Control elements (Next, Previous, View All)
+   - Footer links (Privacy Policy, Terms of Service)
+   - Social media links
+3. NEVER include individual products or model numbers
+4. NEVER include accessories or parts unless they form a distinct product category
+5. ALWAYS ensure each category represents an actual product line or type
+6. DO NOT extract other manufacturers or brands - ONLY extract categories for the specified manufacturer
+7. DO NOT filter out legitimate product categories that contain words like 'home' if they are actual product lines (e.g., 'Home Automation Systems' is valid)
 
 ALWAYS respond in this EXACT delimited format:
 

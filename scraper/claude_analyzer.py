@@ -4,6 +4,7 @@ import yaml
 import requests
 import logging
 import json
+import time
 from bs4 import BeautifulSoup
 from typing import List, Dict, Tuple
 from urllib.parse import urljoin
@@ -58,75 +59,204 @@ class ClaudeAnalyzer:
         self.api_key = api_key
         self.model = model
         self.sonnet_model = sonnet_model
+        # Fallback models for rate limiting scenarios
+        self.fallback_models = [
+            'claude-3-5-haiku-20241022',  # Primary model
+            'claude-3-haiku-20240307',    # Secondary model
+            'claude-3-5-sonnet-20241022'  # Tertiary model
+        ]
+        self.current_model_index = 0
+        
+        # Exponential backoff parameters
+        self.base_wait_time = 2  # Base wait time in seconds
+        self.max_retries = 5     # Maximum number of retries
+        self.max_wait_time = 60  # Maximum wait time in seconds
+        
         self.logger = logger or logging.getLogger('claude_analyzer')
         self.category_count = 0  # Track categories found in initial pass
+        
+        # API call tracking for rate limiting
+        self.api_calls = 0
+        self.last_model_switch_time = time.time()
 
     def is_manufacturer_page(self, url, title, content):
-        """Check if the page is a manufacturer page using Claude Haiku"""
-        try:
-            # Prepare a truncated version of the content
-            truncated_content = content[:2000] + "..." if len(content) > 2000 else content
+        """
+        Check if the page is a manufacturer page using Claude AI with exponential backoff and model fallback.
+        
+        This method analyzes the page content to determine if it's about manufacturers or contains
+        manufacturer information. It sends a structured prompt to the Claude API and parses the response.
+        
+        Process flow:
+        1. Truncate content to fit API limits (2000 chars)
+        2. Format prompt with page details using MANUFACTURER_DETECTION_PROMPT template
+        3. Make API request with exponential backoff and model fallback
+        4. Parse response to determine if it's a manufacturer page
+        
+        Args:
+            url: The URL of the page being analyzed
+            title: The title of the page
+            content: The text content extracted from the page
             
-            # Use the module-level imports for prompt templates
+        Returns:
+            Boolean indicating if the page is about manufacturers
+        """
+        try:
+            self.logger.info(f"MANUFACTURER CHECK: Analyzing if {url} is a manufacturer page")
+            
+            # Prepare a truncated version of the content
+            original_length = len(content)
+            truncated_content = content[:2000] + "..." if original_length > 2000 else content
+            
+            if original_length > 2000:
+                self.logger.info(f"Content truncated from {original_length} to 2000 characters for API limits")
             
             # Format the prompt with the page details
+            self.logger.info("Formatting manufacturer detection prompt with page URL, title, and content")
             prompt = MANUFACTURER_DETECTION_PROMPT.format(
                 url=url,
                 title=title,
                 truncated_content=truncated_content
             )
             
-            # Use requests to make a direct API call
+            # Prepare headers for API call
             headers = {
                 "x-api-key": self.api_key,
                 "content-type": "application/json",
                 "anthropic-version": "2023-06-01"
             }
             
-            payload = {
-                "model": self.model,  # Using Haiku model for this task
-                "max_tokens": 50,
-                "system": MANUFACTURER_SYSTEM_PROMPT,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
+            self.logger.info("Preparing to send manufacturer detection request to Claude API")
             
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload
-            )
+            # Implement exponential backoff with model fallback
+            retry_count = 0
+            wait_time = self.base_wait_time
+            success = False
+            response = None
             
-            # Handle the response
-            if response.status_code == 200:
-                response_data = response.json()
-                answer = response_data["content"][0]["text"].strip()
+            while not success and retry_count < self.max_retries:
+                # Select current model based on fallback status
+                current_model = self.fallback_models[self.current_model_index]
                 
-                # Log the response
-                self.logger.info(f"Claude Haiku manufacturer detection for {url}: {answer}")
+                # Prepare payload with current model
+                payload = {
+                    "model": current_model,
+                    "max_tokens": 50,
+                    "system": MANUFACTURER_SYSTEM_PROMPT,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
+                }
                 
-                # Parse the response for manufacturer detection
-                # Check for delimited format
-                response_pattern = r'# RESPONSE_START\s+(.*?)\s*# RESPONSE_END'
-                response_match = re.search(response_pattern, answer, re.DOTALL)
+                # Track API calls
+                self.api_calls += 1
                 
-                if response_match:
-                    content = response_match.group(1).strip()
-                    # Look for IS_MANUFACTURER: yes/no
-                    is_mfr_match = re.search(r'IS_MANUFACTURER:\s*(yes|no)', content, re.IGNORECASE)
-                    if is_mfr_match:
-                        result = is_mfr_match.group(1).strip().lower() == 'yes'
-                        self.logger.info(f"Manufacturer detection result for {url}: {result}")
-                        return result
+                # Make API request
+                self.logger.info(f"Making Claude API call with model {current_model} (attempt {retry_count+1}/{self.max_retries})")
+                try:
+                    response = requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=payload,
+                        timeout=30  # Add timeout to prevent hanging
+                    )
+                    
+                    # Check for rate limiting or other errors
+                    if response.status_code == 200:
+                        # Success!
+                        success = True
+                    elif response.status_code == 429 or response.status_code >= 500:
+                        # Rate limit or server error - implement backoff and model fallback
+                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
+                        self.logger.warning(error_msg)
+                        
+                        # Try fallback model if available
+                        if self.current_model_index < len(self.fallback_models) - 1:
+                            self.current_model_index += 1
+                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
+                            # Reset wait time when switching models
+                            wait_time = self.base_wait_time
+                        else:
+                            # Wait with exponential backoff
+                            self.logger.info(f"Waiting {wait_time} seconds before retry")
+                            time.sleep(wait_time)
+                            # Increase wait time exponentially, but cap at max_wait_time
+                            wait_time = min(wait_time * 2, self.max_wait_time)
                     else:
-                        self.logger.error(f"Missing IS_MANUFACTURER field in response: {content}")
-                        return False
+                        # Other error - log and retry
+                        self.logger.error(f"API error: {response.status_code} - {response.text}")
+                        time.sleep(wait_time)
+                        wait_time = min(wait_time * 2, self.max_wait_time)
+                        
+                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
+                    # Network error - retry with backoff
+                    self.logger.error(f"Request error: {str(req_err)}")
+                    time.sleep(wait_time)
+                    wait_time = min(wait_time * 2, self.max_wait_time)
+                    
+                retry_count += 1
+                
+            # If we've exhausted all retries and still failed, return False
+            if not success:
+                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
+                return False
+                
+            # Periodically try to switch back to the primary model
+            current_time = time.time()
+            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
+                self.current_model_index = 0
+                self.last_model_switch_time = current_time
+                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
+
+            
+            # STEP 4: Process the successful response from Claude API
+            self.logger.info("STEP 4: Processing Claude API response for manufacturer detection")
+            response_data = response.json()
+            answer = response_data["content"][0]["text"].strip()
+            
+            # Log a preview of the response for debugging
+            answer_preview = answer[:100] + '...' if len(answer) > 100 else answer
+            self.logger.info(f"Claude API response preview: {answer_preview}")
+            
+            # STEP 5: Parse the response to extract the manufacturer detection result
+            self.logger.info("STEP 5: Parsing response to determine if it's a manufacturer page")
+            
+            # The response should follow the delimited format specified in the prompt template:
+            # # RESPONSE_START
+            # IS_MANUFACTURER: yes/no
+            # # RESPONSE_END
+            
+            # Extract content between RESPONSE_START and RESPONSE_END markers
+            response_pattern = r'# RESPONSE_START\s+(.*?)\s*# RESPONSE_END'
+            response_match = re.search(response_pattern, answer, re.DOTALL)
+            
+            if response_match:
+                # Successfully found the delimited response
+                content = response_match.group(1).strip()
+                self.logger.info(f"Found delimited response: {content}")
+                
+                # Extract the IS_MANUFACTURER field (yes/no)
+                is_mfr_match = re.search(r'IS_MANUFACTURER:\s*(yes|no)', content, re.IGNORECASE)
+                if is_mfr_match:
+                    # Successfully found the IS_MANUFACTURER field
+                    result_text = is_mfr_match.group(1).strip().lower()
+                    result = result_text == 'yes'
+                    
+                    # Log the final determination
+                    if result:
+                        self.logger.info(f"✅ {url} IS identified as a manufacturer page")
+                    else:
+                        self.logger.info(f"❌ {url} is NOT a manufacturer page")
+                    
+                    return result
                 else:
-                    self.logger.error(f"Response missing RESPONSE_START/END markers: {answer}")
+                    # Missing the IS_MANUFACTURER field
+                    self.logger.error(f"Error: Missing IS_MANUFACTURER field in response: {content}")
+                    self.logger.info(f"❌ {url} defaulting to NOT a manufacturer page due to parsing error")
                     return False
             else:
-                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+                # Missing the delimited response format
+                self.logger.error(f"Error: Response missing RESPONSE_START/END markers: {answer}")
+                self.logger.info(f"❌ {url} defaulting to NOT a manufacturer page due to formatting error")
                 return False
             
         except Exception as e:
@@ -238,49 +368,151 @@ class ClaudeAnalyzer:
         return ' '.join(content_parts), remaining_chunks
 
     def _extract_manufacturers(self, url: str, content: str) -> List[Dict]:
-        """Extract manufacturer information from structured content"""
-        try:
-            # Use the module-level imports for prompt templates
+        """
+        Extract manufacturer information from structured content with exponential backoff and model fallback.
+        
+        This method processes the page content to extract detailed manufacturer information using Claude AI.
+        It implements a resilient approach with exponential backoff and model fallback to handle API limits.
+        
+        Process flow:
+        1. Format prompt with page content using MANUFACTURER_EXTRACTION_PROMPT template
+        2. Make API request with exponential backoff and model fallback
+        3. Parse the response to extract structured manufacturer data
+        4. Validate and format the extracted data
+        
+        Args:
+            url: The URL of the page being analyzed
+            content: The structured content extracted from the page
             
-            # Format the prompt with the structured content
+        Returns:
+            List of dictionaries containing manufacturer information
+        """
+        try:
+            self.logger.info(f"MANUFACTURER EXTRACTION: Starting extraction from {url}")
+            
+            # STEP 1: Format the prompt with the structured content
+            self.logger.info("STEP 1: Formatting manufacturer extraction prompt")
+            content_preview = content[:100] + '...' if len(content) > 100 else content
+            self.logger.info(f"Content preview for extraction: {content_preview}")
             prompt = MANUFACTURER_EXTRACTION_PROMPT.format(content=content)
             
-            # Make direct API call to Claude
+            # Prepare headers for API call
             headers = {
                 "x-api-key": self.api_key,
                 "content-type": "application/json",
                 "anthropic-version": "2023-06-01"
             }
             
-            payload = {
-                "model": self.model,
-                "max_tokens": 4000,
-                "system": MANUFACTURER_SYSTEM_PROMPT,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
+            self.logger.info("STEP 2: Preparing to send manufacturer extraction request to Claude API")
             
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload
-            )
+            # Implement exponential backoff with model fallback
+            retry_count = 0
+            wait_time = self.base_wait_time
+            success = False
+            response = None
             
-            if response.status_code == 200:
-                response_data = response.json()
-                result = response_data["content"][0]["text"]
+            while not success and retry_count < self.max_retries:
+                # Select current model based on fallback status
+                current_model = self.fallback_models[self.current_model_index]
                 
-                # Parse the delimited response
-                parsed_data = self._parse_manufacturer_response(result)
-                if parsed_data and parsed_data.get('manufacturers'):
-                    self.logger.info(f"Found {len(parsed_data['manufacturers'])} manufacturers in {url}")
-                    return parsed_data['manufacturers']
-                else:
-                    self.logger.info(f"No manufacturers found in {url}")
-                    return []
+                # Prepare payload with current model
+                payload = {
+                    "model": current_model,
+                    "max_tokens": 4000,
+                    "system": MANUFACTURER_SYSTEM_PROMPT,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
+                }
+                
+                # Track API calls
+                self.api_calls += 1
+                
+                # Make API request
+                self.logger.info(f"Making Claude API call with model {current_model} for manufacturer extraction (attempt {retry_count+1}/{self.max_retries})")
+                try:
+                    response = requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=payload,
+                        timeout=30  # Add timeout to prevent hanging
+                    )
+                    
+                    # Check for rate limiting or other errors
+                    if response.status_code == 200:
+                        # Success!
+                        success = True
+                    elif response.status_code == 429 or response.status_code >= 500:
+                        # Rate limit or server error - implement backoff and model fallback
+                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
+                        self.logger.warning(error_msg)
+                        
+                        # Try fallback model if available
+                        if self.current_model_index < len(self.fallback_models) - 1:
+                            self.current_model_index += 1
+                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
+                            # Reset wait time when switching models
+                            wait_time = self.base_wait_time
+                        else:
+                            # Wait with exponential backoff
+                            self.logger.info(f"Waiting {wait_time} seconds before retry")
+                            time.sleep(wait_time)
+                            # Increase wait time exponentially, but cap at max_wait_time
+                            wait_time = min(wait_time * 2, self.max_wait_time)
+                    else:
+                        # Other error - log and retry
+                        self.logger.error(f"API error: {response.status_code} - {response.text}")
+                        time.sleep(wait_time)
+                        wait_time = min(wait_time * 2, self.max_wait_time)
+                        
+                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
+                    # Network error - retry with backoff
+                    self.logger.error(f"Request error: {str(req_err)}")
+                    time.sleep(wait_time)
+                    wait_time = min(wait_time * 2, self.max_wait_time)
+                    
+                retry_count += 1
+                
+            # If we've exhausted all retries and still failed, return empty list
+            if not success:
+                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
+                return []
+                
+            # STEP 3: Process successful response from Claude API
+            self.logger.info("STEP 3: Processing Claude API response for manufacturer extraction")
+            response_data = response.json()
+            result = response_data["content"][0]["text"]
+            
+            # Log a preview of the response for debugging
+            result_preview = result[:150] + '...' if len(result) > 150 else result
+            self.logger.info(f"Claude API response preview: {result_preview}")
+            
+            # Periodically try to switch back to the primary model
+            current_time = time.time()
+            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
+                self.current_model_index = 0
+                self.last_model_switch_time = current_time
+                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
+            
+            # STEP 4: Parse the delimited response to extract structured manufacturer data
+            self.logger.info("STEP 4: Parsing response to extract manufacturer information")
+            self.logger.info("Looking for properly formatted JSON data between RESPONSE_START and RESPONSE_END markers")
+            parsed_data = self._parse_manufacturer_response(result)
+            
+            # STEP 5: Validate and return the extracted manufacturer data
+            if parsed_data and parsed_data.get('manufacturers'):
+                manufacturer_count = len(parsed_data['manufacturers'])
+                self.logger.info(f"✅ Successfully extracted {manufacturer_count} manufacturers from {url}")
+                
+                # Log a summary of each manufacturer found
+                for i, manufacturer in enumerate(parsed_data['manufacturers']):
+                    name = manufacturer.get('name', 'Unknown')
+                    categories_count = len(manufacturer.get('categories', []))
+                    self.logger.info(f"  Manufacturer #{i+1}: {name} with {categories_count} categories")
+                    
+                return parsed_data['manufacturers']
             else:
-                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+                self.logger.info(f"❌ No manufacturers found in {url} or response format invalid")
                 return []
                 
         except Exception as e:
@@ -288,52 +520,122 @@ class ClaudeAnalyzer:
             return []
 
     def _extract_categories(self, url: str, manufacturer_name: str, content: str) -> List[str]:
-        """Extract category information for a specific manufacturer"""
+        """Extract category information for a specific manufacturer with exponential backoff and model fallback"""
         try:
-            # Use the module-level imports for prompt templates
-            
             # Format the prompt with the structured content
             prompt = CATEGORY_EXTRACTION_PROMPT.format(
                 content=content,
                 manufacturer_name=manufacturer_name
             )
             
-            # Make direct API call to Claude
+            # Prepare headers for API call
             headers = {
                 "x-api-key": self.api_key,
                 "content-type": "application/json",
                 "anthropic-version": "2023-06-01"
             }
             
-            payload = {
-                "model": self.model,
-                "max_tokens": 4000,
-                "system": CATEGORY_SYSTEM_PROMPT,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
+            # Implement exponential backoff with model fallback
+            retry_count = 0
+            wait_time = self.base_wait_time
+            success = False
+            response = None
             
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code == 200:
-                response_data = response.json()
-                result = response_data["content"][0]["text"]
+            while not success and retry_count < self.max_retries:
+                # Select current model based on fallback status
+                current_model = self.fallback_models[self.current_model_index]
                 
-                # Parse the delimited response
-                categories = self._parse_category_response(result)
-                if categories:
-                    self.logger.info(f"Found {len(categories)} categories for {manufacturer_name} in {url}")
-                    return categories
+                # Prepare payload with current model
+                payload = {
+                    "model": current_model,
+                    "max_tokens": 4000,
+                    "system": CATEGORY_SYSTEM_PROMPT,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
+                }
+                
+                # Track API calls
+                self.api_calls += 1
+                
+                # Make API request
+                self.logger.info(f"Making Claude API call with model {current_model} for category extraction (attempt {retry_count+1}/{self.max_retries})")
+                try:
+                    response = requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=payload,
+                        timeout=30  # Add timeout to prevent hanging
+                    )
+                    
+                    # Check for rate limiting or other errors
+                    if response.status_code == 200:
+                        # Success!
+                        success = True
+                    elif response.status_code == 429 or response.status_code >= 500:
+                        # Rate limit or server error - implement backoff and model fallback
+                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
+                        self.logger.warning(error_msg)
+                        
+                        # Try fallback model if available
+                        if self.current_model_index < len(self.fallback_models) - 1:
+                            self.current_model_index += 1
+                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
+                            # Reset wait time when switching models
+                            wait_time = self.base_wait_time
+                        else:
+                            # Wait with exponential backoff
+                            self.logger.info(f"Waiting {wait_time} seconds before retry")
+                            time.sleep(wait_time)
+                            # Increase wait time exponentially, but cap at max_wait_time
+                            wait_time = min(wait_time * 2, self.max_wait_time)
+                    else:
+                        # Other error - log and retry
+                        self.logger.error(f"API error: {response.status_code} - {response.text}")
+                        time.sleep(wait_time)
+                        wait_time = min(wait_time * 2, self.max_wait_time)
+                        
+                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
+                    # Network error - retry with backoff
+                    self.logger.error(f"Request error: {str(req_err)}")
+                    time.sleep(wait_time)
+                    wait_time = min(wait_time * 2, self.max_wait_time)
+                    
+                retry_count += 1
+                
+            # If we've exhausted all retries and still failed, return empty list
+            if not success:
+                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
+                return []
+                
+            # Process successful response
+            response_data = response.json()
+            result = response_data["content"][0]["text"]
+            
+            # Periodically try to switch back to the primary model
+            current_time = time.time()
+            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
+                self.current_model_index = 0
+                self.last_model_switch_time = current_time
+                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
+            
+            # Parse the delimited response
+            categories = self._parse_category_response(result)
+            
+            if categories:
+                self.logger.info(f"Found {len(categories)} raw categories for {manufacturer_name} in {url}")
+                
+                # Validate the extracted categories to ensure they are legitimate product categories
+                validated_categories = self.validate_categories(categories, manufacturer_name)
+                
+                if validated_categories:
+                    self.logger.info(f"Validated {len(validated_categories)} categories for {manufacturer_name} in {url}")
+                    return validated_categories
                 else:
-                    self.logger.info(f"No categories found for {manufacturer_name} in {url}")
+                    self.logger.info(f"No valid categories found after validation for {manufacturer_name} in {url}")
                     return []
             else:
-                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+                self.logger.info(f"No categories found for {manufacturer_name} in {url}")
                 return []
                 
         except Exception as e:
@@ -566,12 +868,10 @@ class ClaudeAnalyzer:
             return {"manufacturers": []}
 
     def _extract_manufacturers_initial(self, url: str, title: str, content: str) -> Dict:
-        """Extract manufacturer and category information using Claude Sonnet"""
+        """Extract manufacturer and category information using Claude with exponential backoff and model fallback"""
         try:
             # Prepare a truncated version of the content to avoid token limits
             truncated_content = content[:4000] + "..." if len(content) > 4000 else content
-            
-            # Use the module-level imports for prompt templates
             
             # Format the prompt with the page details
             prompt = MANUFACTURER_EXTRACTION_PROMPT.format(
@@ -580,53 +880,354 @@ class ClaudeAnalyzer:
                 truncated_content=truncated_content
             )
             
-            # Use requests to make a direct API call
+            # Prepare headers for API call
             headers = {
                 "x-api-key": self.api_key,
                 "content-type": "application/json",
                 "anthropic-version": "2023-06-01"
             }
             
-            payload = {
-                "model": self.model,  # Using Haiku model for all operations
-                "max_tokens": 4000,
-                "system": MANUFACTURER_SYSTEM_PROMPT,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
+            # Implement exponential backoff with model fallback
+            retry_count = 0
+            wait_time = self.base_wait_time
+            success = False
+            response = None
+            result = None
             
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload
-            )
-            
-            # Handle the response
-            if response.status_code == 200:
-                response_data = response.json()
-                result = response_data["content"][0]["text"]
-                self.logger.info(f"Claude Haiku manufacturer extraction for {url}: Response received")
+            while not success and retry_count < self.max_retries:
+                # Select current model based on fallback status
+                current_model = self.fallback_models[self.current_model_index]
                 
-                # Parse the response to extract manufacturers and categories
-                parsed_data = self._parse_delimited_response(result)
-                if parsed_data:
-                    self.logger.info(f"Extracted {len(parsed_data.get('manufacturers', []))} manufacturers from {url}")
-                else:
-                    self.logger.warning(f"No manufacturers extracted from {url}")
+                # Prepare payload with current model
+                payload = {
+                    "model": current_model,
+                    "max_tokens": 4000,
+                    "system": MANUFACTURER_SYSTEM_PROMPT,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
+                }
+                
+                # Track API calls
+                self.api_calls += 1
+                
+                # Make API request
+                self.logger.info(f"Making Claude API call with model {current_model} for initial manufacturer extraction (attempt {retry_count+1}/{self.max_retries})")
+                try:
+                    response = requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=payload,
+                        timeout=30  # Add timeout to prevent hanging
+                    )
                     
-                return parsed_data
-            else:
-                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+                    # Check for rate limiting or other errors
+                    if response.status_code == 200:
+                        # Success!
+                        success = True
+                        response_data = response.json()
+                        result = response_data["content"][0]["text"]
+                    elif response.status_code == 429 or response.status_code >= 500:
+                        # Rate limit or server error - implement backoff and model fallback
+                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
+                        self.logger.warning(error_msg)
+                        
+                        # Try fallback model if available
+                        if self.current_model_index < len(self.fallback_models) - 1:
+                            self.current_model_index += 1
+                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
+                            # Reset wait time when switching models
+                            wait_time = self.base_wait_time
+                        else:
+                            # Wait with exponential backoff
+                            self.logger.info(f"Waiting {wait_time} seconds before retry")
+                            time.sleep(wait_time)
+                            # Increase wait time exponentially, but cap at max_wait_time
+                            wait_time = min(wait_time * 2, self.max_wait_time)
+                    else:
+                        # Other error - log and retry
+                        self.logger.error(f"API error: {response.status_code} - {response.text}")
+                        time.sleep(wait_time)
+                        wait_time = min(wait_time * 2, self.max_wait_time)
+                        
+                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
+                    # Network error - retry with backoff
+                    self.logger.error(f"Request error: {str(req_err)}")
+                    time.sleep(wait_time)
+                    wait_time = min(wait_time * 2, self.max_wait_time)
+                    
+                retry_count += 1
+                
+            # If we've exhausted all retries and still failed, return None
+            if not success or not result:
+                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
                 return None
+                
+            # Periodically try to switch back to the primary model
+            current_time = time.time()
+            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
+                self.current_model_index = 0
+                self.last_model_switch_time = current_time
+                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
+            
+            self.logger.info(f"Claude manufacturer extraction for {url}: Response received")
+            
+            # Parse the response to extract manufacturers and categories
+            parsed_data = self._parse_delimited_response(result)
+            if parsed_data:
+                self.logger.info(f"Extracted {len(parsed_data.get('manufacturers', []))} manufacturers from {url}")
+            else:
+                self.logger.warning(f"No manufacturers extracted from {url}")
+                
+            return parsed_data
             
         except Exception as e:
             self.logger.error(f"Error analyzing with Claude Haiku extraction: {str(e)}")
             return None
     
+    def validate_categories(self, categories: List[str], manufacturer_name: str) -> List[str]:
+        """
+        Validate and normalize a list of extracted categories to ensure they are legitimate product categories.
+        
+        This method performs the following validations:
+        1. Removes UI elements and navigation controls
+        2. Normalizes category names (standardizes format, removes duplicates)
+        3. Ensures categories are actual product lines, not marketing terms
+        4. Removes very short or generic terms
+        
+        Args:
+            categories: List of extracted category names
+            manufacturer_name: Name of the manufacturer for context
+            
+        Returns:
+            List of validated and normalized category names
+        """
+        # Early return if no categories
+        if not categories:
+            return []
+            
+        self.logger.info(f"CATEGORY VALIDATION: Starting validation of {len(categories)} categories for {manufacturer_name}")
+        
+        # Common UI elements and navigation controls to filter out - use exact matches only
+        ui_elements = [
+            'home', 'menu', 'search', 'login', 'register', 'contact', 'about', 'support',
+            'next', 'previous', 'view all', 'show more', 'back', 'forward', 'privacy', 'terms',
+            'cookie', 'sitemap', 'faq', 'help', 'cart', 'checkout', 'account', 'profile',
+            'facebook', 'twitter', 'instagram', 'youtube', 'linkedin'
+        ]
+        
+        # Filter out obvious UI elements and normalize categories
+        filtered_categories = []
+        for category in categories:
+            # Skip very short categories (likely not valid)
+            if len(category) < 3:
+                self.logger.info(f"Filtering out short category: '{category}'")
+                continue
+                
+            # Skip categories that EXACTLY match common UI elements (case-insensitive)
+            # But don't filter out legitimate product categories that might contain these words
+            is_ui_element = False
+            if category.lower() in [ui.lower() for ui in ui_elements]:
+                is_ui_element = True
+                self.logger.info(f"Filtering out UI element: '{category}'")
+            
+            # Don't filter out product categories like 'Home Automation Systems'
+            # which contain UI words but are legitimate categories
+                    
+            if not is_ui_element:
+                # Add the category if it's not already in the list (case-insensitive check)
+                if not any(cat.lower() == category.lower() for cat in filtered_categories):
+                    filtered_categories.append(category)
+        
+        # If we have more than 5 categories, use Claude to validate them
+        # This helps with more complex validation that simple rules might miss
+        if len(filtered_categories) > 5 and hasattr(self, 'api_key') and self.api_key:
+            try:
+                # Check if CATEGORY_VALIDATION_PROMPT is defined
+                if 'CATEGORY_VALIDATION_PROMPT' not in globals():
+                    self.logger.warning("CATEGORY_VALIDATION_PROMPT not defined, skipping Claude validation")
+                    return filtered_categories
+                    
+                self.logger.info(f"Using Claude to validate {len(filtered_categories)} categories")
+                
+                # Format the prompt with the categories and manufacturer name
+                categories_list = [f"- {cat}" for cat in filtered_categories]
+                categories_text = '\n'.join(categories_list)
+                
+                # Import the prompt template if needed
+                from scraper.prompt_templates import CATEGORY_VALIDATION_PROMPT
+                
+                prompt = CATEGORY_VALIDATION_PROMPT.format(
+                    manufacturer=manufacturer_name,
+                    categories=categories_text
+                )
+                
+                # Prepare headers for API call
+                headers = {
+                    "x-api-key": self.api_key,
+                    "content-type": "application/json",
+                    "anthropic-version": "2023-06-01"
+                }
+                
+                # Use the Sonnet model for better validation quality
+                payload = {
+                    "model": self.sonnet_model,  # Use Sonnet for better validation
+                    "max_tokens": 2000,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ]
+                }
+                
+                # Make API request
+                self.logger.info(f"Making Claude API call with model {self.sonnet_model} for category validation")
+                response = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=payload,
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    # Process the response
+                    response_data = response.json()
+                    result = response_data["content"][0]["text"]
+                    
+                    # Parse the validated categories
+                    validated_categories = self._parse_category_response(result)
+                    
+                    if validated_categories:
+                        self.logger.info(f"Successfully validated categories: {len(validated_categories)} valid out of {len(filtered_categories)} original")
+                        return validated_categories
+                    else:
+                        self.logger.warning(f"No valid categories found after validation")
+                        return filtered_categories  # Fall back to filtered categories
+                else:
+                    self.logger.error(f"API error during category validation: {response.status_code} - {response.text}")
+                    return filtered_categories  # Fall back to filtered categories
+                    
+            except Exception as e:
+                self.logger.error(f"Error during category validation: {str(e)}")
+                return filtered_categories  # Fall back to filtered categories
+        
+        self.logger.info(f"Completed category validation: {len(filtered_categories)} valid categories")
+        return filtered_categories
+        
+    def translate_categories_batch(self, categories_text: str, manufacturer_name: str, target_lang: str) -> List[str]:
+        """
+        Translate multiple categories at once to reduce API calls.
+        
+        Args:
+            categories_text: Newline-separated categories to translate
+            manufacturer_name: Manufacturer name to preserve
+            target_lang: Target language code
+            
+        Returns:
+            List of translated categories
+        """
+        try:
+            # Map language codes to full names
+            language_names = {
+                'es': 'Spanish',
+                'pt': 'Portuguese',
+                'fr': 'French',
+                'it': 'Italian'
+            }
+            target_language = language_names.get(target_lang, 'Spanish')
+            
+            # Format the prompt for batch translation
+            prompt = TRANSLATION_BATCH_PROMPT.format(
+                categories=categories_text,
+                target_language=target_language
+            )
+            
+            # Prepare headers
+            headers = {
+                "x-api-key": self.api_key,
+                "content-type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
+            # Implement exponential backoff with model fallback
+            retry_count = 0
+            wait_time = self.base_wait_time
+            success = False
+            response = None
+            
+            while not success and retry_count < self.max_retries:
+                current_model = self.fallback_models[self.current_model_index]
+                
+                # Prepare payload - use smaller max_tokens for efficiency
+                payload = {
+                    "model": current_model,
+                    "max_tokens": 50,  # Reduced since we only need translations
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a specialized translator for product categories."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                }
+                
+                self.api_calls += 1
+                self.logger.info(f"Making batch translation API call with model {current_model} (attempt {retry_count+1}/{self.max_retries})")
+                
+                try:
+                    response = requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=payload,
+                        timeout=30
+                    )
+                    
+                    if response.status_code == 200:
+                        success = True
+                        response_data = response.json()
+                        result = response_data["content"][0]["text"]
+                        
+                        # Parse translations between delimiters
+                        match = re.search(r'# RESPONSE_START\s*(.+?)\s*# RESPONSE_END', result, re.DOTALL)
+                        if match:
+                            translations = [t.strip() for t in match.group(1).strip().split('\n') if t.strip()]
+                            return translations
+                        else:
+                            raise ValueError("No valid translations found in response")
+                            
+                    elif response.status_code == 429:
+                        if self.current_model_index < len(self.fallback_models) - 1:
+                            self.current_model_index += 1
+                            self.logger.warning(f"Rate limited - falling back to {self.fallback_models[self.current_model_index]}")
+                        else:
+                            self.logger.warning(f"Rate limited on all models - waiting {wait_time}s")
+                            time.sleep(wait_time)
+                            wait_time = min(wait_time * 2, self.max_wait_time)
+                        retry_count += 1
+                    else:
+                        self.logger.error(f"API error: {response.status_code} - {response.text}")
+                        time.sleep(wait_time)
+                        wait_time = min(wait_time * 2, self.max_wait_time)
+                        retry_count += 1
+                        
+                except Exception as e:
+                    self.logger.error(f"Request error: {str(e)}")
+                    time.sleep(wait_time)
+                    wait_time = min(wait_time * 2, self.max_wait_time)
+                    retry_count += 1
+            
+            if not success:
+                raise ValueError(f"Failed to translate categories after {self.max_retries} attempts")
+                
+        except Exception as e:
+            self.logger.error(f"Batch translation error: {str(e)}")
+            raise
+            
     def translate_category(self, category: str, manufacturer_name: str, target_lang: str) -> str:
         """
-        Translate a category name to the target language.
+        Legacy method for single category translation.
+        Now uses batch translation under the hood for efficiency.
         
         Args:
             category: Original category name
@@ -637,79 +1238,32 @@ class ClaudeAnalyzer:
             Translated category name
         """
         try:
-            # Map language codes to full names
-            language_names = {
-                'es': 'Spanish',
-                'pt': 'Portuguese',
-                'fr': 'French',
-                'it': 'Italian'
-            }
-            
-            # Get full language name
-            target_language = language_names.get(target_lang, 'Spanish')  # Default to Spanish if unknown
-            
-            # Use the module-level imports for prompt templates
-            
-            # Format the prompt with the category and target language
-            prompt = TRANSLATION_PROMPT.format(
-                category=category,
-                target_language=target_language
-            )
-            
-            # Use requests to make a direct API call
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            payload = {
-                "model": self.model,
-                "max_tokens": 100,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ]
-            }
-            
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload
-            )
-            
-            # Handle the response
-            if response.status_code == 200:
-                response_data = response.json()
-                result = response_data["content"][0]["text"].strip()
-                
-                # Parse the response for the translation
-                response_pattern = r'# RESPONSE_START\s+TRANSLATED:\s*(.*?)\s*# RESPONSE_END'
-                response_match = re.search(response_pattern, result, re.DOTALL)
-                
-                if response_match:
-                    translated = response_match.group(1).strip()
-                    
-                    # Validate translation contains manufacturer name
-                    if manufacturer_name.lower() not in translated.lower():
-                        self.logger.warning(f"Translation missing manufacturer name: {translated}")
-                        return category
-                    
-                    self.logger.info(f"Translated to {target_lang}: {translated}")
-                    return translated
-                else:
-                    self.logger.error(f"Invalid translation response format: {result}")
-                    return category
-            else:
-                self.logger.error(f"Error from Anthropic API: {response.status_code} - {response.text}")
+            # Skip translation for very short categories or those containing numbers
+            if len(category) < 3 or any(char.isdigit() for char in category):
+                self.logger.info(f"Skipping translation for short or numeric category: {category}")
                 return category
                 
+            # Use batch translation with a single category
+            translations = self.translate_categories_batch(category, manufacturer_name, target_lang)
+            
+            if translations and len(translations) > 0:
+                translated = translations[0]
+                
+                # Validate translation
+                if translated and len(translated) >= 3:
+                    # Check if manufacturer name is preserved
+                    if manufacturer_name.lower() in translated.lower():
+                        self.logger.info(f"Translated '{category}' to '{translated}' ({target_lang})")
+                        return translated
+                    else:
+                        # Add manufacturer name if missing
+                        translated = f"{manufacturer_name} {translated}"
+                        self.logger.info(f"Added manufacturer to translation: '{translated}' ({target_lang})")
+                        return translated
+                        
+            self.logger.warning(f"Failed to get valid translation for '{category}'")
+            return category
+            
         except Exception as e:
             self.logger.error(f"Error translating category: {str(e)}")
             return category

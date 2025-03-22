@@ -346,7 +346,7 @@ class CompetitorScraper:
         self.session_uuid = str(uuid.uuid4())
         
         # Initialize StatisticsManager
-        self.statistics_manager = StatisticsManager('scraper', self.db_manager)
+        self.statistics_manager = StatisticsManager('scraper', self.db_manager, create_session=True)
         self.session_id = self.statistics_manager.session_id
         
         # Initialize control flags
@@ -451,7 +451,7 @@ class CompetitorScraper:
         
         # Get model names from config
         self.anthropic_model = anthropic_config.get('model', 'claude-3-haiku-20240307')
-        self.anthropic_sonnet_model = anthropic_config.get('sonnet_model', 'claude-3-sonnet-20240229')
+        self.anthropic_sonnet_model = anthropic_config.get('sonnet_model', 'claude-3-5-sonnet-20240620')
         
         # Initialize Claude analyzer with direct API access
         from scraper.claude_analyzer import ClaudeAnalyzer
@@ -491,6 +491,7 @@ class CompetitorScraper:
     def _load_visited_urls(self) -> Set[str]:
         """
         Load previously visited URLs from the database.
+        Also resets URLs that were marked as visited but not fully processed.
         
         Returns:
             Set of visited URL strings
@@ -498,10 +499,31 @@ class CompetitorScraper:
         visited_urls = set()
         try:
             with self.db_manager.session() as session:
-                visited_records = session.query(CrawlStatus).filter_by(visited=True).all()
+                # Get all visited URLs that were fully processed
+                visited_records = session.query(CrawlStatus).filter(
+                    CrawlStatus.visited == True,
+                    CrawlStatus.is_manufacturer.isnot(None)  # Must have been analyzed
+                ).all()
+                
                 for record in visited_records:
                     visited_urls.add(record.url)
-            self.logger.info(f"Loaded {len(visited_urls)} previously visited URLs from database")
+                
+                # Reset URLs that were marked visited but not fully processed
+                incomplete_records = session.query(CrawlStatus).filter(
+                    CrawlStatus.visited == True,
+                    CrawlStatus.is_manufacturer.is_(None)  # Not analyzed yet
+                ).all()
+                
+                for record in incomplete_records:
+                    record.visited = False
+                    self.logger.debug(f"Reset incomplete URL: {record.url}")
+                
+                if incomplete_records:
+                    session.commit()
+                    self.logger.info(f"Reset {len(incomplete_records)} incompletely processed URLs")
+                
+                self.logger.info(f"Loaded {len(visited_urls)} fully processed URLs from database")
+                
         except Exception as e:
             self.logger.error(f"Error loading visited URLs: {str(e)}")
         
@@ -740,50 +762,135 @@ class CompetitorScraper:
                 
             return []
     
-    def _translate_category(self, category: str, manufacturer_name: str) -> Dict[str, str]:
+    def _translate_categories_batch(self, categories: List[str], manufacturer_name: str) -> Dict[str, Dict[str, str]]:
         """
-        Translate a category name to all target languages, preserving manufacturer name.
+        Translate a batch of categories to all target languages at once.
         
         Args:
-            category: Original category name
+            categories: List of category names to translate
             manufacturer_name: Manufacturer name to preserve
             
         Returns:
-            Dictionary mapping language codes to translated category names
+            Dictionary mapping category to its translations dict
         """
         translations = {}
         source_lang = self.config['languages']['source']
         target_langs = self.config['languages']['targets']
         
-        # Add source language version
-        translations[source_lang] = category
+        # Initialize translations dict
+        for category in categories:
+            translations[category] = {source_lang: category}  # Add source version
+            categories_to_translate.append(category)
         
-        # Skip translation if category appears to be already in Spanish
-        spanish_indicators = ['de', 'para', 'con', 'del', 'y', 'las', 'los']
-        if any(word in category.lower().split() for word in spanish_indicators):
-            self.logger.debug(f"Category '{category}' appears to be in Spanish, skipping translation")
-            for lang in target_langs:
-                translations[lang] = category
+        if not categories_to_translate:
             return translations
+            
+        # Batch translate categories
+        max_retries = 3
+        retry_count = 0
+        success = False
         
-        # Translate to each target language
-        for target_lang in target_langs:
-            if target_lang == source_lang:
-                continue
-                
+        while not success and retry_count < max_retries:
             try:
-                translated = self.claude_analyzer.translate_category(category, manufacturer_name, target_lang)
-                if translated and translated != category:
-                    self.logger.info(f"Translated '{category}' to '{translated}' ({target_lang})")
-                    translations[target_lang] = translated
-                    self.statistics_manager.increment_stat('translations')
-                else:
-                    translations[target_lang] = category
+                # Format categories with manufacturer name
+                categories_text = '\n'.join(categories_to_translate)
+                self.logger.info(f"Batch translating categories:\n{categories_text}")
+                
+                # Translate to each target language
+                for target_lang in target_langs:
+                    if target_lang == source_lang:
+                        continue
+                        
+                    self.logger.info(f"Translating batch to {target_lang}")
+                    # Get translations in batch
+                    translated_batch = self.claude_analyzer.translate_categories_batch(
+                        categories_text, manufacturer_name, target_lang)
+                    
+                    # Process translations
+                    if translated_batch:
+                        for orig, trans in zip(categories_to_translate, translated_batch):
+                            translations[orig][target_lang] = trans
+                            self.logger.info(f"Translated '{orig}' -> '{trans}' ({target_lang})")
+                            self.statistics_manager.increment_stat('translations')
+                                
+                        success = True
+                    else:
+                        self.logger.error("No translations received")
+                        raise ValueError("No translations received")
+                        
             except Exception as e:
-                self.logger.error(f"Translation error for {target_lang}: {str(e)}")
-                translations[target_lang] = category
-        
+                self.logger.error(f"Batch translation error: {str(e)} (attempt {retry_count + 1}/{max_retries})")
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(2 ** retry_count)  # Exponential backoff
+                else:
+                    raise  # Re-raise to stop processing
+                    
         return translations
+    
+    def _translate_category(self, category: str, manufacturer_name: str) -> Dict[str, str]:
+        """
+        Translate a single category to all target languages.
+        Uses batch translation under the hood for efficiency.
+        """
+        try:
+            # Use batch translation with a single category
+            self.logger.info(f"Translating category: '{category}'")
+            batch_results = self._translate_categories_batch([category], manufacturer_name)
+            
+            if category in batch_results:
+                translations = batch_results[category]
+                self.logger.info(f"Got translations for '{category}': {translations}")
+                
+                # Store base category in main categories table
+                source_lang = self.config['languages']['source']
+                base_category = category  # Use original name as base
+                
+                # Find or create base category
+                category = session.query(Category).filter(
+                    func.lower(Category.name) == func.lower(base_category)
+                ).first()
+                
+                if not category:
+                    category = Category(name=base_category)
+                    session.add(category)
+                    session.flush()
+                    categories_added += 1
+                    self.statistics_manager.increment_stat('categories_extracted')
+                    self.logger.info(f"Created new category: {base_category}")
+                
+                # Associate with manufacturer
+                if manufacturer not in category.manufacturers:
+                    category.manufacturers.append(manufacturer)
+                    categories_processed += 1
+                
+                # Store translations
+                for lang, translated_name in translations.items():
+                    if lang == source_lang:
+                        continue
+                        
+                    category_table = _created_category_tables.get(lang)
+                    if not category_table:
+                        continue
+                    
+                    # Create translation entry
+                    translation_entry = category_table(
+                        category_id=category.id,
+                        category_name=translated_name
+                    )
+                    session.add(translation_entry)
+                    translations_added += 1
+                    self.logger.info(f"Added translation for '{base_category}' in {lang}: '{translated_name}'")
+                
+                session.commit()
+                
+            else:
+                self.logger.error(f"No translations found for '{category}'")
+                return {}
+            
+        except Exception as e:
+            self.logger.error(f"Translation failed for category '{category}': {str(e)}")
+            return {}
     
     def _process_extracted_data(self, response_data: List[Dict[str, Any]], source_url: str):
         """
@@ -845,89 +952,61 @@ class CompetitorScraper:
                     for i, category_name in enumerate(categories, 1):
                         self.logger.info(f"  Category {i}: {category_name}")
                         
-                        # Validate category contains manufacturer name
-                        if manufacturer_name.lower() not in category_name.lower():
-                            self.logger.warning(f"Skipping category '{category_name}' - missing manufacturer name")
+                        # Basic category validation
+                        if len(category_name) < 3:
+                            self.logger.warning(f"Skipping category '{category_name}' - too short")
                             continue
+                            
+                        # Add manufacturer name if not present
+                        if manufacturer_name.lower() not in category_name.lower():
+                            category_name = f"{manufacturer_name} {category_name}"
+                            self.logger.info(f"Added manufacturer name to category: '{category_name}'")
                         
                         try:
                             # Get translations for all target languages
                             translations = self._translate_category(category_name, manufacturer_name)
+                            self.logger.info(f"Got translations for '{category_name}': {translations}")
                             
                             # Store base category in main categories table
                             source_lang = self.config['languages']['source']
-                            base_category = translations[source_lang]
+                            base_category = category_name  # Use original name as base
                             
                             # Find or create base category
-                            try:
-                                # Use case-insensitive search for existing category
-                                category = session.query(Category).filter(
-                                    func.lower(Category.name) == func.lower(base_category)
-                                ).first()
-                                
-                                if not category:
-                                    # Create new category
-                                    category = Category(name=base_category)
-                                    session.add(category)
-                                    try:
-                                        session.flush()  # Get the ID
-                                        self.logger.debug(f"Created new category: {base_category}")
-                                        categories_added += 1
-                                        self.statistics_manager.increment_stat('categories_extracted')
-                                    except SQLAlchemyError as flush_err:
-                                        session.rollback()
-                                        self.logger.warning(f"Error creating category '{base_category}': {str(flush_err)}")
-                                        raise
-                                
-                                # Handle many-to-many relationship
-                                if manufacturer not in category.manufacturers:
-                                    category.manufacturers.append(manufacturer)
-                                    categories_processed += 1
-                                    self.logger.debug(f"Associated category '{base_category}' with manufacturer '{manufacturer.name}'")
-                                    
-                                # Commit the changes
-                                try:
-                                    session.flush()
-                                except SQLAlchemyError as flush_err:
-                                    session.rollback()
-                                    self.logger.warning(f"Error associating category '{base_category}' with manufacturer: {str(flush_err)}")
-                                    raise
-                                    
-                            except SQLAlchemyError as db_err:
-                                self.logger.error(f"Database error processing category '{base_category}': {str(db_err)}")
-                                raise
+                            category = session.query(Category).filter(
+                                func.lower(Category.name) == func.lower(base_category)
+                            ).first()
                             
-                            # Ensure base category operations are committed
-                            session.flush()
+                            if not category:
+                                category = Category(name=base_category)
+                                session.add(category)
+                                session.flush()
+                                categories_added += 1
+                                self.statistics_manager.increment_stat('categories_extracted')
+                                self.logger.info(f"Created new category: {base_category}")
                             
-                            # Store translations in language-specific tables
+                            # Associate with manufacturer
+                            if manufacturer not in category.manufacturers:
+                                category.manufacturers.append(manufacturer)
+                                categories_processed += 1
+                            
+                            # Store translations
                             for lang, translated_name in translations.items():
                                 if lang == source_lang:
                                     continue
                                     
-                                # Get the appropriate category table class for this language
                                 category_table = _created_category_tables.get(lang)
                                 if not category_table:
-                                    self.logger.warning(f"No table found for language {lang}, skipping translation")
                                     continue
                                 
-                                # Check if translation already exists
-                                existing_translation = session.query(category_table).filter(
-                                    category_table.category_id == category.id,
-                                    func.lower(category_table.category_name) == func.lower(translated_name)
-                                ).first()
-                                
-                                if not existing_translation:
-                                    # Create new translation entry
-                                    translation_entry = category_table(
-                                        category_id=category.id,
-                                        category_name=translated_name
-                                    )
-                                    session.add(translation_entry)
-                                    translations_added += 1
-                                    self.logger.info(f"Added translation for '{base_category}' in {lang}: '{translated_name}'")
-                                    
-                            # Commit after processing each category's translations
+                                # Create translation entry
+                                translation_entry = category_table(
+                                    category_id=category.id,
+                                    category_name=translated_name
+                                )
+                                session.add(translation_entry)
+                                translations_added += 1
+                                self.logger.info(f"Added translation for '{base_category}' in {lang}: '{translated_name}'")
+                            
                             session.commit()
                             
                         except Exception as e:
@@ -1436,71 +1515,147 @@ class CompetitorScraper:
         return dict(structure)
 
     def _analyze_page(self, url: str, html_content: str) -> Tuple[bool, List[Dict], List[Tuple]]:
-        """Analyze a page for manufacturer information and extract links."""
+        """
+        Analyze a page for manufacturer information and extract links.
+        
+        The analysis process follows these steps:
+        1. Parse the HTML content and extract text and structure
+        2. Check if the page is a manufacturer page using Claude AI
+        3. If it is a manufacturer page, extract manufacturer data and categories
+        4. Extract links for further crawling
+        
+        Returns:
+            Tuple containing:
+            - Boolean indicating if it's a manufacturer page
+            - List of extracted manufacturer data dictionaries
+            - List of new URLs to crawl with metadata
+        """
         try:
-            # Parse HTML
+            # STEP 1: Parse HTML and extract content
+            self.logger.info(f"STEP 1: Parsing HTML content for {url}")
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Extract text content
+            # Extract page title
             title = soup.title.string if soup.title else ""
+            self.logger.info(f"Page title: {title}")
+            
+            # Extract text content (this is what gets sent to Claude)
             text_content = self._extract_text_content(soup)
+            text_preview = text_content[:100] + '...' if len(text_content) > 100 else text_content
+            self.logger.info(f"Extracted text content preview: {text_preview}")
             
-            # Extract HTML structure information
+            # Extract HTML structure information (navigation elements, lists, etc.)
             html_structure = self._extract_html_structure(soup)
+            self.logger.info(f"Page structure analysis: nav={html_structure.get('nav', 0)}, "
+                            f"lists={html_structure.get('list', 0)}, "
+                            f"menus={html_structure.get('menu', 0)}")
             
-            # Log page analysis start with structure info
-            self.logger.info(f"Analyzing page structure for {url}:")
-            self.logger.info(f"Found structure: nav={html_structure.get('nav', 0)}, "
-                           f"lists={html_structure.get('list', 0)}, "
-                           f"menus={html_structure.get('menu', 0)}")
+            # STEP 2: Check if it's a manufacturer page using Claude AI
+            self.logger.info(f"STEP 2: Checking if {url} is a manufacturer page")
+            self.logger.info(f"Sending page title and text content to Claude AI for manufacturer detection")
+            is_manufacturer = False
+            try:
+                # This calls Claude API with the MANUFACTURER_DETECTION_PROMPT template
+                # The prompt asks Claude to determine if the page is about manufacturers
+                is_manufacturer = self.claude_analyzer.is_manufacturer_page(url, title, text_content)
+                self.logger.info(f"Claude AI determined: Is manufacturer page? {is_manufacturer}")
+            except Exception as api_err:
+                self.logger.error(f"Error in manufacturer detection API call: {str(api_err)}")
+                self.logger.info("Continuing with link extraction despite API error")
             
-            # Check if it's a manufacturer page
-            is_manufacturer = self.claude_analyzer.is_manufacturer_page(url, title, text_content)
-            
+            # STEP 3: If it's a manufacturer page, extract detailed data
             extracted_data = []
             if is_manufacturer:
-                self.logger.info(f"Found manufacturer page {url}, extracting data...")
-                # Extract manufacturer data with enhanced processing
-                result = self.claude_analyzer.extract_manufacturers(
-                    url=url,
-                    title=title,
-                    content=text_content,
-                    html_content=html_content
-                )
-                if result and 'manufacturers' in result:
-                    extracted_data = result['manufacturers']
-                    for mfr in extracted_data:
-                        self.logger.info(f"Extracted manufacturer: {mfr.get('manufacturer', 'unknown')}")
-                        if 'categories' in mfr:
-                            self.logger.info(f"Found {len(mfr['categories'])} categories")
-                            category_sample = ', '.join(mfr['categories'][:5])
-                            self.logger.debug(f"Categories sample: {category_sample}...")
+                self.logger.info(f"STEP 3: Extracting manufacturer data from {url}")
+                try:
+                    # This calls Claude API with the MANUFACTURER_EXTRACTION_PROMPT template
+                    # The prompt asks Claude to extract manufacturer names and details
+                    self.logger.info("Sending page content to Claude AI for manufacturer data extraction")
+                    result = self.claude_analyzer.extract_manufacturers(
+                        url=url,
+                        title=title,
+                        content=text_content,
+                        html_content=html_content
+                    )
+                    
+                    # Process the extracted manufacturer data
+                    if result and 'manufacturers' in result:
+                        extracted_data = result['manufacturers']
+                        self.logger.info(f"Successfully extracted {len(extracted_data)} manufacturers")
+                        
+                        # Log details about each extracted manufacturer
+                        for i, mfr in enumerate(extracted_data):
+                            mfr_name = mfr.get('manufacturer', 'unknown')
+                            self.logger.info(f"Manufacturer #{i+1}: {mfr_name}")
+                            
+                            # Log URLs associated with this manufacturer
+                            if 'urls' in mfr and mfr['urls']:
+                                self.logger.info(f"  - Associated URLs: {', '.join(mfr['urls'][:3])}{' ...' if len(mfr['urls']) > 3 else ''}")
+                            
+                            # Log categories for this manufacturer
+                            if 'categories' in mfr and mfr['categories']:
+                                cat_count = len(mfr['categories'])
+                                self.logger.info(f"  - Found {cat_count} product categories")
+                                category_sample = ', '.join(mfr['categories'][:5])
+                                self.logger.info(f"  - Category examples: {category_sample}{' ...' if cat_count > 5 else ''}")
+                            else:
+                                self.logger.info("  - No categories found")
+                    else:
+                        self.logger.info("No manufacturer data was extracted from the page")
+                        
+                except Exception as extract_err:
+                    self.logger.error(f"Error in manufacturer data extraction: {str(extract_err)}")
+                    self.logger.info("Continuing with link extraction despite extraction error")
             
-            # Extract and prioritize links
+            # STEP 4: Extract links for further crawling
+            self.logger.info(f"STEP 4: Extracting links from {url} for further crawling")
             new_urls = []
-            for link in soup.find_all('a', href=True):
-                href = link.get('href')
-                if href:
-                    absolute_url = urljoin(url, href)
-                    if self._should_crawl_url(absolute_url):
-                        # Get content hint from link text and title
-                        content_hint = f"{link.get_text()} {link.get('title', '')}"
+            try:
+                # Find all links in the page
+                all_links = soup.find_all('a', href=True)
+                self.logger.info(f"Found {len(all_links)} total links on the page")
+                
+                # Process each link
+                for link in all_links:
+                    href = link.get('href')
+                    if href:
+                        # Convert relative URLs to absolute
+                        absolute_url = urljoin(url, href)
                         
-                        # Store link metadata
-                        metadata = {
-                            'text': link.get_text(strip=True),
-                            'title': link.get('title', ''),
-                            'class': link.get('class', []),
-                            'parent_tag': link.parent.name if link.parent else None
-                        }
-                        
-                        new_urls.append((absolute_url, content_hint, html_structure, metadata))
+                        # Check if we should crawl this URL based on domain and exclusion rules
+                        if self._should_crawl_url(absolute_url):
+                            # Get content hint from link text and title
+                            link_text = link.get_text(strip=True)
+                            link_title = link.get('title', '')
+                            content_hint = f"{link_text} {link_title}"
+                            
+                            # Store link metadata for prioritization
+                            metadata = {
+                                'text': link_text,
+                                'title': link_title,
+                                'class': link.get('class', []),
+                                'parent_tag': link.parent.name if link.parent else None
+                            }
+                            
+                            # Add URL to the list of new URLs to crawl
+                            new_urls.append((absolute_url, content_hint, html_structure, metadata))
+                
+                # Log summary of URLs to be crawled
+                self.logger.info(f"Added {len(new_urls)} URLs to the crawl queue")
+                if new_urls:
+                    sample_urls = [url for url, _, _, _ in new_urls[:3]]
+                    self.logger.info(f"Sample URLs: {', '.join(sample_urls)}{' ...' if len(new_urls) > 3 else ''}")
+                    
+            except Exception as link_err:
+                self.logger.error(f"Error extracting links: {str(link_err)}")
             
-            self.logger.info(f"Found {len(new_urls)} new URLs to process")
+            # Return the results of the analysis
+            self.logger.info(f"Page analysis complete for {url}")
             return is_manufacturer, extracted_data, new_urls
             
         except Exception as e:
             self.logger.error(f"Error analyzing page {url}: {str(e)}", exc_info=True)
+            # Return empty results but don't fail completely
             return False, [], []
 
     def _should_crawl_url(self, url: str) -> bool:

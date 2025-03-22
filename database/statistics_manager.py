@@ -24,13 +24,14 @@ class StatisticsManager:
     It handles both in-memory statistics and database persistence.
     """
     
-    def __init__(self, component_type: str, db_manager: Optional[DatabaseManager] = None):
+    def __init__(self, component_type: str, db_manager: Optional[DatabaseManager] = None, create_session: bool = True):
         """
         Initialize the statistics manager.
         
         Args:
             component_type: Type of component ('scraper', 'finder', or 'combined')
             db_manager: Database manager instance for database operations
+            create_session: Whether to automatically create a new session
         """
         self.component_type = component_type
         self.db_manager = db_manager or get_db_manager()
@@ -42,8 +43,9 @@ class StatisticsManager:
         # Initialize statistics based on component type
         self.stats = self._initialize_stats()
         
-        # Create a new session in the database
-        self._create_session()
+        # Create session only if requested
+        if create_session:
+            self._create_session()
     
     def _initialize_stats(self) -> Dict[str, Any]:
         """
@@ -177,6 +179,10 @@ class StatisticsManager:
                 
         except Exception as e:
             self.logger.error(f"Error creating database session: {str(e)}")
+    
+    def create_new_session(self) -> None:
+        """Explicit method to create a new session"""
+        self._create_session()
     
     def update_stat(self, key: str, value: Any, increment: bool = False) -> None:
         """
@@ -490,6 +496,3 @@ class StatisticsManager:
             return {}
             
         return self.batch_stats
-        runtime_minutes = runtime_seconds / 60
-        
-        self.logger.info(f"{self.component_type.capitalize()} session completed in {runtime_minutes:.2f} minutes")

@@ -1453,8 +1453,10 @@ def interactive_mode(config):
                         print(f"Unrecognized argument: {args[i]}")
                         i += 1
                 
-                list_sessions(config, session_type=session_type, limit=limit)
-                
+                stats_manager = StatisticsManager('combined', get_db_manager(config['database']['path']), create_session=False)
+                session_data = stats_manager.get_session_stats(session_type, limit)
+                print(session_data)
+            
             elif command.startswith('list-manufacturers'):
                 args = command.split()[1:] if len(command.split()) > 1 else []
                 limit = None
