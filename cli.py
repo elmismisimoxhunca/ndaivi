@@ -1116,7 +1116,7 @@ def interactive_mode(config):
                 # Parse arguments
                 i = 0
                 while i < len(args):
-                    if args[i] == '--max-pages' and i + 1 < len(args):
+                    if args[i] in ['--max-pages', '--max_pages'] and i + 1 < len(args):
                         try:
                             max_pages = int(args[i + 1])
                             i += 2

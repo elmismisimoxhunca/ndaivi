@@ -141,7 +141,8 @@ class CrawlStatus(Base):
     url = Column(String(255), unique=True, nullable=False)
     visited = Column(Boolean, default=False)
     analyzed = Column(Boolean, default=False)
-    is_manufacturer_page = Column(Boolean, nullable=True)
+    is_manufacturer_page = Column(Boolean, nullable=True)  # Retained for backward compatibility
+    page_type = Column(String(50), nullable=True)  # 'brand_page', 'brand_category_page', 'inconclusive', or 'other'
     last_visited = Column(DateTime, nullable=True)
     depth = Column(Integer, default=0)
     parent_url = Column(String(255), nullable=True)
@@ -152,7 +153,7 @@ class CrawlStatus(Base):
     last_modified = Column(DateTime, nullable=True)
     
     def __repr__(self):
-        return f"<CrawlStatus(url='{self.url}', visited={self.visited}, analyzed={self.analyzed})>"
+        return f"<CrawlStatus(url='{self.url}', visited={self.visited}, analyzed={self.analyzed}, page_type='{self.page_type}')>"
 
 class ScraperLog(Base):
     __tablename__ = 'scraper_logs'

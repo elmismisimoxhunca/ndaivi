@@ -45,7 +45,7 @@ class StatisticsManager:
         
         # Create session only if requested
         if create_session:
-            self._create_session()
+            self.create_session()
     
     def _initialize_stats(self) -> Dict[str, Any]:
         """
@@ -59,6 +59,9 @@ class StatisticsManager:
             "start_time": datetime.datetime.now(),
             "end_time": None,
             "runtime_seconds": 0,
+            "max_pages": None,
+            "max_runtime_minutes": None,
+            "error": None
         }
         
         if self.component_type == 'scraper':
@@ -132,6 +135,15 @@ class StatisticsManager:
         
         return stats
     
+    def create_session(self) -> None:
+        """
+        Create a new statistics session in the database.
+        
+        This public method provides a clean interface to create a new session
+        for tracking statistics during a scraping, finding, or combined operation.
+        """
+        self._create_session()
+    
     def _create_session(self) -> None:
         """
         Create a new session in the database.
@@ -180,10 +192,6 @@ class StatisticsManager:
         except Exception as e:
             self.logger.error(f"Error creating database session: {str(e)}")
     
-    def create_new_session(self) -> None:
-        """Explicit method to create a new session"""
-        self._create_session()
-    
     def update_stat(self, key: str, value: Any, increment: bool = False) -> None:
         """
         Update a specific statistic.
@@ -197,6 +205,17 @@ class StatisticsManager:
             self.logger.warning(f"Unknown statistic key: {key}")
             self.stats[key] = value
             return
+            
+        # Special handling for datetime fields
+        if key in ["start_time", "end_time"] and value is not None:
+            # Ensure we always store datetime objects, not strings
+            if isinstance(value, str):
+                try:
+                    value = datetime.datetime.fromisoformat(value)
+                except ValueError:
+                    self.logger.error(f"Invalid datetime format for {key}: {value}")
+                    # Keep existing value
+                    return
         
         if increment:
             if isinstance(self.stats[key], (int, float)):
@@ -216,6 +235,16 @@ class StatisticsManager:
         """
         for key, value in stats_dict.items():
             self.update_stat(key, value, increment)
+    
+    def update_stats(self, stats_dict: Dict[str, Any], increment: bool = False) -> None:
+        """
+        Legacy method that forwards to update_multiple_stats for backward compatibility.
+        
+        Args:
+            stats_dict: Dictionary of statistics to update
+            increment: Whether to increment existing stats or replace them
+        """
+        self.update_multiple_stats(stats_dict, increment)
     
     def get_stat(self, key: str) -> Any:
         """
@@ -239,7 +268,22 @@ class StatisticsManager:
         # Update runtime before returning
         if self.stats["start_time"]:
             end_time = self.stats["end_time"] or datetime.datetime.now()
-            self.stats["runtime_seconds"] = (end_time - self.stats["start_time"]).total_seconds()
+            
+            # Ensure start_time is a datetime object
+            start_time = self.stats["start_time"]
+            if isinstance(start_time, str):
+                try:
+                    # Try to parse the string to a datetime object
+                    start_time = datetime.datetime.fromisoformat(start_time)
+                    # Update the stats with the corrected start_time
+                    self.stats["start_time"] = start_time
+                except ValueError:
+                    self.logger.error(f"Invalid start_time format: {start_time}")
+                    # Don't update runtime in this case
+                    return self.stats
+            
+            # Now calculate runtime with the corrected start_time
+            self.stats["runtime_seconds"] = (end_time - start_time).total_seconds()
         
         return self.stats
     
