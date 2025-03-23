@@ -23,17 +23,24 @@ class TranslationManager:
     to avoid redundant API calls.
     """
     
-    def __init__(self):
-        """Initialize the Translation Manager."""
+    def __init__(self, config_path: str = None):
+        """
+        Initialize the Translation Manager.
+        
+        Args:
+            config_path: Optional path to configuration file
+        """
         self.logger = logging.getLogger(__name__)
-        self.config_manager = ConfigManager()
+        self.config_manager = ConfigManager(config_path)
         
         # Translation settings
         self.enabled = self.config_manager.get('translation.enabled', True)
         self.default_source_lang = self.config_manager.get('translation.default_source_lang', 'en')
         self.default_target_lang = self.config_manager.get('translation.default_target_lang', 'es')
+        self.batch_size = self.config_manager.get('translation.batch_size', 50)
         
         # Cache for translations
+        self.cache_enabled = self.config_manager.get('translation.cache_enabled', True)
         self.cache = {}
         
         # Claude API configuration
@@ -43,37 +50,41 @@ class TranslationManager:
             if not self.api_key:
                 self.api_key = self.config_manager.get('claude_analyzer.api_key', '')
                 
-            if not self.api_key:
-                self.api_key = self.config_manager.get('ai_apis.anthropic.api_key', '')
+            if not self.api_key and not self.api_key.strip():
+                self.logger.warning("No Claude API key found. Translation will not work without a valid API key.")
+                self.enabled = False
                 
-            if not self.api_key:
-                self.api_key = self.config_manager.get('claude.api_key', '')
-            
-            if not self.api_key:
-                raise ValueError("No Claude API key found in environment variables or config. Set CLAUDE_API_KEY environment variable or configure it in config.yaml")
-            
-            # Log partial API key for debugging
-            if self.api_key:
-                self.logger.info(f"Using Claude API key starting with: {self.api_key[:5]}...")
+            # Get target languages
+            self.target_languages = self.config_manager.get('languages.targets', {})
+            if not self.target_languages:
+                self.logger.warning("No target languages configured. Translation will be limited.")
                 
-            # Get API URL from config with fallback
-            self.api_url = self.config_manager.get('claude_analyzer.api_base_url', 
-                                                  self.config_manager.get('claude.api_url', 
-                                                                        'https://api.anthropic.com/v1/messages'))
-            
-            # Get model from config with fallbacks
-            self.model = self.config_manager.get('claude.translation_model',
-                                                self.config_manager.get('ai_apis.anthropic.model',
-                                                                      self.config_manager.get('claude_analyzer.model',
-                                                                                            'claude-3-haiku-20240307')))
-            
-            self.logger.info(f"Translation Manager initialized with model: {self.model}")
-            self.logger.info(f"Translation API URL: {self.api_url}")
-            self.logger.info(f"Translation enabled: {self.enabled}")
+            # Get translation prompt template
+            self.translation_prompt = self.config_manager.get('prompt_templates.translate_categories', '')
+            if not self.translation_prompt:
+                self.logger.warning("No translation prompt template found. Using default template.")
+                self.translation_prompt = """
+                Translate the following product categories from {source_language} to {target_language}.
+                Preserve any brand names or proper nouns without translation.
+                
+                Categories:
+                {categories}
+                
+                Respond in JSON format:
+                {
+                  "translations": [
+                    "Translated Category 1",
+                    "Translated Category 2",
+                    ...
+                  ]
+                }
+                """
+                
+            self.logger.info(f"Translation manager initialized. Enabled: {self.enabled}")
+            self.logger.info(f"Target languages: {', '.join(self.target_languages.keys()) if self.target_languages else 'None'}")
             
         except Exception as e:
-            self.logger.error(f"Error initializing Translation Manager: {str(e)}")
-            self.api_key = None
+            self.logger.error(f"Error initializing translation manager: {str(e)}")
             self.enabled = False
 
     def _test_api_connection(self):
@@ -118,7 +129,7 @@ class TranslationManager:
         
         # Check cache first
         cache_key = f"{text}_{source_lang}_{target_lang}"
-        if cache_key in self.cache:
+        if self.cache_enabled and cache_key in self.cache:
             self.logger.debug(f"Translation cache hit for: {text}")
             return self.cache[cache_key]
         
@@ -145,16 +156,16 @@ IMPORTANT: Your response must contain ONLY the translated text, nothing else.
             }
             
             payload = {
-                "model": self.model,
+                "model": self.config_manager.get('claude_analyzer.model', 'claude-3-haiku-20240307'),
                 "max_tokens": 1000,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_prompt}]
             }
             
-            self.logger.debug(f"API URL: {self.api_url}")
+            self.logger.debug(f"API URL: {self.config_manager.get('claude_analyzer.api_base_url', 'https://api.anthropic.com/v1/messages')}")
             
             response = requests.post(
-                self.api_url,
+                self.config_manager.get('claude_analyzer.api_base_url', 'https://api.anthropic.com/v1/messages'),
                 headers=headers,
                 json=payload,
                 timeout=30
@@ -168,7 +179,8 @@ IMPORTANT: Your response must contain ONLY the translated text, nothing else.
                 translated = response_data['content'][0]['text'].strip()
                 
                 # Cache the result
-                self.cache[cache_key] = translated
+                if self.cache_enabled:
+                    self.cache[cache_key] = translated
                 
                 self.logger.info(f"Successfully translated: '{text}' -> '{translated}'")
                 return translated
