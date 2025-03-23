@@ -117,7 +117,7 @@ def check_api_key():
     return True
 
 def main():
-    """Main entry point."""
+    """Main function."""
     # Check command line arguments
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <url>")
@@ -137,70 +137,42 @@ def main():
         
         # Initialize analyzer
         logger.info("Initializing Claude Analyzer")
+        
+        # Initialize analyzer with standard configuration
         analyzer = ClaudeAnalyzer()
         
-        # Step 1: Keyword filter
-        logger.info("Step 1: Keyword filter")
-        filter_result = analyzer.keyword_filter(url, title, content)
-        logger.info(f"Filter result: {filter_result}")
+        # Ensure translation is enabled
+        analyzer.translation_enabled = True
+        logger.info(f"Translation enabled: {analyzer.translation_enabled}")
         
-        # If keyword filter gives a definitive result, extract data if needed
-        if filter_result['page_type'] in ['brand_page', 'brand_category_page']:
-            page_type = filter_result['page_type']
-            logger.info(f"Keyword filter identified page as a {page_type}")
-            data = analyzer.extract_manufacturer_data(url, title, content, page_type)
-            logger.info(f"Extracted data: {data}")
-            sys.exit(0)
+        # Set target languages if not already set
+        if not analyzer.target_languages:
+            analyzer.target_languages = {"es": "Spanish"}
+            logger.info(f"Setting target languages: {analyzer.target_languages}")
         
-        # If we need further analysis, proceed to step 2
-        if filter_result['passed']:
-            logger.info("Keyword filter passed, proceeding to step 2")
-            
-            # Step 2: Metadata analysis
-            logger.info("Step 2: Metadata analysis")
-            metadata_result = analyzer.analyze_metadata(url, title, metadata)
-            logger.info(f"Metadata analysis result: {metadata_result}")
-            
-            # If we got a definitive result, extract data if needed
-            if metadata_result['page_type'] != 'inconclusive':
-                page_type = metadata_result['page_type']
-                logger.info(f"Metadata analysis identified page as a {page_type}")
-                
-                if page_type in ['brand_page', 'brand_category_page']:
-                    data = analyzer.extract_manufacturer_data(url, title, content, page_type)
-                    logger.info(f"Extracted data: {data}")
-                    sys.exit(0)
-            
-            # If we need further analysis, proceed to step 3 (content analysis)
-            if metadata_result['page_type'] == 'inconclusive':
-                logger.info("Metadata analysis inconclusive, proceeding to step 3")
-                
-                # Step 3: Content analysis
-                logger.info("Step 3: Content analysis")
-                content_result = analyzer.analyze_content(url, title, content)
-                logger.info(f"Content analysis result: {content_result}")
-                
-                # If we got a definitive result, extract data if needed
-                if content_result['page_type'] != 'inconclusive':
-                    page_type = content_result['page_type']
-                    logger.info(f"Content analysis identified page as a {page_type}")
-                    
-                    if page_type in ['brand_page', 'brand_category_page']:
-                        data = analyzer.extract_manufacturer_data(url, title, content, page_type)
-                        logger.info(f"Extracted data: {data}")
-                        sys.exit(0)
-                else:
-                    logger.info("Content analysis inconclusive, page is not a manufacturer page")
-        else:
-            logger.info("Keyword filter failed, page is not a manufacturer page")
+        # Use the full analyze_page method (includes batch translation)
+        logger.info("Using full analyze_page method")
+        result = analyzer.analyze_page(url, title, content, metadata)
         
-        # If we get here, the page is not a manufacturer page
-        logger.info("Page is not a manufacturer page")
+        # Log result
+        logger.info(f"Analysis result: page_type={result.get('page_type', 'unknown')}, is_manufacturer_page={result.get('is_manufacturer_page', False)}")
+        
+        # Extract categories
+        if 'categories' in result:
+            extracted_categories = result.get('categories', [])
+            logger.info(f"Extracted categories: {extracted_categories}")
+        
+        # Get translation results
+        if 'translated_categories' in result:
+            logger.info("Translation results:")
+            for lang, categories in result.get('translated_categories', {}).items():
+                logger.info(f"  {lang}: {categories}")
         
     except Exception as e:
-        logger.error(f"Error analyzing page: {e}")
+        logger.error(f"Error running test: {str(e)}")
+        # Print traceback for debugging
         import traceback
-        traceback.print_exc()
+        logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
 if __name__ == "__main__":

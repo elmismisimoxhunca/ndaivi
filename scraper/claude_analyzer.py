@@ -29,41 +29,34 @@ class ClaudeAnalyzer:
         Initialize the Claude Analyzer.
         
         Args:
-            config_path: Path to the configuration file
+            config_path: Optional path to configuration file
         """
         # Set up logging
-        self.logger = logging.getLogger('claude_analyzer')
+        self.logger = logging.getLogger(__name__)
         
         # Load configuration
-        self.config_manager = ConfigManager(config_path)
-        if config_path:
-            self.config = self._load_config(config_path)
-        else:
-            self.config = self.config_manager.get_all()
+        self.config_manager = ConfigManager()
         
-        # Set up statistics
+        # Initialize statistics
         self.stats = {
             'pages_analyzed': 0,
             'manufacturer_pages_found': 0,
-            'tokens_used': 0,
-            'cache_hits': 0,
-            'errors': 0,
             'categories_found': 0,
+            'categories_translated': 0,
             'claude_api_calls': 0,
-            'claude_api_cache_hits': 0,
             'claude_api_prompt_tokens': 0,
             'claude_api_completion_tokens': 0,
             'claude_api_total_tokens': 0,
             'claude_api_errors': 0
         }
         
-        # Set up API configuration
+        # Get API key from environment or config
         self.claude_api_key = os.environ.get('CLAUDE_API_KEY')
         if not self.claude_api_key:
             self.claude_api_key = self.config_manager.get('claude_analyzer.api_key', '')
-            if not self.claude_api_key:
-                self.logger.error("No Claude API key found in environment variables or config")
-                raise ValueError("Claude API key is required. Set CLAUDE_API_KEY environment variable or configure it in config.yaml")
+            
+        if not self.claude_api_key:
+            raise ValueError("Claude API key is required. Set CLAUDE_API_KEY environment variable or configure it in config.yaml")
                 
         self.claude_model = self.config_manager.get('claude_analyzer.claude_model', 'claude-3-5-haiku-20241022')
         
@@ -83,7 +76,10 @@ class ClaudeAnalyzer:
         self.negative_keywords = self.config_manager.get('claude_analyzer.negative_keywords', [])
         
         # Set up translation
-        self.translation_enabled = self.config_manager.get('claude_analyzer.translation_enabled', False)
+        self.translation_enabled = self.config_manager.get('translation.enabled', True)
+        if not self.translation_enabled:
+            self.translation_enabled = self.config_manager.get('claude_analyzer.translation_enabled', True)
+            
         self.target_languages = self.config_manager.get('languages.targets', {})
         
         # Initialize translation manager if translation is enabled
@@ -92,6 +88,14 @@ class ClaudeAnalyzer:
             try:
                 from scraper.translation_manager import TranslationManager
                 self.translation_manager = TranslationManager()
+                
+                # Ensure the translation manager is properly initialized
+                if not self.translation_manager.api_key:
+                    self.translation_manager.api_key = self.claude_api_key
+                    
+                if not self.translation_manager.enabled:
+                    self.translation_manager.enabled = True
+                    
                 self.logger.info(f"Translation enabled for languages: {', '.join(self.target_languages.keys())}")
             except Exception as e:
                 self.logger.error(f"Failed to initialize TranslationManager: {str(e)}")
@@ -99,6 +103,7 @@ class ClaudeAnalyzer:
         
         self.logger.info(f"Claude Analyzer initialized with Claude model: {self.claude_model}")
         self.logger.info(f"Caching {'enabled' if self.enable_cache else 'disabled'}")
+        self.logger.info(f"Translation {'enabled' if self.translation_enabled else 'disabled'}")
     
     def _load_config(self, config_path: str) -> Dict:
         """
@@ -360,60 +365,6 @@ class ClaudeAnalyzer:
         self.stats['claude_api_errors'] += 1
         return ""
     
-    def translate_category(self, category: str, source_lang: str = 'en', target_lang: str = 'en') -> str:
-        """
-        Translate a category from source language to target language.
-        
-        Args:
-            category: Category to translate
-            source_lang: Source language code
-            target_lang: Target language code
-            
-        Returns:
-            Translated category
-        """
-        if not self.translation_enabled:
-            return category
-        
-        if source_lang == target_lang:
-            return category
-        
-        # Check cache first
-        cache_key = f"{category}_{source_lang}_{target_lang}"
-        if cache_key in self.translation_cache:
-            self.logger.debug(f"Translation cache hit for: {category}")
-            return self.translation_cache[cache_key]
-        
-        self.logger.info(f"Translating category: {category} from {source_lang} to {target_lang}")
-        
-        # Prepare prompt
-        system_prompt = """You are a translation assistant. Your task is to translate product categories from one language to another.
-Respond ONLY with the translated text, no other text or explanation.
-"""
-        
-        user_prompt = f"""Translate the following product category from {source_lang} to {target_lang}:
-{category}
-
-Respond ONLY with the translated text.
-"""
-        
-        # Call Claude API
-        try:
-            response = self._call_claude_api(system_prompt + user_prompt)
-            
-            # Clean up response
-            translated = response.strip()
-            
-            # Cache the result
-            self.translation_cache[cache_key] = translated
-            
-            self.logger.debug(f"Translated '{category}' to '{translated}'")
-            return translated
-        except Exception as e:
-            self.logger.error(f"Error translating category: {str(e)}")
-            return category
-    
-    # STEP 1: Keyword filtering (no Claude API call)
     def keyword_filter(self, url: str, title: str, content: str) -> Dict:
         """
         Filter pages based on keywords to quickly categorize pages without using Claude API.
@@ -682,9 +633,9 @@ Based on this information, classify this page as "brand_page", "brand_category_p
                 'confidence': 0.0
             }
     
-    def extract_manufacturer_data(self, url: str, title: str, content: str, page_type: str) -> List[str]:
+    def extract_manufacturer_data(self, url: str, title: str, content: str, page_type: str) -> Dict:
         """
-        Extract manufacturer data based on page type.
+        Extract manufacturer data from a page.
         
         Args:
             url: Page URL
@@ -693,152 +644,44 @@ Based on this information, classify this page as "brand_page", "brand_category_p
             page_type: Page type ('brand_page' or 'brand_category_page')
             
         Returns:
-            List of extracted categories
+            Dictionary containing manufacturer_name and categories
         """
         self.logger.info(f"Extracting manufacturer data for page type: {page_type}")
         
+        # Extract manufacturer name
+        manufacturer_name = self._extract_manufacturer_name(url, title)
+        
         # Extract categories based on page type
         if page_type == 'brand_page':
-            return self.extract_manufacturer_data_for_brand_page(url, title, content)
+            self.logger.info(f"Extracting manufacturer data for brand page: {url}")
+            categories = self._extract_brand_categories(url, title, content)
         elif page_type == 'brand_category_page':
-            return self.extract_manufacturer_data_for_category_page(url, title, content)
+            self.logger.info(f"Extracting manufacturer data for brand category page: {url}")
+            categories = self._extract_category_from_page(url, title, content)
         else:
-            self.logger.warning(f"Unsupported page type for manufacturer data extraction: {page_type}")
-            return []
-    
-    def extract_manufacturer_data_for_brand_page(self, url: str, title: str, content: str) -> Dict:
-        """
-        Extract manufacturer data for a brand page.
-        
-        Args:
-            url: Page URL
-            title: Page title
-            content: Page content
-            
-        Returns:
-            Dictionary with manufacturer name, categories, and URL
-        """
-        self.logger.info(f"Extracting manufacturer data for brand page: {url}")
-        
-        # Extract key elements from the content
-        key_elements = self._extract_key_elements(content)
-        
-        # Extract main content (truncated)
-        main_content = self._extract_main_content(content, max_chars=1500)
-        
-        # Prepare prompt for Claude API
-        system_prompt = """You are an expert in analyzing manufacturer websites and extracting product categories.
-Your task is to identify all product categories from a manufacturer's website.
-Respond with ONLY a list of product categories, one per line, with no additional text or explanation.
-Focus on main product categories, not individual products or subcategories.
-"""
-        
-        user_prompt = f"""URL: {url}
-Title: {title}
-
-Key Elements:
-{key_elements}
-
-Truncated Content:
-{main_content}
-
-Extract all product categories from this manufacturer page. List ONLY the main product categories, one per line.
-"""
-        
-        # Call Claude API
-        try:
-            response = self._call_claude_api(system_prompt + user_prompt)
-            
-            # Parse categories - one per line
+            self.logger.warning(f"Unknown page type for manufacturer data extraction: {page_type}")
             categories = []
-            if response:
-                for line in response.strip().split('\n'):
-                    category = line.strip()
-                    if category:
-                        categories.append(category)
-            
-            # Translate categories if enabled
-            if self.translation_manager and categories:
-                from scraper.translation_manager import TranslationManager
-                translation_manager = TranslationManager()
+        
+        # Ensure categories is a list, not a dictionary
+        if isinstance(categories, dict) and 'categories' in categories:
+            result = categories
+            # Make sure manufacturer_name is set
+            if 'manufacturer_name' not in result:
+                result['manufacturer_name'] = manufacturer_name
+        else:
+            # Convert non-list to list if needed
+            if not isinstance(categories, list):
+                categories = [categories] if categories else []
                 
-                # Get target languages from config
-                target_languages = self.config_manager.get('languages.targets', {})
-                
-                # Translate to each target language
-                for lang_code, lang_name in target_languages.items():
-                    self.logger.info(f"Translating {len(categories)} categories to {lang_name}")
-                    translated_categories = translation_manager.translate_list(categories, 'en', lang_code)
-                    
-                    # Log the translations
-                    for i, (orig, trans) in enumerate(zip(categories, translated_categories)):
-                        self.logger.debug(f"  {i+1}. '{orig}' -> '{trans}'")
-            
-            # Update statistics
-            self.stats['categories_found'] += len(categories)
-            
-            # Extract manufacturer name from title or URL
-            manufacturer_name = self._extract_manufacturer_name(url, title)
-            
-            # Return extracted data
-            return {
+            # Create result dictionary with expected keys
+            result = {
                 'manufacturer_name': manufacturer_name,
                 'categories': categories,
                 'url': url
             }
-        except Exception as e:
-            self.logger.error(f"Error extracting manufacturer data for brand page: {str(e)}")
-            return []
-    
-    def extract_manufacturer_data_for_category_page(self, url: str, title: str, content: str) -> List[str]:
-        """
-        Extract manufacturer data for a category page.
         
-        Args:
-            url: Page URL
-            title: Page title
-            content: Page content
-            
-        Returns:
-            List of extracted categories
-        """
-        self.logger.info(f"Extracting manufacturer data for category page: {url}")
-        
-        # Extract key elements
-        key_elements = self._extract_key_elements(content)
-        
-        # Prepare prompt for Claude API
-        system_prompt = """You are an expert in analyzing manufacturer websites and extracting product categories.
-Your task is to identify the main product category from this specific category page.
-Respond with ONLY the category name, nothing else.
-"""
-        
-        user_prompt = f"""URL: {url}
-Title: {title}
-
-Key Elements:
-{key_elements}
-
-Based on this information, what is the SINGLE main product category represented on this page?
-Respond with ONLY the category name, no explanations or additional text.
-"""
-        
-        # Call Claude API
-        try:
-            response = self._call_claude_api(system_prompt + user_prompt)
-            
-            # Clean up response
-            category = response.strip() if response else None
-            
-            # Translate category if enabled
-            if self.translation_manager and category:
-                category = self.translate_category(category)
-            
-            self.logger.info(f"Extracted category: {category}")
-            return [category] if category else []
-        except Exception as e:
-            self.logger.error(f"Error extracting manufacturer data for category page: {str(e)}")
-            return []
+        self.logger.info(f"Extracted data: {result}")
+        return result
     
     def analyze_page(self, url: str, title: str, content: str, metadata: str = None) -> Dict:
         """
@@ -848,6 +691,8 @@ Respond with ONLY the category name, no explanations or additional text.
         1. Keyword filtering (no Claude API call)
         2. Metadata analysis (Claude API call with title and metadata)
         3. Content analysis (Claude API call with truncated content)
+        4. Category extraction (if applicable)
+        5. Batch translation of categories (if enabled)
         
         Args:
             url: Page URL
@@ -860,11 +705,14 @@ Respond with ONLY the category name, no explanations or additional text.
         """
         self.logger.info(f"Analyzing page: {url}")
         
+        # Update statistics
+        self.stats['pages_analyzed'] += 1
+        
         # Extract metadata if not provided
         if metadata is None:
             metadata = self._extract_metadata_from_content(content)
         
-        # STEP 1: Keyword filtering
+        # Step 1: Keyword filtering
         keyword_result = self.keyword_filter(url, title, content)
         
         # If keyword filter indicates this is definitely not a manufacturer page, skip further analysis
@@ -884,19 +732,35 @@ Respond with ONLY the category name, no explanations or additional text.
             is_category_page = page_type == 'brand_category_page'
             
             # For manufacturer pages, extract categories
-            categories = []
-            if is_manufacturer_page or is_category_page:
-                categories = self.extract_manufacturer_data(url, title, content, page_type)
+            extracted_data = self.extract_manufacturer_data(url, title, content, page_type)
             
-            return {
+            # Translate categories in batch if enabled
+            translated_categories = {}
+            if self.translation_enabled and self.translation_manager and 'categories' in extracted_data:
+                self.logger.info(f"Translating {len(extracted_data['categories'])} categories for {extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title))}")
+                translation_data = {'manufacturer_name': extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title)), 'categories': extracted_data['categories'], 'url': url}
+                translated_categories = self._batch_translate_categories(translation_data)
+                self.logger.info(f"Translation completed. Results: {translated_categories}")
+            
+            # Build response with all extracted data
+            result = {
                 'is_manufacturer_page': is_manufacturer_page,
                 'is_category_page': is_category_page,
                 'page_type': page_type,
-                'categories': categories,
+                'manufacturer_name': extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title)),
+                'categories': extracted_data.get('categories', []),
+                'translated_categories': translated_categories,
                 'analysis_method': 'keyword_filter'
             }
-        
-        # STEP 2: Metadata analysis
+            
+            # Add any additional data from extraction
+            for key, value in extracted_data.items():
+                if key not in ['categories', 'manufacturer_name']:
+                    result[key] = value
+            
+            return result
+            
+        # Step 2: Metadata analysis
         try:
             metadata_result = self.analyze_metadata(url, title, metadata)
             
@@ -907,21 +771,37 @@ Respond with ONLY the category name, no explanations or additional text.
                 is_category_page = page_type == 'brand_category_page'
                 
                 # For manufacturer pages, extract categories
-                categories = []
-                if is_manufacturer_page or is_category_page:
-                    categories = self.extract_manufacturer_data(url, title, content, page_type)
+                extracted_data = self.extract_manufacturer_data(url, title, content, page_type)
                 
-                return {
+                # Translate categories in batch if enabled
+                translated_categories = {}
+                if self.translation_enabled and self.translation_manager and 'categories' in extracted_data:
+                    self.logger.info(f"Translating {len(extracted_data['categories'])} categories for {extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title))}")
+                    translation_data = {'manufacturer_name': extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title)), 'categories': extracted_data['categories'], 'url': url}
+                    translated_categories = self._batch_translate_categories(translation_data)
+                    self.logger.info(f"Translation completed. Results: {translated_categories}")
+                
+                # Build result
+                result = {
                     'is_manufacturer_page': is_manufacturer_page,
                     'is_category_page': is_category_page,
                     'page_type': page_type,
-                    'categories': categories,
+                    'manufacturer_name': extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title)),
+                    'categories': extracted_data.get('categories', []),
+                    'translated_categories': translated_categories,
                     'analysis_method': 'metadata_analysis'
                 }
+                
+                # Add any additional data
+                for key, value in extracted_data.items():
+                    if key not in ['categories', 'manufacturer_name']:
+                        result[key] = value
+                
+                return result
         except Exception as e:
             self.logger.error(f"Error in metadata analysis: {str(e)}")
         
-        # STEP 3: Content analysis
+        # Step 3: Content analysis
         try:
             content_result = self.analyze_content(url, title, content)
             
@@ -930,17 +810,33 @@ Respond with ONLY the category name, no explanations or additional text.
             is_category_page = page_type == 'brand_category_page'
             
             # For manufacturer pages, extract categories
-            categories = []
-            if is_manufacturer_page or is_category_page:
-                categories = self.extract_manufacturer_data(url, title, content, page_type)
+            extracted_data = self.extract_manufacturer_data(url, title, content, page_type)
             
-            return {
+            # Translate categories in batch if enabled
+            translated_categories = {}
+            if self.translation_enabled and self.translation_manager and 'categories' in extracted_data:
+                self.logger.info(f"Translating {len(extracted_data['categories'])} categories for {extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title))}")
+                translation_data = {'manufacturer_name': extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title)), 'categories': extracted_data['categories'], 'url': url}
+                translated_categories = self._batch_translate_categories(translation_data)
+                self.logger.info(f"Translation completed. Results: {translated_categories}")
+            
+            # Build result
+            result = {
                 'is_manufacturer_page': is_manufacturer_page,
                 'is_category_page': is_category_page,
                 'page_type': page_type,
-                'categories': categories,
+                'manufacturer_name': extracted_data.get('manufacturer_name', self._extract_manufacturer_name(url, title)),
+                'categories': extracted_data.get('categories', []),
+                'translated_categories': translated_categories,
                 'analysis_method': 'content_analysis'
             }
+            
+            # Add any additional data
+            for key, value in extracted_data.items():
+                if key not in ['categories', 'manufacturer_name']:
+                    result[key] = value
+            
+            return result
         except Exception as e:
             self.logger.error(f"Error in content analysis: {str(e)}")
         
@@ -951,8 +847,80 @@ Respond with ONLY the category name, no explanations or additional text.
             'is_category_page': False,
             'page_type': 'other',
             'categories': [],
+            'translated_categories': {},
             'analysis_method': 'default'
         }
+    
+    def _batch_translate_categories(self, data: Dict) -> Dict[str, List[str]]:
+        """
+        Translate a batch of categories to all target languages.
+        
+        Args:
+            data: Dictionary containing manufacturer_name, categories, and url
+            
+        Returns:
+            Dictionary mapping language codes to lists of translated categories
+        """
+        translated_results = {}
+        
+        # Skip if translation is not enabled or no categories to translate
+        if not self.translation_enabled:
+            self.logger.warning("Translation skipped: not enabled")
+            return translated_results
+            
+        if not self.translation_manager:
+            self.logger.warning("Translation skipped: translation manager not initialized")
+            return translated_results
+            
+        if not self.translation_manager.enabled:
+            self.logger.warning("Translation skipped: translation manager is disabled")
+            return translated_results
+            
+        if not self.translation_manager.api_key:
+            self.logger.warning("Translation skipped: translation manager has no API key")
+            return translated_results
+            
+        # Extract manufacturer name and category list
+        manufacturer_name = data.get('manufacturer_name', '')
+        categories = data.get('categories', [])
+        url = data.get('url', '')
+        
+        if not manufacturer_name or not categories:
+            self.logger.warning(f"Missing manufacturer name or categories for translation: {data}")
+            return translated_results
+            
+        self.logger.debug(f"Categories to translate: {categories}")
+        
+        # Translate to each target language
+        for lang_code, lang_name in self.target_languages.items():
+            # Skip English if it's the source language
+            if lang_code == 'en':
+                translated_results[lang_code] = categories
+                continue
+                
+            self.logger.info(f"Batch translating {len(categories)} categories to {lang_name}")
+            
+            try:
+                # Use the translation_manager's translate_list method to translate all categories at once
+                translated_categories = self.translation_manager.translate_list(categories, 'en', lang_code)
+                
+                if translated_categories:
+                    self.logger.info(f"Successfully translated {len(categories)} categories to {lang_name}")
+                    self.stats['categories_translated'] += len(translated_categories)
+                    translated_results[lang_code] = translated_categories
+                else:
+                    self.logger.warning(f"No translations returned for {lang_name}")
+                    translated_results[lang_code] = categories  # Use original as fallback
+                
+            except Exception as e:
+                self.logger.error(f"Error batch translating to {lang_name}: {str(e)}")
+                # Print the full exception traceback for debugging
+                import traceback
+                self.logger.error(f"Traceback: {traceback.format_exc()}")
+                # Use original categories as fallback
+                translated_results[lang_code] = categories
+        
+        return translated_results
     
     def _extract_key_elements(self, content: str) -> str:
         """
@@ -1143,12 +1111,9 @@ Respond with ONLY the category name, no explanations or additional text.
         self.stats = {
             'pages_analyzed': 0,
             'manufacturer_pages_found': 0,
-            'tokens_used': 0,
-            'cache_hits': 0,
-            'errors': 0,
             'categories_found': 0,
+            'categories_translated': 0,
             'claude_api_calls': 0,
-            'claude_api_cache_hits': 0,
             'claude_api_prompt_tokens': 0,
             'claude_api_completion_tokens': 0,
             'claude_api_total_tokens': 0,
@@ -1185,3 +1150,127 @@ Respond with ONLY the category name, no explanations or additional text.
                 manufacturer_name = title_parts[0].strip()
         
         return manufacturer_name
+
+    def _extract_brand_categories(self, url: str, title: str, content: str) -> List[str]:
+        """
+        Extract categories from a brand page.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content
+            
+        Returns:
+            List of categories
+        """
+        self.logger.info(f"Extracting categories from brand page: {url}")
+        
+        # Extract key elements from the content
+        key_elements = self._extract_key_elements(content)
+        
+        # Extract main content (truncated)
+        main_content = self._extract_main_content(content, max_chars=1500)
+        
+        # Extract manufacturer name
+        manufacturer_name = self._extract_manufacturer_name(url, title)
+        
+        # Prepare prompt for Claude API
+        system_prompt = """You are an expert in analyzing manufacturer websites and extracting product categories.
+Your task is to identify all product categories from a manufacturer's website.
+Respond with ONLY a list of product categories, one per line, with no additional text or explanation.
+IMPORTANT: Always prefix each category with the manufacturer name (e.g., "Samsung TVs" not just "TVs").
+Focus on main product categories, not individual products or subcategories.
+"""
+        
+        user_prompt = f"""URL: {url}
+Title: {title}
+
+Key Elements:
+{key_elements}
+
+Truncated Content:
+{main_content}
+
+Extract all product categories from this manufacturer page. 
+The manufacturer name is: {manufacturer_name}
+List ONLY the main product categories, one per line, with the manufacturer name as prefix.
+Example format: "{manufacturer_name} Laptops" not just "Laptops"
+"""
+        
+        # Call Claude API
+        try:
+            response = self._call_claude_api(system_prompt + user_prompt)
+            
+            # Parse categories - one per line
+            categories = []
+            if response:
+                for line in response.strip().split('\n'):
+                    category = line.strip()
+                    if category:
+                        categories.append(category)
+            
+            # Update statistics
+            self.stats['categories_found'] += len(categories)
+            
+            return categories
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting categories from brand page: {str(e)}")
+            return []
+            
+    def _extract_category_from_page(self, url: str, title: str, content: str) -> List[str]:
+        """
+        Extract the main category from a category page.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content
+            
+        Returns:
+            List of categories (should be a single category)
+        """
+        self.logger.info(f"Extracting category from category page: {url}")
+        
+        # Extract key elements
+        key_elements = self._extract_key_elements(content)
+        
+        # Extract manufacturer name
+        manufacturer_name = self._extract_manufacturer_name(url, title)
+        
+        # Prepare prompt for Claude API
+        system_prompt = """You are an expert in analyzing manufacturer websites and extracting product categories.
+Your task is to identify the main product category from this specific category page.
+Respond with ONLY the category name, nothing else.
+"""
+        
+        user_prompt = f"""URL: {url}
+Title: {title}
+
+Key Elements:
+{key_elements}
+
+Based on this information, what is the SINGLE main product category represented on this page?
+Respond with ONLY the category name, no explanations or additional text.
+"""
+        
+        # Call Claude API
+        try:
+            response = self._call_claude_api(system_prompt + user_prompt)
+            
+            # Clean up response
+            category = response.strip() if response else None
+            
+            # Format with manufacturer name prefix
+            if category and manufacturer_name:
+                category = f"{manufacturer_name} {category}"
+                
+            categories = [category] if category else []
+            
+            self.logger.info(f"Extracted category: {category}")
+            
+            return categories
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting category from category page: {str(e)}")
+            return []
