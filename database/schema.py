@@ -253,6 +253,44 @@ class ErrorLog(Base):
         return f"<ErrorLog(timestamp='{self.timestamp}', error_type='{self.error_type}', url='{self.url}')>"
 
 
+class ClaudeCache(Base):
+    """
+    Cache for Claude API responses to avoid redundant API calls.
+    
+    This table stores the responses from the Claude API for specific prompts
+    and content, allowing for reuse of previous responses to save tokens and
+    reduce costs.
+    """
+    __tablename__ = 'claude_cache'
+    
+    id = Column(Integer, primary_key=True)
+    cache_key = Column(String(255), unique=True, nullable=False)
+    response = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<ClaudeCache(cache_key='{self.cache_key[:8]}...', created_at='{self.created_at}')>"
+
+
+class TranslationCache(Base):
+    """
+    Cache for translated categories to avoid redundant translation API calls.
+    
+    This table stores the translations of categories for specific manufacturers
+    and target languages, allowing for reuse of previous translations to save
+    tokens and reduce costs.
+    """
+    __tablename__ = 'translation_cache'
+    
+    id = Column(Integer, primary_key=True)
+    cache_key = Column(String(255), unique=True, nullable=False)
+    translations = Column(Text, nullable=False)  # JSON string of original->translated pairs
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<TranslationCache(cache_key='{self.cache_key[:8]}...', created_at='{self.created_at}')>"
+
+
 def get_db_engine(db_path):
     """
     Create a SQLAlchemy engine with optimized settings for SQLite.

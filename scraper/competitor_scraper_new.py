@@ -21,7 +21,7 @@ import time
 import os
 import uuid
 import heapq
-from urllib.parse import urlparse, urljoin, ParseResult
+from urllib.parse import urlparse, urljoin, ParseResult, parse_qs, urlencode
 import datetime
 import signal
 import threading
@@ -36,6 +36,7 @@ import re
 import json
 import argparse
 from requests.exceptions import RequestException
+import traceback
 
 # Add the project root to the Python path
 import sys
@@ -81,152 +82,90 @@ signal.signal(signal.SIGUSR1, handle_suspend)  # SIGUSR1 for suspension
 
 class UrlPriority:
     """
-    Class for determining URL crawling priority based on various factors.
-    
-    This helps optimize the crawling order to find manufacturer information faster.
+    Utility class for calculating URL priorities.
     """
     
-    # Keyword weights for prioritization
-    PRIORITY_KEYWORDS = {
-        'manufacturer': 10,
-        'brand': 8,
-        'vendor': 8,
-        'supplier': 7,
-        'partner': 6,
-        'directory': 6,
-        'catalog': 5,
-        'product': 4,
-        'category': 3,
-        # New category-specific keywords
-        'products': 5,
-        'categories': 4,
-        'brands': 8,
-        'manufacturers': 10,
-        'suppliers': 7,
-        'partners': 6,
-        'catalog': 5,
-        'shop': 3,
-        'store': 3
-    }
+    # Priority weights
+    DEPTH_WEIGHT = 5.0
+    KEYWORD_WEIGHT = 10.0
+    PATH_LENGTH_WEIGHT = 1.0
+    QUERY_PARAMS_WEIGHT = 2.0
+    DOMAIN_WEIGHT = 8.0
+    ANCHOR_TEXT_WEIGHT = 15.0
     
-    # HTML structure weights
-    HTML_WEIGHTS = {
-        'nav': 3,  # Navigation menus often contain category hierarchies
-        'breadcrumb': 2,  # Breadcrumbs show category structure
-        'sidebar': 2,  # Sidebars often contain category lists
-        'menu': 2,  # Menu structures often have categories
-        'list': 1,  # Lists might contain categories
-        'table': 1  # Tables might contain product/category info
-    }
+    # Keywords that might indicate manufacturer pages
+    MANUFACTURER_KEYWORDS = [
+        'manufacturer', 'brand', 'brands', 'company', 'companies', 'vendor', 'vendors',
+        'supplier', 'suppliers', 'producer', 'producers', 'maker', 'makers',
+        'about', 'about-us', 'about_us', 'aboutus', 'about-company', 'about_company',
+        'products', 'product-range', 'product_range', 'product-catalog', 'product_catalog',
+        'catalog', 'catalogue', 'portfolio', 'range', 'series', 'models',
+        'category', 'categories', 'directory', 'listing'
+    ]
     
-    # URL path segment weights
-    PATH_WEIGHTS = {
-        'catalog': 4,
-        'products': 4,
-        'categories': 4,
-        'brands': 6,
-        'manufacturers': 8
-    }
-    
-    @staticmethod
-    def calculate_priority(url: str, depth: int, content_hint: Optional[str] = None, html_structure: Optional[Dict] = None) -> float:
+    @classmethod
+    def calculate_priority(cls, url: str, depth: int, anchor_text: str = None, 
+                          html_structure: Dict = None) -> float:
         """
-        Calculate a crawling priority score for a URL with enhanced analysis.
-        
-        Lower scores indicate higher priority.
+        Calculate priority score for a URL. Lower scores have higher priority.
         
         Args:
             url: The URL to calculate priority for
-            depth: The link depth from the starting point
-            content_hint: Optional title or other content hint from the page
+            depth: Current crawl depth
+            anchor_text: Optional text of the anchor linking to this URL
             html_structure: Optional dict containing info about HTML structure
             
         Returns:
-            A priority score (lower is higher priority)
+            Priority score (lower is higher priority)
         """
-        # Base priority based on depth
-        priority = depth * 10.0
+        # Start with base priority from depth
+        priority = depth * cls.DEPTH_WEIGHT
         
-        # Parse URL for analysis
-        parsed_url = urlparse(url)
-        path_segments = parsed_url.path.lower().split('/')
-        
-        # Apply path segment boosts
-        for segment in path_segments:
-            for key, boost in UrlPriority.PATH_WEIGHTS.items():
-                if key in segment:
-                    priority -= boost
-        
-        # Apply keyword boosts to URL
-        url_lower = url.lower()
-        for keyword, boost in UrlPriority.PRIORITY_KEYWORDS.items():
-            if keyword in url_lower:
-                priority -= boost
-        
-        # Apply content hint boosts if available
-        if content_hint and isinstance(content_hint, str):
-            content_lower = content_hint.lower()
-            for keyword, boost in UrlPriority.PRIORITY_KEYWORDS.items():
-                if keyword in content_lower:
-                    priority -= boost * 0.5  # Half boost for content hints
-        
-        # Apply HTML structure boosts if available
-        if html_structure:
-            for element_type, count in html_structure.items():
-                if element_type.lower() in UrlPriority.HTML_WEIGHTS:
-                    boost = UrlPriority.HTML_WEIGHTS[element_type.lower()]
-                    priority -= boost * min(count, 3)  # Cap the boost for each type
-        
-        # Special adjustments
-        if 'category' in path_segments or 'categories' in path_segments:
-            priority -= 5  # Extra boost for explicit category pages
-        
-        if parsed_url.query and any(param in parsed_url.query.lower() 
-                                  for param in ['category', 'brand', 'manufacturer']):
-            priority -= 3  # Boost for relevant query parameters
-        
-        # Limit minimum priority value
-        return max(1.0, priority)
-    
-    @staticmethod
-    def calculate_seed_priority(url: str) -> float:
-        """
-        Calculate a priority score specifically for seed URLs.
-        
-        Seed URLs are given higher priority than regular URLs.
-        
-        Args:
-            url: The seed URL to calculate priority for
+        try:
+            # Parse URL
+            parsed_url = urlparse(url)
             
-        Returns:
-            A priority score (lower is higher priority)
-        """
-        # Start with a base priority of 0 for seed URLs
-        priority = 0.0
-        
-        # Parse URL for analysis
-        parsed_url = urlparse(url)
-        path_segments = parsed_url.path.lower().split('/')
-        
-        # Apply path segment boosts
-        for segment in path_segments:
-            for key, boost in UrlPriority.PATH_WEIGHTS.items():
-                if key in segment:
-                    priority -= boost
-        
-        # Apply keyword boosts to URL
-        url_lower = url.lower()
-        for keyword, boost in UrlPriority.PRIORITY_KEYWORDS.items():
-            if keyword in url_lower:
-                priority -= boost
-        
-        # Special adjustments for seed URLs
-        if 'brand' in url_lower or 'manufacturer' in url_lower:
-            priority -= 15  # Extra boost for brand/manufacturer pages
+            # Analyze path components
+            path = parsed_url.path
+            path_components = [p for p in path.split('/') if p]
             
-        # Ensure seed URLs have higher priority than regular URLs
-        return max(-50.0, priority)  # Cap at -50 to ensure high priority
-
+            # Path length penalty (longer paths are lower priority)
+            priority += len(path_components) * cls.PATH_LENGTH_WEIGHT
+            
+            # Query parameters penalty
+            if parsed_url.query:
+                priority += len(parsed_url.query.split('&')) * cls.QUERY_PARAMS_WEIGHT
+            
+            # Keyword bonus for paths that might contain manufacturer info
+            path_str = ' '.join(path_components).lower()
+            for keyword in cls.MANUFACTURER_KEYWORDS:
+                if keyword in path_str:
+                    priority -= cls.KEYWORD_WEIGHT
+                    break
+            
+            # Anchor text bonus
+            if anchor_text:
+                anchor_text = anchor_text.lower()
+                for keyword in cls.MANUFACTURER_KEYWORDS:
+                    if keyword in anchor_text:
+                        priority -= cls.ANCHOR_TEXT_WEIGHT
+                        break
+            
+            # Domain bonus for certain domains
+            domain = parsed_url.netloc.lower()
+            if any(term in domain for term in ['manufacturer', 'brand', 'supplier', 'company']):
+                priority -= cls.DOMAIN_WEIGHT
+            
+            # HTML structure bonus (if available)
+            if html_structure:
+                # Implement additional priority adjustments based on HTML structure
+                pass
+            
+        except Exception:
+            # If there's an error in calculation, use a default high (low priority) value
+            return 1000.0
+        
+        return max(0.0, priority)
 
 class PriorityUrlQueue:
     """
@@ -249,7 +188,14 @@ class PriorityUrlQueue:
         Returns:
             True if the URL is in the queue, False otherwise
         """
-        return url in self._url_set
+        if not url or not isinstance(url, str):
+            return False
+            
+        # Normalize URL for consistent comparison
+        normalized_url = url.rstrip('/')
+        
+        # Check if the normalized URL is in the set
+        return normalized_url in self._url_set
     
     def push(self, url: str, depth: int, priority: Optional[float] = None, 
              content_hint: Optional[str] = None, html_structure: Optional[Dict] = None,
@@ -268,6 +214,12 @@ class PriorityUrlQueue:
         Returns:
             True if URL was added, False if it was already in queue
         """
+        if not url or not isinstance(url, str):
+            return False
+        
+        # Normalize URL for consistent comparison
+        url = url.rstrip('/')
+            
         if url in self._url_set:
             return False
         
@@ -300,14 +252,21 @@ class PriorityUrlQueue:
         if not self._queue:
             raise IndexError("Priority queue is empty")
         
-        # Get and return the highest priority (lowest score) URL
-        _, _, url, depth = heapq.heappop(self._queue)
-        self._url_set.remove(url)
-        
-        # Get and remove metadata if it exists
-        metadata = self._url_metadata.pop(url, None)
-        
-        return url, depth, metadata
+        try:
+            # Get and return the highest priority (lowest score) URL
+            _, _, url, depth = heapq.heappop(self._queue)
+            self._url_set.remove(url)
+            
+            # Get and remove metadata if it exists
+            metadata = self._url_metadata.pop(url, None)
+            
+            return url, depth, metadata
+            
+        except Exception as e:
+            # If something goes wrong, make sure we don't leave inconsistent state
+            if url in self._url_set:
+                self._url_set.remove(url)
+            raise
     
     def update_priority(self, url: str, new_priority: float):
         """Update the priority of a URL in the queue"""
@@ -397,8 +356,9 @@ class ContentExtractor:
             title = soup.find('title')
             title_text = title.text.strip() if title else ""
             
-            # Extract content
-            content = self.extract_text_content(soup)
+            # Extract content - keep the HTML for link extraction
+            html_content = str(soup)
+            text_content = self.extract_text_content(soup)
             
             # Extract metadata
             metadata = {}
@@ -408,7 +368,10 @@ class ContentExtractor:
                 if name and content:
                     metadata[name] = content
             
-            return title_text, content, metadata
+            # Add HTML to metadata for link extraction
+            metadata['html_content'] = html_content
+            
+            return title_text, text_content, metadata
             
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Error fetching URL {url}: {str(e)}")
@@ -464,8 +427,6 @@ class ContentExtractor:
                 text = img.get('alt', '') if img else ''
             
             links[full_url] = text
-        
-        return links
     
     def extract_html_structure(self, soup: BeautifulSoup) -> Dict[str, int]:
         """
@@ -753,25 +714,30 @@ class ClaudeAnalyzer:
     category extraction, and translation functionality.
     """
     
-    def __init__(self, api_key: str, model: str, sonnet_model: str, logger):
+    def __init__(self, config_path: str, logger):
         """
         Initialize the Claude analyzer.
         
         Args:
-            api_key: Anthropic API key
-            model: Claude model to use for basic analysis
-            sonnet_model: Claude model to use for more complex analysis
+            config_path: Path to the configuration YAML file
             logger: Logger instance for logging API interactions
         """
-        self.api_key = api_key
-        self.model = model
-        self.sonnet_model = sonnet_model
+        self.config_path = config_path
         self.logger = logger
+        
+        # Load configuration
+        self.config = {}
+        self._load_config()
+        
+        # Initialize API clients
+        self.api_key = self.config['ai_apis']['anthropic']['api_key']
+        self.model = self.config['ai_apis']['anthropic']['model']
+        self.sonnet_model = self.config['ai_apis']['anthropic']['sonnet_model']
         
         # We'll use direct API calls instead of the SDK to avoid compatibility issues
         self.api_base_url = "https://api.anthropic.com/v1/messages"
         self.headers = {
-            "x-api-key": api_key,
+            "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json"
         }
@@ -779,51 +745,93 @@ class ClaudeAnalyzer:
         # Cache for API responses to avoid duplicate calls
         self._response_cache = {}
         
-        self.logger.info(f"Claude Analyzer initialized with models: {model} and {sonnet_model}")
+        self.logger.info(f"Claude Analyzer initialized with models: {self.model} and {self.sonnet_model}")
+    
+    def _load_config(self) -> None:
+        """
+        Load configuration from the YAML file.
+        """
+        try:
+            with open(self.config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
+            
+            # Validate configuration
+            self._validate_config()
+            
+        except Exception as e:
+            self.logger.error(f"Error loading configuration: {str(e)}")
+            raise ValueError(f"Failed to load configuration from {self.config_path}: {str(e)}")
+    
+    def _validate_config(self) -> None:
+        """
+        Validate the loaded configuration.
+        
+        Raises:
+            ValueError: If configuration is invalid
+        """
+        required_sections = ['database', 'crawling', 'ai_apis']
+        required_fields = {
+            'database': ['path'],
+            'crawling': ['max_depth', 'delay_between_requests', 'user_agent'],
+            'ai_apis': ['anthropic']
+        }
+        
+        # Check required sections
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"Missing required configuration section: {section}")
+            
+            # Check required fields in each section
+            for field in required_fields[section]:
+                if field not in self.config[section]:
+                    raise ValueError(f"Missing required configuration field: {section}.{field}")
+        
+        # Validate specific fields
+        if 'max_urls_per_domain' in self.config['crawling']:
+            if not isinstance(self.config['crawling']['max_urls_per_domain'], int) or self.config['crawling']['max_urls_per_domain'] <= 0:
+                raise ValueError("max_urls_per_domain must be a positive integer")
+        
+        if not isinstance(self.config['crawling']['max_depth'], int) or self.config['crawling']['max_depth'] <= 0:
+            raise ValueError("max_depth must be a positive integer")
+        
+        if 'request_timeout' in self.config['crawling']:
+            if not isinstance(self.config['crawling']['request_timeout'], (int, float)) or self.config['crawling']['request_timeout'] <= 0:
+                raise ValueError("request_timeout must be a positive number")
+        
+        # Check for target languages
+        if 'languages' in self.config and 'targets' in self.config['languages']:
+            if not isinstance(self.config['languages']['targets'], dict) or not self.config['languages']['targets']:
+                raise ValueError("languages.targets must be a non-empty dictionary")
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
           retry=retry_if_exception_type(RequestException))
-    def is_manufacturer_page(self, url: str, title: str, content: str) -> bool:
+    def analyze_metadata(self, url: str, title: str, metadata: str) -> Dict[str, Any]:
         """
-        Determine if a page is a manufacturer page.
+        Analyze metadata to determine if a page is a manufacturer page.
         
         Args:
             url: URL of the page
             title: Page title
-            content: Page text content
+            metadata: Metadata string
             
         Returns:
-            True if the page is a manufacturer page, False otherwise
+            Dictionary with analysis result
         """
-        # Create a cache key
-        cache_key = f"is_mfr_{hash(url + title)}"
-        
-        # Check cache first
-        if cache_key in self._response_cache:
-            self.logger.info(f"Using cached result for {url}")
-            return self._response_cache[cache_key]
-        
-        # Prepare a truncated version of content to avoid token limits
-        truncated_content = content[:5000] if content else ""
-        
         try:
             # Construct the prompt
             prompt = f"""
-            You are analyzing a webpage to determine if it's a manufacturer page.
+            Analyze the metadata to determine if this is a manufacturer page.
             
             URL: {url}
             Title: {title}
             
-            Content excerpt:
-            {truncated_content}
+            Metadata:
+            {metadata}
             
-            A manufacturer page is one that:
-            1. Represents a company that makes physical products
-            2. Contains information about product categories or specific products
-            3. Is NOT a retailer, distributor, or marketplace that primarily sells products made by others
-            
-            Based on the URL, title, and content, is this a manufacturer page? 
-            Answer with only YES or NO.
+            Return a JSON object with the following structure:
+            {{
+                "page_type": "manufacturer" | "non_manufacturer" | "inconclusive"
+            }}
             """
             
             # Call the Claude API directly
@@ -831,7 +839,7 @@ class ClaudeAnalyzer:
                 "model": self.model,
                 "max_tokens": 100,
                 "temperature": 0,
-                "system": "You are a helpful AI assistant that analyzes web pages to identify manufacturer information.",
+                "system": "You are a helpful AI assistant that analyzes web page metadata.",
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
@@ -847,24 +855,127 @@ class ClaudeAnalyzer:
             response_data = response.json()
             
             # Process the response
-            result_text = response_data['content'][0]['text'].strip().upper()
-            is_manufacturer = "YES" in result_text
+            result_text = response_data['content'][0]['text']
             
-            # Cache the result
-            self._response_cache[cache_key] = is_manufacturer
+            # Extract JSON from the response
+            json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # Try to find JSON without code blocks
+                json_match = re.search(r'({.*})', result_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = result_text
             
-            self.logger.info(f"Claude analysis for {url}: {'Manufacturer page' if is_manufacturer else 'Not a manufacturer page'}")
-            return is_manufacturer
+            # Parse the JSON
+            try:
+                result = json.loads(json_str)
+                
+                # Validate the structure
+                if 'page_type' not in result:
+                    result = {'page_type': 'inconclusive'}
+                
+                return result
+                
+            except json.JSONDecodeError:
+                self.logger.error(f"Failed to parse JSON from Claude response for {url}")
+                return {'page_type': 'inconclusive'}
             
         except Exception as e:
-            self.logger.error(f"Error in Claude analysis for {url}: {str(e)}")
-            return False
+            self.logger.error(f"Error in metadata analysis for {url}: {str(e)}")
+            return {'page_type': 'inconclusive'}
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
           retry=retry_if_exception_type(RequestException))
-    def extract_manufacturers(self, url: str, title: str, content: str) -> Dict[str, Any]:
+    def analyze_links(self, url: str, title: str, links_data: str) -> Dict[str, Any]:
         """
-        Extract manufacturer and category information from page content.
+        Analyze links to determine if a page is a manufacturer page.
+        
+        Args:
+            url: URL of the page
+            title: Page title
+            links_data: Links data string
+            
+        Returns:
+            Dictionary with analysis result
+        """
+        try:
+            # Construct the prompt
+            prompt = f"""
+            Analyze the links to determine if this is a manufacturer page.
+            
+            URL: {url}
+            Title: {title}
+            
+            Links Data:
+            {links_data}
+            
+            Return a JSON object with the following structure:
+            {{
+                "page_type": "manufacturer" | "non_manufacturer" | "inconclusive"
+            }}
+            """
+            
+            # Call the Claude API directly
+            payload = {
+                "model": self.model,
+                "max_tokens": 100,
+                "temperature": 0,
+                "system": "You are a helpful AI assistant that analyzes web page links.",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            
+            response = requests.post(
+                self.api_base_url,
+                headers=self.headers,
+                json=payload
+            )
+            
+            response.raise_for_status()
+            response_data = response.json()
+            
+            # Process the response
+            result_text = response_data['content'][0]['text']
+            
+            # Extract JSON from the response
+            json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # Try to find JSON without code blocks
+                json_match = re.search(r'({.*})', result_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = result_text
+            
+            # Parse the JSON
+            try:
+                result = json.loads(json_str)
+                
+                # Validate the structure
+                if 'page_type' not in result:
+                    result = {'page_type': 'inconclusive'}
+                
+                return result
+                
+            except json.JSONDecodeError:
+                self.logger.error(f"Failed to parse JSON from Claude response for {url}")
+                return {'page_type': 'inconclusive'}
+            
+        except Exception as e:
+            self.logger.error(f"Error in links analysis for {url}: {str(e)}")
+            return {'page_type': 'inconclusive'}
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
+          retry=retry_if_exception_type(RequestException))
+    def analyze_content(self, url: str, title: str, content: str) -> Dict[str, Any]:
+        """
+        Analyze content to determine if a page is a manufacturer page.
         
         Args:
             url: URL of the page
@@ -872,35 +983,107 @@ class ClaudeAnalyzer:
             content: Page text content
             
         Returns:
-            Dictionary with extracted manufacturer information
+            Dictionary with analysis result
         """
-        # Create a cache key
-        cache_key = f"extract_{hash(url + title)}"
-        
-        # Check cache first
-        if cache_key in self._response_cache:
-            self.logger.info(f"Using cached extraction for {url}")
-            return self._response_cache[cache_key]
-        
-        # Prepare a truncated version of content to avoid token limits
-        truncated_content = content[:10000] if content else ""
-        
         try:
             # Construct the prompt
             prompt = f"""
-            You are analyzing a webpage to extract manufacturer and product category information.
+            Analyze the content to determine if this is a manufacturer page.
             
             URL: {url}
             Title: {title}
             
-            Content excerpt:
-            {truncated_content}
+            Content:
+            {content}
             
-            Extract the following information:
-            1. Manufacturer name(s)
-            2. Product categories for each manufacturer
+            Return a JSON object with the following structure:
+            {{
+                "page_type": "manufacturer" | "non_manufacturer" | "inconclusive"
+            }}
+            """
             
-            Format your response as JSON:
+            # Call the Claude API directly
+            payload = {
+                "model": self.sonnet_model,
+                "max_tokens": 1000,
+                "temperature": 0,
+                "system": "You are a helpful AI assistant that analyzes web page content.",
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            
+            response = requests.post(
+                self.api_base_url,
+                headers=self.headers,
+                json=payload
+            )
+            
+            response.raise_for_status()
+            response_data = response.json()
+            
+            # Process the response
+            result_text = response_data['content'][0]['text']
+            
+            # Extract JSON from the response
+            json_match = re.search(r'```json\s*(.*?)\s*```', result_text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # Try to find JSON without code blocks
+                json_match = re.search(r'({.*})', result_text, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = result_text
+            
+            # Parse the JSON
+            try:
+                result = json.loads(json_str)
+                
+                # Validate the structure
+                if 'page_type' not in result:
+                    result = {'page_type': 'inconclusive'}
+                
+                return result
+                
+            except json.JSONDecodeError:
+                self.logger.error(f"Failed to parse JSON from Claude response for {url}")
+                return {'page_type': 'inconclusive'}
+            
+        except Exception as e:
+            self.logger.error(f"Error in content analysis for {url}: {str(e)}")
+            return {'page_type': 'inconclusive'}
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
+          retry=retry_if_exception_type(RequestException))
+    def extract_manufacturer_data(self, url: str, title: str, content: str, page_type: str) -> Dict[str, Any]:
+        """
+        Extract manufacturer data from a page.
+        
+        Args:
+            url: URL of the page
+            title: Page title
+            content: Page text content
+            page_type: Type of page (brand_page, brand_category_page, etc.)
+            
+        Returns:
+            Dictionary with extracted manufacturer data
+        """
+        try:
+            # Construct the prompt
+            prompt = f"""
+            Extract manufacturer data from this page.
+            
+            URL: {url}
+            Title: {title}
+            
+            Content:
+            {content}
+            
+            Page Type: {page_type}
+            
+            Return a JSON object with the following structure:
             {{
                 "manufacturers": [
                     {{
@@ -910,13 +1093,11 @@ class ClaudeAnalyzer:
                     ...
                 ]
             }}
-            
-            If no manufacturers are found, return an empty array.
             """
             
             # Call the Claude API directly
             payload = {
-                "model": self.sonnet_model,  # Use the more powerful model for extraction
+                "model": self.sonnet_model,
                 "max_tokens": 1000,
                 "temperature": 0,
                 "system": "You are a helpful AI assistant that extracts structured manufacturer and product category information from web pages.",
@@ -957,10 +1138,6 @@ class ClaudeAnalyzer:
                 if 'manufacturers' not in result:
                     result = {'manufacturers': []}
                 
-                # Cache the result
-                self._response_cache[cache_key] = result
-                
-                self.logger.info(f"Extracted {len(result['manufacturers'])} manufacturers from {url}")
                 return result
                 
             except json.JSONDecodeError:
@@ -968,13 +1145,12 @@ class ClaudeAnalyzer:
                 return {'manufacturers': []}
             
         except Exception as e:
-            self.logger.error(f"Error in Claude extraction for {url}: {str(e)}")
+            self.logger.error(f"Error extracting manufacturer data from {url}: {str(e)}")
             return {'manufacturers': []}
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10),
           retry=retry_if_exception_type(RequestException))
-    def translate_categories_batch(self, categories_text: str, manufacturer_name: str, 
-                                  target_lang: str, response_format: str = 'delimited') -> List[str]:
+    def translate_categories(self, categories_text: str, manufacturer_name: str, target_lang: str) -> List[str]:
         """
         Translate a batch of categories to a target language.
         
@@ -982,7 +1158,6 @@ class ClaudeAnalyzer:
             categories_text: Newline-separated list of categories
             manufacturer_name: Manufacturer name to preserve in translation
             target_lang: Target language code
-            response_format: Format of the response ('delimited' or 'json')
             
         Returns:
             List of translated categories
@@ -1591,30 +1766,34 @@ class ConfigManager:
     
     def get_seed_urls(self) -> List[str]:
         """
-        Get seed URLs for crawling.
+        Get seed URLs from configuration.
         
         Returns:
             List of seed URLs
         """
-        # Check in various possible config locations
         seed_urls = []
         
-        # First check in scraper section
-        if 'scraper' in self.config and 'seed_urls' in self.config['scraper']:
-            seed_urls = self.config['scraper']['seed_urls']
-            self.logger.debug(f"Found seed URLs in scraper section: {seed_urls}")
-        
-        # Then check in competitor_scraper section
-        elif 'competitor_scraper' in self.config and 'seed_urls' in self.config['competitor_scraper']:
-            seed_urls = self.config['competitor_scraper']['seed_urls']
-            self.logger.debug(f"Found seed URLs in competitor_scraper section: {seed_urls}")
-        
-        # Finally check in crawling section
-        elif 'crawling' in self.config and 'seed_urls' in self.config['crawling']:
-            seed_urls = self.config['crawling']['seed_urls']
-            self.logger.debug(f"Found seed URLs in crawling section: {seed_urls}")
+        # Check for seed_urls in the crawling section
+        if 'crawling' in self.config:
+            # First check for 'seed_urls'
+            if 'seed_urls' in self.config['crawling']:
+                seed_urls = self.config['crawling']['seed_urls']
+                self.logger.debug(f"Found seed URLs in crawling.seed_urls: {seed_urls}")
+            # Then check for 'initial_urls' (for backward compatibility)
+            elif 'initial_urls' in self.config['crawling']:
+                seed_urls = self.config['crawling']['initial_urls']
+                self.logger.debug(f"Found seed URLs in crawling.initial_urls: {seed_urls}")
         
         return seed_urls
+    
+    def get_domain_validation_mode(self) -> str:
+        """
+        Get the domain validation mode.
+        
+        Returns:
+            Domain validation mode ('strict' or 'relaxed')
+        """
+        return self.config.get('crawling', {}).get('domain_validation_mode', 'strict')
 
 
 class StatisticsManager:
@@ -2052,14 +2231,16 @@ class CompetitorScraper:
         self.content_extractor = ContentExtractor(user_agent, timeout, self.logger)
         
         # Initialize Claude analyzer
-        claude_api_key = self.config_manager.get_claude_api_key()
-        model, sonnet_model = self.config_manager.get_claude_models()
-        self.claude_analyzer = ClaudeAnalyzer(claude_api_key, model, sonnet_model, self.logger)
+        self.claude_analyzer = ClaudeAnalyzer(config_path, self.logger)
         
         # Scraper settings
         self.max_urls_per_domain = self.config_manager.get_max_urls_per_domain()
         self.max_depth = self.config_manager.get_max_depth()
         self.target_languages = self.config_manager.get_target_languages()
+        
+        # Domain validation settings
+        self.domain_validation_mode = self.config_manager.get_domain_validation_mode()
+        self.allowed_domains = set()
         
         # State variables
         self.running = False
@@ -2122,7 +2303,7 @@ class CompetitorScraper:
             url = self._normalize_url(url)
             
             # Calculate priority
-            priority = UrlPriority.calculate_seed_priority(url)
+            priority = UrlPriority.calculate_priority(url, 0)
             
             # Add to queue
             self.url_queue.push(url, 0, priority)
@@ -2132,11 +2313,14 @@ class CompetitorScraper:
             domain = parsed_url.netloc
             self.db_handler.add_url_to_queue(url, priority, domain)
             
+            # Add domain to allowed domains
+            self.add_allowed_domain(domain)
+            
             self.logger.info(f"Added seed URL: {url} with priority {priority}")
     
     def _normalize_url(self, url: str) -> str:
         """
-        Normalize a URL.
+        Normalize a URL to ensure consistent format.
         
         Args:
             url: URL to normalize
@@ -2144,29 +2328,139 @@ class CompetitorScraper:
         Returns:
             Normalized URL
         """
-        # Add scheme if missing
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
+        if not url:
+            return ""
+            
+        try:
+            # Parse the URL
+            parsed = urlparse(url)
+            
+            # Skip non-HTTP URLs
+            if parsed.scheme not in ('http', 'https'):
+                return ""
+            
+            # Rebuild the URL with normalized components
+            normalized = ParseResult(
+                scheme=parsed.scheme.lower(),
+                netloc=parsed.netloc.lower(),
+                path=parsed.path,
+                params=parsed.params,
+                query=parsed.query,
+                fragment=""  # Remove fragments
+            ).geturl()
+            
+            # Remove trailing slash for consistency
+            if normalized.endswith('/'):
+                normalized = normalized[:-1]
+                
+            # Remove common tracking parameters
+            if parsed.query:
+                query_params = parse_qs(parsed.query)
+                # List of common tracking parameters to remove
+                tracking_params = ['utm_source', 'utm_medium', 'utm_campaign', 
+                                 'utm_term', 'utm_content', 'fbclid', 'gclid']
+                
+                # Remove tracking parameters
+                filtered_params = {k: v for k, v in query_params.items() 
+                                if k.lower() not in tracking_params}
+                
+                # Rebuild URL without tracking parameters if any were removed
+                if len(filtered_params) != len(query_params):
+                    query_string = urlencode(filtered_params, doseq=True)
+                    normalized = ParseResult(
+                        scheme=parsed.scheme.lower(),
+                        netloc=parsed.netloc.lower(),
+                        path=parsed.path,
+                        params=parsed.params,
+                        query=query_string,
+                        fragment=""
+                    ).geturl()
+                    
+                    # Remove trailing slash again if needed
+                    if normalized.endswith('/'):
+                        normalized = normalized[:-1]
+            
+            self.logger.debug(f"Normalized URL: {url} -> {normalized}")
+            return normalized
+            
+        except Exception as e:
+            self.logger.error(f"Error normalizing URL {url}: {str(e)}")
+            return url
+    
+    def add_allowed_domain(self, domain: str) -> None:
+        """
+        Add a domain to the list of allowed domains.
         
-        # Parse and reconstruct to normalize
-        parsed = urlparse(url)
+        Args:
+            domain: Domain to add (without protocol, e.g., 'example.com')
+        """
+        if domain:
+            # Remove www. prefix if present
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            
+            self.allowed_domains.add(domain.lower())
+            self.logger.info(f"Added allowed domain: {domain}")
+    
+    def is_allowed_domain(self, url: str) -> bool:
+        """
+        Check if a URL belongs to an allowed domain.
         
-        # Remove trailing slash from path
-        path = parsed.path
-        if path.endswith('/') and len(path) > 1:
-            path = path[:-1]
+        Args:
+            url: URL to check
+            
+        Returns:
+            True if the URL belongs to an allowed domain, False otherwise
+        """
+        if not self.allowed_domains:
+            # If no allowed domains are set, allow all domains
+            return True
+            
+        try:
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc.lower()
+            
+            # In strict mode, domain must match exactly
+            if self.domain_validation_mode == "strict":
+                return domain in self.allowed_domains
+            
+            # In relaxed mode, allow subdomains
+            elif self.domain_validation_mode == "relaxed":
+                for allowed_domain in self.allowed_domains:
+                    # Check if domain is a subdomain of an allowed domain
+                    if domain == allowed_domain or domain.endswith('.' + allowed_domain):
+                        return True
+                return False
+            
+            # Default to strict mode
+            return domain in self.allowed_domains
+            
+        except Exception as e:
+            self.logger.error(f"Error checking domain for URL {url}: {str(e)}")
+            return False
+    
+    def extract_domain_from_url(self, url: str) -> str:
+        """
+        Extract the domain from a URL.
         
-        # Reconstruct URL
-        normalized = ParseResult(
-            scheme=parsed.scheme,
-            netloc=parsed.netloc,
-            path=path,
-            params=parsed.params,
-            query=parsed.query,
-            fragment=''  # Remove fragments
-        ).geturl()
-        
-        return normalized
+        Args:
+            url: URL to extract domain from
+            
+        Returns:
+            Domain as string (without protocol)
+        """
+        try:
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc.lower()
+            
+            # Remove www. prefix if present
+            if domain.startswith('www.'):
+                domain = domain[4:]
+                
+            return domain
+        except Exception as e:
+            self.logger.error(f"Error extracting domain from URL {url}: {str(e)}")
+            return ""
     
     def start(self, seed_urls: List[str] = None, max_pages: int = None) -> None:
         """
@@ -2187,6 +2481,14 @@ class CompetitorScraper:
         
         # Add seed URLs if provided
         if seed_urls:
+            self.logger.info(f"Adding {len(seed_urls)} seed URLs")
+            for url in seed_urls:
+                # Extract domain from seed URL
+                domain = self.extract_domain_from_url(url)
+                if domain:
+                    self.add_allowed_domain(domain)
+            
+            # Add the seed URLs to the queue
             self.add_seed_urls(seed_urls)
         
         # Add seed URLs from config if queue is empty
@@ -2196,16 +2498,36 @@ class CompetitorScraper:
             self.logger.debug(f"Found seed URLs in config: {config_seed_urls}")
             if config_seed_urls:
                 self.logger.info(f"Adding {len(config_seed_urls)} seed URLs from config")
+                for url in config_seed_urls:
+                    # Extract domain from seed URL
+                    domain = self.extract_domain_from_url(url)
+                    if domain:
+                        self.add_allowed_domain(domain)
+                
+                # Add the seed URLs to the queue
                 self.add_seed_urls(config_seed_urls)
             else:
                 self.logger.warning("No seed URLs provided or found in config")
                 self.stop()
                 return
         
+        # Log domain validation settings
+        if self.allowed_domains:
+            self.logger.info(f"Domain validation mode: {self.domain_validation_mode}")
+            self.logger.info(f"Allowed domains: {', '.join(self.allowed_domains)}")
+        else:
+            self.logger.warning("No allowed domains set, crawling will not be domain-restricted")
+        
+        # Debug: Show initial queue state
+        self.logger.info(f"Initial queue size: {len(self.url_queue)}")
+        
         # Main scraping loop
         try:
             pages_processed = 0
             while self.running and not self.url_queue.is_empty():
+                # Debug: Show queue state at the start of each iteration
+                self.logger.debug(f"Queue size before processing: {len(self.url_queue)}")
+                
                 # Check for global shutdown signal
                 if SHUTDOWN_FLAG:
                     self.logger.info("Shutdown signal received, stopping scraper")
@@ -2224,30 +2546,49 @@ class CompetitorScraper:
                     break
                 
                 # Get next URL from queue
-                url_info = self.url_queue.pop()
-                if not url_info:
-                    self.logger.info("URL queue is empty")
-                    break
-                
-                url, depth, _ = url_info
-                
-                # Skip if already visited
-                if url in self.visited_urls:
+                try:
+                    url_info = self.url_queue.pop()
+                    if not url_info or len(url_info) < 2:
+                        self.logger.warning(f"Invalid URL info from queue: {url_info}")
+                        continue
+                    
+                    url, depth, _ = url_info
+                    self.logger.debug(f"Popped URL from queue: {url} (depth={depth})")
+                    
+                    # Skip if already visited
+                    if url in self.visited_urls:
+                        self.logger.debug(f"Skipping already visited URL: {url}")
+                        continue
+                    
+                    # Check if URL is in an allowed domain
+                    if not self.is_allowed_domain(url):
+                        self.logger.debug(f"Skipping URL {url} due to domain validation")
+                        continue
+                    
+                    # Process URL
+                    self._process_url(url, depth)
+                    
+                    # Increment pages processed counter
+                    pages_processed += 1
+                    
+                    # Debug: Show queue state after processing
+                    self.logger.debug(f"Queue size after processing: {len(self.url_queue)}")
+                    self.logger.debug(f"Visited URLs count: {len(self.visited_urls)}")
+                    
+                except IndexError:
+                    self.logger.warning("URL queue returned empty result")
+                    if self.url_queue.is_empty():
+                        self.logger.info("URL queue is now empty")
+                        break
                     continue
-                
-                # Process URL
-                self._process_url(url, depth)
-                
-                # Increment pages processed counter
-                pages_processed += 1
-                
-                # Add to visited URLs
-                self.visited_urls.add(url)
+                except Exception as e:
+                    self.logger.error(f"Error processing URL from queue: {str(e)}")
+                    continue
                 
                 # Small delay to avoid overwhelming servers
                 time.sleep(0.5)
             
-            self.logger.info("Scraper finished")
+            self.logger.info(f"Scraper finished. Processed {pages_processed} pages.")
             
         except Exception as e:
             self.logger.error(f"Error in scraper main loop: {str(e)}")
@@ -2301,11 +2642,6 @@ class CompetitorScraper:
         try:
             self.logger.info(f"Processing URL: {url} (depth={depth})")
             
-            # Skip if URL has already been processed
-            if url in self.visited_urls:
-                self.logger.debug(f"URL already processed: {url}")
-                return
-            
             # Extract domain
             parsed_url = urlparse(url)
             domain = parsed_url.netloc
@@ -2322,20 +2658,27 @@ class CompetitorScraper:
             
             # Fetch content
             try:
-                html_content = self.content_extractor.fetch_url(url)
-                if not html_content:
+                result = self.content_extractor.fetch_url(url)
+                if not result:
                     self.logger.warning(f"No content retrieved from URL: {url}")
                     self.db_handler.mark_url_completed(url, success=False)
+                    # Add to visited URLs even if fetch failed
+                    self.visited_urls.add(url)
                     return
+                    
+                title, text_content, metadata = result
+                
+                # Check if we have HTML content in metadata
+                if 'html_content' not in metadata:
+                    self.logger.warning(f"No HTML content in metadata for URL: {url}")
+                    metadata['html_content'] = "<html></html>"  # Empty HTML as fallback
+                
             except Exception as e:
                 self.logger.error(f"Error fetching URL {url}: {str(e)}")
                 self.db_handler.mark_url_completed(url, success=False)
+                # Add to visited URLs even if fetch failed
+                self.visited_urls.add(url)
                 return
-            
-            # Extract text and metadata
-            title = html_content[0]
-            text_content = html_content[1]
-            metadata = html_content[2]
             
             # Analyze with Claude to detect manufacturer page
             is_manufacturer = self._analyze_manufacturer_page(url, title, text_content)
@@ -2345,7 +2688,18 @@ class CompetitorScraper:
             
             # Extract links for further crawling
             if depth < self.max_depth:
-                self._extract_and_queue_links(url, text_content, depth)
+                # Debug: Show queue size before extracting links
+                self.logger.debug(f"Queue size before extracting links: {len(self.url_queue)}")
+                
+                # Use HTML content from metadata for link extraction
+                html_content = metadata.get('html_content', '')
+                self.logger.debug(f"HTML content length for link extraction: {len(html_content)}")
+                
+                # Extract and queue links
+                self._extract_and_queue_links(url, html_content, depth)
+                
+                # Debug: Show queue size after extracting links
+                self.logger.debug(f"Queue size after extracting links: {len(self.url_queue)}")
             
             # Mark URL as completed
             self.db_handler.mark_url_completed(url, success=True)
@@ -2359,9 +2713,12 @@ class CompetitorScraper:
             
         except Exception as e:
             self.logger.error(f"Error processing URL {url}: {str(e)}")
+            self.logger.error(f"Exception details: {traceback.format_exc()}")
             self.db_handler.mark_url_completed(url, success=False)
             self.stats_manager.log_error(url, "processing_error", str(e), self.stats_manager.session_id)
             self.stats_manager.log_url_processed(url, False, time.time() - start_time, self.stats_manager.session_id)
+            # Add to visited URLs even if processing failed
+            self.visited_urls.add(url)
     
     def _analyze_manufacturer_page(self, url: str, title: str, content: str) -> bool:
         """
@@ -2378,17 +2735,48 @@ class CompetitorScraper:
         try:
             start_time = time.time()
             
-            # Use Claude to analyze the page
-            is_manufacturer = self.claude_analyzer.is_manufacturer_page(url, title, content)
+            # First do a quick keyword check to discard obviously non-manufacturer pages
+            if not self._quick_manufacturer_check(title, content):
+                self.logger.debug(f"Quick check determined {url} is not a manufacturer page")
+                return False
             
-            if is_manufacturer:
+            # Extract metadata for analysis
+            metadata = self._extract_metadata(title, content)
+            
+            # Use the new four-step analysis workflow
+            # Step 1: Keyword filtering (already done above)
+            
+            # Step 2: Metadata analysis
+            metadata_result = self.claude_analyzer.analyze_metadata(url, title, metadata)
+            if metadata_result.get('page_type') == 'brand_page' or metadata_result.get('page_type') == 'brand_category_page':
                 # Log AI request
                 duration = time.time() - start_time
-                self.stats_manager.log_ai_request('manufacturer_detection', duration, session_id=self.stats_manager.session_id)
+                self.stats_manager.log_ai_request('manufacturer_detection_metadata', duration, session_id=self.stats_manager.session_id)
+                return True
+            elif metadata_result.get('page_type') == 'other':
+                return False
                 
-                return is_manufacturer
+            # Step 3: Link analysis
+            links_data = self._extract_links_data(url, content)
+            links_result = self.claude_analyzer.analyze_links(url, title, links_data)
+            if links_result.get('page_type') == 'brand_page' or links_result.get('page_type') == 'brand_category_page':
+                # Log AI request
+                duration = time.time() - start_time
+                self.stats_manager.log_ai_request('manufacturer_detection_links', duration, session_id=self.stats_manager.session_id)
+                return True
+            elif links_result.get('page_type') == 'other':
+                return False
+                
+            # Step 4: Content analysis (truncated to 3000 chars)
+            truncated_content = content[:3000]
+            content_result = self.claude_analyzer.analyze_content(url, title, truncated_content)
+            is_manufacturer = content_result.get('page_type') == 'brand_page' or content_result.get('page_type') == 'brand_category_page'
             
-            return False
+            # Log AI request
+            duration = time.time() - start_time
+            self.stats_manager.log_ai_request('manufacturer_detection_content', duration, session_id=self.stats_manager.session_id)
+            
+            return is_manufacturer
             
         except Exception as e:
             self.logger.error(f"Error analyzing manufacturer page {url}: {str(e)}")
@@ -2448,45 +2836,106 @@ class CompetitorScraper:
         try:
             start_time = time.time()
             
-            # Use Claude to extract manufacturer information
-            result = self.claude_analyzer.extract_manufacturers(url, title, content)
+            # Determine page type using the new analyzer
+            metadata = self._extract_metadata(title, content)
+            links_data = self._extract_links_data(url, content)
+            truncated_content = content[:3000]
             
-            # Log AI request
-            duration = time.time() - start_time
-            self.stats_manager.log_ai_request('manufacturer_extraction', duration, session_id=self.stats_manager.session_id)
+            # Try each analysis method in sequence until we get a definitive result
+            page_type = None
             
-            # Process each manufacturer
-            for manufacturer in result.get('manufacturers', []):
-                manufacturer_name = manufacturer.get('name')
-                categories = manufacturer.get('categories', [])
+            # First try metadata analysis
+            metadata_result = self.claude_analyzer.analyze_metadata(url, title, metadata)
+            page_type = metadata_result.get('page_type')
+            
+            # If inconclusive, try link analysis
+            if not page_type or page_type == 'inconclusive':
+                links_result = self.claude_analyzer.analyze_links(url, title, links_data)
+                page_type = links_result.get('page_type')
+            
+            # If still inconclusive, try content analysis
+            if not page_type or page_type == 'inconclusive':
+                content_result = self.claude_analyzer.analyze_content(url, title, truncated_content)
+                page_type = content_result.get('page_type')
+            
+            # Extract manufacturer data based on page type
+            if page_type == 'brand_page' or page_type == 'brand_category_page':
+                result = self.claude_analyzer.extract_manufacturer_data(url, title, content, page_type)
                 
-                if not manufacturer_name:
-                    continue
+                # Log AI request
+                duration = time.time() - start_time
+                self.stats_manager.log_ai_request('manufacturer_extraction', duration, session_id=self.stats_manager.session_id)
                 
-                # Log manufacturer found
-                self.stats_manager.log_manufacturer_found(manufacturer_name, url, session_id=self.stats_manager.session_id)
-                
-                # Add manufacturer to database
-                manufacturer_id = self.db_handler.add_manufacturer(manufacturer_name, url)
-                
-                if not manufacturer_id:
-                    self.logger.error(f"Failed to add manufacturer {manufacturer_name} to database")
-                    continue
-                
-                # Log categories found
-                if categories:
-                    self.stats_manager.log_categories_found(manufacturer_name, categories, url, session_id=self.stats_manager.session_id)
+                # Process each manufacturer
+                for manufacturer in result.get('manufacturers', []):
+                    manufacturer_name = manufacturer.get('name')
+                    categories = manufacturer.get('categories', [])
                     
-                    # Add categories to database
-                    self.db_handler.add_categories(manufacturer_id, categories)
+                    if not manufacturer_name:
+                        continue
                     
-                    # Translate categories if needed
-                    if self.target_languages and categories:
-                        self._translate_categories(manufacturer_id, manufacturer_name, categories)
+                    # Log manufacturer found
+                    self.stats_manager.log_manufacturer_found(manufacturer_name, url, session_id=self.stats_manager.session_id)
+                    
+                    # Add manufacturer to database
+                    manufacturer_id = self.db_handler.add_manufacturer(manufacturer_name, url)
+                    
+                    if not manufacturer_id:
+                        self.logger.error(f"Failed to add manufacturer {manufacturer_name} to database")
+                        continue
+                    
+                    # Log categories found
+                    if categories:
+                        self.stats_manager.log_categories_found(manufacturer_name, categories, url, session_id=self.stats_manager.session_id)
+                        
+                        # Add categories to database
+                        self.db_handler.add_categories(manufacturer_id, categories)
+                        
+                        # Translate categories if needed
+                        if self.target_languages and categories:
+                            self._translate_categories(manufacturer_id, manufacturer_name, categories)
             
         except Exception as e:
             self.logger.error(f"Error extracting manufacturer info from {url}: {str(e)}")
             self.stats_manager.log_error(url, "extraction_error", str(e), self.stats_manager.session_id)
+    
+    def _extract_metadata(self, title: str, content: str) -> str:
+        """
+        Extract metadata from page title and content.
+        
+        Args:
+            title: Page title
+            content: Page text content
+            
+        Returns:
+            Extracted metadata as string
+        """
+        # Extract first 500 characters as a sample
+        content_sample = content[:500]
+        
+        # Extract headings and important text
+        metadata = f"Title: {title}\n"
+        
+        # Add a sample of the content
+        metadata += f"Content Sample: {content_sample}\n"
+        
+        return metadata
+    
+    def _extract_links_data(self, url: str, content: str) -> str:
+        """
+        Extract links data from page content.
+        
+        Args:
+            url: URL of the page
+            content: Page text content
+            
+        Returns:
+            Extracted links data as string
+        """
+        # This is a simplified version - in a real implementation,
+        # we would parse the HTML and extract actual links
+        # For now, we'll just return a placeholder
+        return "Links data would be extracted here"
     
     def _translate_categories(self, manufacturer_id: int, manufacturer_name: str, categories: List[str]) -> None:
         """
@@ -2514,8 +2963,8 @@ class CompetitorScraper:
                 
                 start_time = time.time()
                 
-                # Translate categories
-                translated_categories = self.claude_analyzer.translate_categories_batch(
+                # Translate categories using the new API
+                translated_categories = self.claude_analyzer.translate_categories(
                     categories_text, manufacturer_name, lang
                 )
                 
@@ -2533,67 +2982,7 @@ class CompetitorScraper:
             
         except Exception as e:
             self.logger.error(f"Error translating categories for {manufacturer_name}: {str(e)}")
-            self.stats_manager.log_error(url, "translation_error", str(e), self.stats_manager.session_id)
-    
-    def _extract_and_queue_links(self, url: str, html_content: str, depth: int) -> None:
-        """
-        Extract links from HTML content and add them to the queue.
-        
-        Args:
-            url: Source URL
-            html_content: HTML content
-            depth: Current crawl depth
-        """
-        try:
-            # Parse the source URL
-            parsed_source = urlparse(url)
-            base_url = f"{parsed_source.scheme}://{parsed_source.netloc}"
-            
-            # Parse HTML content
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Extract links
-            links = {}
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
-                # Skip empty or javascript links
-                if not href or href.startswith('javascript:') or href == '#':
-                    continue
-                
-                # Resolve relative URLs
-                full_url = urljoin(base_url, href)
-                
-                # Get the anchor text
-                text = a_tag.get_text().strip()
-                if not text and a_tag.find('img'):
-                    # Use alt text for image links
-                    img = a_tag.find('img')
-                    text = img.get('alt', '') if img else ''
-                
-                links[full_url] = text
-            
-            # Process each link
-            for link in links:
-                # Skip if already visited
-                if link in self.visited_urls:
-                    continue
-                
-                # Calculate priority
-                priority = UrlPriority.calculate_priority(link, depth + 1)
-                
-                # Add to queue
-                self.url_queue.push(link, depth + 1, priority)
-                
-                # Add to database
-                parsed_link = urlparse(link)
-                domain = parsed_link.netloc
-                self.db_handler.add_url_to_queue(link, priority, domain)
-            
-            self.logger.debug(f"Extracted and queued {len(links)} links from {url}")
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting links from {url}: {str(e)}")
-            self.stats_manager.log_error(url, "link_extraction_error", str(e), self.stats_manager.session_id)
+            self.stats_manager.log_error("", "translation_error", str(e), self.stats_manager.session_id)
     
     def get_stats(self) -> Dict[str, Any]:
         """

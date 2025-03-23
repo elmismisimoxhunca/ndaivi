@@ -58,25 +58,35 @@ ai_apis:
     model: "claude-3-haiku-20240307"
     sonnet_model: "claude-3-7-sonnet-20250219"
 
+# Claude analyzer configuration
+claude_analyzer:
+  api_key: "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"
+  api_base_url: "https://api.anthropic.com/v1/messages"
+  model: "claude-3-opus-20240229"
+  enable_cache: true
+  cache_ttl: 86400
+  cache_expiration_days: 7
+  max_tokens: 4000
+  temperature: 0.1
+  min_confidence_threshold: 0.7
+
 # Crawling settings
 crawling:
-  max_depth: 10  # Increased depth to ensure more comprehensive crawling
-  delay_between_requests: 2  # seconds
+  max_depth: 3
+  delay_between_requests: 1.0
   max_pages_per_run: 0  # 0 means no limit, will crawl until no pages remain
   build_sitemap: true  # Enable sitemap building
   respect_robots_txt: false  # Temporarily disable robots.txt to test scraper
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+  request_timeout: 10
+  max_urls_per_domain: 100
+  domain_validation_mode: "strict"
+  seed_urls:
+    - "https://www.manualslib.com"
   initial_urls:
     - "https://www.manualslib.com"
-  # Maximum URLs to crawl per domain
-  max_urls_per_domain: 1
-  # Request timeout in seconds
-  request_timeout: 30
-  # Maximum number of retries for failed requests
   max_retries: 3
-  # Delay between retries in seconds
   retry_delay: 5
-  # Whether to follow external links
   follow_external_links: false
 
 # URL priority settings
@@ -114,21 +124,6 @@ content_extraction:
     - "aside"
   # Maximum links to extract per page
   max_links_per_page: 100
-
-# Claude analyzer settings
-claude_analyzer:
-  # Enable caching of Claude responses
-  enable_cache: true
-  # Cache expiration time in days
-  cache_expiration_days: 7
-  # Maximum tokens to use in requests
-  max_tokens: 4000
-  # Temperature for Claude API calls
-  temperature: 0.1
-  # Enable quick keyword pre-check before using Claude
-  enable_keyword_precheck: true
-  # Minimum confidence threshold for manufacturer detection
-  min_confidence_threshold: 0.7
 
 # Keywords for filtering
 keywords:
@@ -180,3 +175,113 @@ manufacturer_finder:
   
   # Delay between manufacturer processing in seconds
   processing_delay: 3
+
+# Prompt templates for Claude AI
+prompt_templates:
+  # System prompts
+  system:
+    manufacturer: "You are a specialized AI that analyzes web content to identify manufacturers and their product categories."
+    page_type: "You are a specialized AI that classifies pages as: brand pages, brand category pages, or other pages."
+    translation: "You are a specialized AI that translates product categories while preserving manufacturer names."
+    general: "You are an AI specialized in extracting structured information about manufacturers and their product categories from web content."
+
+  # Page analysis prompts
+  page_type_analysis: |
+    Analyze this content and determine if it's:
+    1. A brand/manufacturer page (contains multiple product categories)
+    2. A brand category page (specific product category within a brand)
+    3. Inconclusive (not enough information to make a determination)
+    4. Other (not related to product categories)
+
+    Content:
+    {content}
+
+    Rules:
+    - ONLY respond with one of: "brand_page", "brand_category_page", "inconclusive", or "other"
+    - "brand_page" = Main manufacturer page listing multiple product categories
+    - "brand_category_page" = Page for a specific product category within a brand
+    - "inconclusive" = Not enough information to determine the page type
+    - "other" = Any other type of page (about, contact, etc.)
+    - Use "inconclusive" when you need more context to make a determination
+    - Use "other" when you are confident it's not brand-related
+
+  # Extraction prompts
+  brand_page_extraction: |
+    Extract manufacturer name and product categories from this brand page.
+
+    Content:
+    {content}
+
+    Rules:
+    1. ONLY extract categories that are clearly product lines or model types
+    2. IGNORE:
+       - Individual product names/models
+       - Support/service categories
+       - Accessory categories
+    3. Format: Exactly as shown below, nothing else
+
+    # RESPONSE_START
+    MANUFACTURER: [name]
+    CATEGORIES:
+    - [category 1]
+    - [category 2]
+    WEBSITE: [official website if found]
+    # RESPONSE_END
+
+  category_page_extraction: |
+    Extract manufacturer name and product category from this category page.
+
+    Content:
+    {content}
+
+    Rules:
+    1. ONLY extract the main category name
+    2. IGNORE subcategories and individual products
+    3. Format: Exactly as shown below, nothing else
+
+    # RESPONSE_START
+    MANUFACTURER: [name]
+    CATEGORY: [category name]
+    WEBSITE: [official website if found]
+    # RESPONSE_END
+
+  # Keyword filtering
+  keyword_filter:
+    positive:
+      - manufacturer
+      - brand
+      - company
+      - product
+      - category
+      - catalog
+      - portfolio
+      - series
+      - model
+      - range
+      - lineup
+    negative:
+      - login
+      - register
+      - cart
+      - checkout
+      - account
+      - privacy
+      - terms
+      - contact
+      - about us
+      - faq
+      - support
+
+  # Translation prompt
+  translation_batch: |
+    Translate these product categories to {target_language}. 
+    Manufacturer name: {manufacturer_name}
+
+    Categories:
+    {categories}
+
+    Rules:
+    1. Keep "{manufacturer_name}" untranslated
+    2. Format each line: "[Original] → [Translation]"
+    3. Preserve technical terms and model numbers
+    4. Use industry-standard translations

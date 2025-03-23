@@ -8,7 +8,8 @@ import json
 import datetime
 import logging
 import signal
-from scraper.competitor_scraper_new import CompetitorScraper
+import traceback
+from scraper.competitor_scraper_new import CompetitorScraper, ConfigManager
 from manufacturer_website_finder import ManufacturerWebsiteFinder
 from utils import load_config, validate_database_consistency, export_database_to_json
 from database.schema import init_db, Category, Manufacturer, CrawlStatus, ScraperLog, ScraperSession
@@ -1233,6 +1234,7 @@ def interactive_mode(config):
                 args = command.split()[1:] if len(command.split()) > 1 else []
                 max_pages = None
                 background = False
+                debug = False
                 
                 # Parse arguments
                 i = 0
@@ -1247,6 +1249,9 @@ def interactive_mode(config):
                     elif args[i] == '--background':
                         background = True
                         i += 1
+                    elif args[i] == '--debug':
+                        debug = True
+                        i += 1
                     else:
                         print(f"Unrecognized argument: {args[i]}")
                         i += 1
@@ -1254,7 +1259,14 @@ def interactive_mode(config):
                 # Start the scraper
                 try:
                     print(f"Starting competitor scraper{' in background' if background else ''}...")
+                    
+                    # Initialize the scraper with just the config path
                     scraper = CompetitorScraper(config_path=config['config_path'])
+                    
+                    # Enable debug logging if requested
+                    if debug:
+                        scraper.logger.setLevel(logging.DEBUG)
+                        print("Debug mode enabled - detailed logs will be shown")
                     
                     if background:
                         # Fork a new process for background operation using double-fork pattern
@@ -1327,13 +1339,17 @@ def interactive_mode(config):
                             print(f"Error starting background process: {str(e)}")
                     else:
                         # Run in foreground
+                        print("Starting scraper in foreground mode...")
                         if max_pages:
+                            print(f"Maximum pages to process: {max_pages}")
                             scraper.start(max_pages=max_pages)
                         else:
                             scraper.start()
                         print("Scraper completed successfully")
                 except Exception as e:
                     print(f"Error starting scraper: {str(e)}")
+                    logger.error(f"Error starting scraper: {str(e)}")
+                    logger.error(traceback.format_exc())
                 
             elif command.startswith('find-websites'):
                 args = command.split()[1:] if len(command.split()) > 1 else []

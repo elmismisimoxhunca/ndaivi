@@ -1,1732 +1,1187 @@
 import os
 import re
-import yaml
-import requests
-import logging
-import json
 import time
+import json
+import yaml
+import hashlib
+import logging
+import requests
 from bs4 import BeautifulSoup
-from typing import List, Dict, Tuple
-from urllib.parse import urljoin
+from typing import Dict, List, Tuple, Optional, Any
+from datetime import datetime, timedelta
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
-# Define prompt templates directly in this file to avoid import issues
-MANUFACTURER_DETECTION_PROMPT = """
-URL: {url}
-Title: {title}
-
-Content: {truncated_content}
-
-Question: Is this webpage about a manufacturer or does it contain a list of manufacturers or brands?
-
-Respond using this exact format without any explanations:
-
-# RESPONSE_START
-IS_MANUFACTURER: yes  # Replace with 'no' if not a manufacturer page
-# RESPONSE_END
-"""
-
-# New prompt template for page type analysis
-PAGE_TYPE_ANALYSIS_PROMPT = """
-URL: {url}
-
-Content: {content}
-
-Question: Analyze this webpage and determine if it is one of these types:
-1. Brand page (main page about a manufacturer/brand with their products/categories)
-2. Brand category page (page dedicated to a specific product category from a brand)
-3. Inconclusive (not enough information to make a determination)
-4. Other (not related to brands/manufacturers or their product categories)
-
-Respond using this exact format without any explanations:
-
-# RESPONSE_START
-PAGE_TYPE: brand_page  # Replace with 'brand_category_page', 'inconclusive', or 'other' as appropriate
-# RESPONSE_END
-"""
-
-# New prompt template for category page info extraction
-CATEGORY_PAGE_INFO_PROMPT = """
-URL: {url}
-Title: {title}
-
-Content: {content}
-
-Question: Extract the manufacturer name and product category from this webpage.
-
-Respond using this exact format:
-
-# RESPONSE_START
-MANUFACTURER: [manufacturer name]
-CATEGORY: [category name]
-WEBSITE: [official website if found, or empty]
-# RESPONSE_END
-"""
-
-# System prompts
-MANUFACTURER_SYSTEM_PROMPT = """You are a specialized AI trained to analyze web content and identify manufacturers and their product categories.
-Your task is to analyze structured navigation data from web pages and identify manufacturers/brands ONLY."""
-
-CATEGORY_SYSTEM_PROMPT = """You are a specialized AI trained to analyze web content and identify product categories for a specific manufacturer.
-Your task is to analyze structured navigation data from web pages and identify product categories belonging to the manufacturer."""
-
-PAGE_TYPE_SYSTEM_PROMPT = """You are a specialized AI trained to analyze web content and classify pages related to manufacturers and their products.
-Your task is to determine if a page is:
-1. A brand page (main page about a manufacturer/brand)
-2. A brand category page (page for a specific product category from a brand)
-3. Inconclusive (not enough information to make a determination)
-4. Other (not related to brands/manufacturers)
-
-Be conservative in your classification - only classify as brand or category page if you're confident."""
-
-# General system prompt used for other tasks
-SYSTEM_PROMPT = """You are Claude, an AI assistant specialized in analyzing web content to extract structured information about manufacturers and their product categories.
-
-Your task is to carefully analyze the provided content and extract the requested information following the exact format specified in each instruction."""
-
-# Import other less essential prompt templates from the original file
-try:
-    from scraper.prompt_templates import (
-        MANUFACTURER_EXTRACTION_PROMPT, CATEGORY_EXTRACTION_PROMPT, 
-        CATEGORY_VALIDATION_PROMPT, TRANSLATION_PROMPT, TRANSLATION_BATCH_PROMPT, TRANSLATION_SYSTEM_PROMPT
-    )
-except ImportError:
-    # Fallback minimal templates if imports fail
-    MANUFACTURER_EXTRACTION_PROMPT = "Extract manufacturers from this content: {content}"
-    CATEGORY_EXTRACTION_PROMPT = "Extract categories for {manufacturer_name} from this content: {content}"
-    CATEGORY_VALIDATION_PROMPT = "Validate these categories for {manufacturer}: {categories}"
-    TRANSLATION_PROMPT = "Translate {category} to {target_language}"
-    TRANSLATION_BATCH_PROMPT = "Translate these categories to {target_language}:\n{categories_line_by_line}"
-    TRANSLATION_SYSTEM_PROMPT = "You are a specialized translator for product categories."
+# Import the new ConfigManager
+from utils.config_manager import ConfigManager
 
 class ClaudeAnalyzer:
-    """A class to handle Claude API interactions for analyzing web content"""
+    """
+    Claude Analyzer for web content.
     
-    def __init__(self, api_key, model, sonnet_model, logger=None):
-        """Initialize the Claude analyzer"""
-        self.api_key = api_key
-        self.model = model
-        self.sonnet_model = sonnet_model
-        # Fallback models for rate limiting scenarios
-        self.fallback_models = [
-            'claude-3-5-haiku-20241022',  # Primary model
-            'claude-3-haiku-20240307',    # Secondary model
-            'claude-3-5-sonnet-20241022'  # Tertiary model
-        ]
-        self.current_model_index = 0
-        
-        # Exponential backoff parameters
-        self.base_wait_time = 2  # Base wait time in seconds
-        self.max_retries = 5     # Maximum number of retries
-        self.max_wait_time = 60  # Maximum wait time in seconds
-        
-        self.logger = logger or logging.getLogger('claude_analyzer')
-        self.category_count = 0  # Track categories found in initial pass
-        
-        # API call tracking for rate limiting
-        self.api_calls = 0
-        self.last_model_switch_time = time.time()
-
-    def is_manufacturer_page(self, url, title, content):
-        """
-        Check if the page is a manufacturer page using Claude AI with exponential backoff and model fallback.
-        
-        This method analyzes the page content to determine if it's about manufacturers or contains
-        manufacturer information. It sends a structured prompt to the Claude API and parses the response.
-        
-        Process flow:
-        1. Truncate content to fit API limits (2000 chars)
-        2. Format prompt with page details using MANUFACTURER_DETECTION_PROMPT template
-        3. Make API request with exponential backoff and model fallback
-        4. Parse response to determine if it's a manufacturer page
-        
-        Args:
-            url: The URL of the page being analyzed
-            title: The title of the page
-            content: The text content extracted from the page
-            
-        Returns:
-            Boolean indicating if the page is about manufacturers
-        """
-        try:
-            self.logger.info(f"MANUFACTURER CHECK: Analyzing if {url} is a manufacturer page")
-            
-            # Prepare a truncated version of the content
-            original_length = len(content)
-            truncated_content = content[:2000] + "..." if original_length > 2000 else content
-            
-            if original_length > 2000:
-                self.logger.info(f"Content truncated from {original_length} to 2000 characters for API limits")
-            
-            # Format the prompt with the page details
-            self.logger.info("Formatting manufacturer detection prompt with page URL, title, and content")
-            prompt = MANUFACTURER_DETECTION_PROMPT.format(
-                url=url,
-                title=title,
-                truncated_content=truncated_content
-            )
-            
-            # Prepare headers for API call
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            self.logger.info("Preparing to send manufacturer detection request to Claude API")
-            
-            # Implement exponential backoff with model fallback
-            retry_count = 0
-            wait_time = self.base_wait_time
-            success = False
-            response = None
-            
-            while not success and retry_count < self.max_retries:
-                # Select current model based on fallback status
-                current_model = self.fallback_models[self.current_model_index]
-                
-                # Prepare payload with current model
-                payload = {
-                    "model": current_model,
-                    "max_tokens": 50,
-                    "system": MANUFACTURER_SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                
-                # Track API calls
-                self.api_calls += 1
-                
-                # Make API request
-                self.logger.info(f"Making Claude API call with model {current_model} (attempt {retry_count+1}/{self.max_retries})")
-                try:
-                    response = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=30  # Add timeout to prevent hanging
-                    )
-                    
-                    # Check for rate limiting or other errors
-                    if response.status_code == 200:
-                        # Success!
-                        success = True
-                    elif response.status_code == 429 or response.status_code >= 500:
-                        # Rate limit or server error - implement backoff and model fallback
-                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
-                        self.logger.warning(error_msg)
-                        
-                        # Try fallback model if available
-                        if self.current_model_index < len(self.fallback_models) - 1:
-                            self.current_model_index += 1
-                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
-                            # Reset wait time when switching models
-                            wait_time = self.base_wait_time
-                        else:
-                            # Wait with exponential backoff
-                            self.logger.info(f"Waiting {wait_time} seconds before retry")
-                            time.sleep(wait_time)
-                            # Increase wait time exponentially, but cap at max_wait_time
-                            wait_time = min(wait_time * 2, self.max_wait_time)
-                    else:
-                        # Other error - log and retry
-                        self.logger.error(f"API error: {response.status_code} - {response.text}")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, self.max_wait_time)
-                        
-                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
-                    # Network error - retry with backoff
-                    self.logger.error(f"Request error: {str(req_err)}")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, self.max_wait_time)
-                    
-                retry_count += 1
-                
-            # If we've exhausted all retries and still failed, return False
-            if not success:
-                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
-                return False
-                
-            # Periodically try to switch back to the primary model
-            current_time = time.time()
-            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
-                self.current_model_index = 0
-                self.last_model_switch_time = current_time
-                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
-
-            
-            # STEP 4: Process the successful response from Claude API
-            self.logger.info("STEP 4: Processing Claude API response for manufacturer detection")
-            response_data = response.json()
-            answer = response_data["content"][0]["text"].strip()
-            
-            # Log a preview of the response for debugging
-            answer_preview = answer[:100] + '...' if len(answer) > 100 else answer
-            self.logger.info(f"Claude API response preview: {answer_preview}")
-            
-            # STEP 5: Parse the response to extract the manufacturer detection result
-            self.logger.info("STEP 5: Parsing response to determine if it's a manufacturer page")
-            
-            # The response should follow the delimited format specified in the prompt template:
-            # # RESPONSE_START
-            # IS_MANUFACTURER: yes/no
-            # # RESPONSE_END
-            
-            # Extract content between RESPONSE_START and RESPONSE_END markers
-            response_pattern = r'# RESPONSE_START\s+(.*?)\s*# RESPONSE_END'
-            response_match = re.search(response_pattern, answer, re.DOTALL)
-            
-            if response_match:
-                # Successfully found the delimited response
-                content = response_match.group(1).strip()
-                self.logger.info(f"Found delimited response: {content}")
-                
-                # Extract the IS_MANUFACTURER field (yes/no)
-                is_mfr_match = re.search(r'IS_MANUFACTURER:\s*(yes|no)', content, re.IGNORECASE)
-                if is_mfr_match:
-                    # Successfully found the IS_MANUFACTURER field
-                    result_text = is_mfr_match.group(1).strip().lower()
-                    result = result_text == 'yes'
-                    
-                    # Log the final determination
-                    if result:
-                        self.logger.info(f"✅ {url} IS identified as a manufacturer page")
-                    else:
-                        self.logger.info(f"❌ {url} is NOT a manufacturer page")
-                    
-                    return result
-                else:
-                    # Missing the IS_MANUFACTURER field
-                    self.logger.error(f"Error: Missing IS_MANUFACTURER field in response: {content}")
-                    self.logger.info(f"❌ {url} defaulting to NOT a manufacturer page due to parsing error")
-                    return False
-            else:
-                # Missing the delimited response format
-                self.logger.error(f"Error: Response missing RESPONSE_START/END markers: {answer}")
-                self.logger.info(f"❌ {url} defaulting to NOT a manufacturer page due to formatting error")
-                return False
-            
-        except Exception as e:
-            self.logger.error(f"Error analyzing with Claude Haiku: {str(e)}")
-            return False
+    This class provides methods to analyze web content using the Claude API,
+    with a focus on identifying manufacturer pages and extracting structured data.
+    It implements a four-step analysis process to ensure accurate results while
+    minimizing API calls, resulting in a more efficient and cost-effective analysis process.
+    """
     
-    def _extract_structured_content(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
-        """Extract content from important HTML structures"""
-        structured_content = []
-        
-        # Extract navigation menus (often contain category hierarchies)
-        nav_elements = soup.find_all(['nav', 'ul', 'ol'])
-        for nav in nav_elements:
-            if len(nav.get_text(strip=True)) > 50:  # Only consider substantial nav elements
-                structured_content.append({
-                    'type': 'navigation',
-                    'content': nav.get_text(' ', strip=True)
-                })
-        
-        # Extract product listing sections
-        product_sections = soup.find_all(['div', 'section'], class_=lambda x: x and any(term in str(x).lower() for term in ['product', 'category', 'catalog']))
-        for section in product_sections:
-            structured_content.append({
-                'type': 'product_section',
-                'content': section.get_text(' ', strip=True)
-            })
-        
-        # Extract breadcrumb navigation
-        breadcrumbs = soup.find_all(['nav', 'div'], class_=lambda x: x and 'breadcrumb' in str(x).lower())
-        for crumb in breadcrumbs:
-            structured_content.append({
-                'type': 'breadcrumb',
-                'content': crumb.get_text(' > ', strip=True)
-            })
-        
-        return structured_content
-
-    def _extract_prioritized_content(self, soup: BeautifulSoup, max_chars: int = 3000) -> Tuple[str, List[str]]:
+    def __init__(self, config_path: str = None):
         """
-        Extract content from HTML, prioritizing structured data up to max_chars.
-        Returns tuple of (prioritized_content, remaining_chunks)
-        """
-        content_parts = []
-        remaining_chunks = []
-        current_length = 0
-        
-        # Priority 1: Navigation menus and category lists
-        nav_elements = soup.find_all(['nav', 'ul', 'ol'], 
-                                   class_=lambda x: x and any(term in str(x).lower() 
-                                   for term in ['category', 'product', 'menu', 'nav']))
-        for nav in nav_elements:
-            text = nav.get_text(' ', strip=True)
-            if len(text) > 50:  # Only substantial content
-                if current_length + len(text) <= max_chars:
-                    content_parts.append(text)
-                    current_length += len(text)
-                else:
-                    remaining_chunks.append(text)
-        
-        # Priority 2: Breadcrumbs and structured hierarchies
-        breadcrumbs = soup.find_all(['nav', 'div'], 
-                                  class_=lambda x: x and 'breadcrumb' in str(x).lower())
-        for crumb in breadcrumbs:
-            text = crumb.get_text(' > ', strip=True)
-            if current_length + len(text) <= max_chars:
-                content_parts.append(text)
-                current_length += len(text)
-            else:
-                remaining_chunks.append(text)
-        
-        # Priority 3: Product sections and category grids
-        product_sections = soup.find_all(['div', 'section'], 
-                                       class_=lambda x: x and any(term in str(x).lower() 
-                                       for term in ['product', 'category', 'catalog']))
-        for section in product_sections:
-            text = section.get_text(' ', strip=True)
-            if len(text) > 50:
-                if current_length + len(text) <= max_chars:
-                    content_parts.append(text)
-                    current_length += len(text)
-                else:
-                    remaining_chunks.append(text)
-        
-        # Priority 4: Tables with relevant headers
-        tables = soup.find_all('table')
-        for table in tables:
-            headers = table.find_all('th')
-            if any(term in str(headers).lower() for term in ['product', 'category', 'brand', 'manufacturer']):
-                text = table.get_text(' ', strip=True)
-                if current_length + len(text) <= max_chars:
-                    content_parts.append(text)
-                    current_length += len(text)
-                else:
-                    remaining_chunks.append(text)
-        
-        # If we still have room, add any remaining relevant text
-        if current_length < max_chars:
-            main_content = soup.find('main') or soup.find('article') or soup.find('div', class_='content')
-            if main_content:
-                text = main_content.get_text(' ', strip=True)
-                if current_length + len(text) <= max_chars:
-                    content_parts.append(text)
-                else:
-                    # Only take what we can fit
-                    space_left = max_chars - current_length
-                    content_parts.append(text[:space_left])
-                    remaining_chunks.append(text[space_left:])
-        
-        return ' '.join(content_parts), remaining_chunks
-
-    def _extract_manufacturers(self, url: str, content: str) -> List[Dict]:
-        """
-        Extract manufacturer information from structured content with exponential backoff and model fallback.
-        
-        This method processes the page content to extract detailed manufacturer information using Claude AI.
-        It implements a resilient approach with exponential backoff and model fallback to handle API limits.
-        
-        Process flow:
-        1. Format prompt with page content using MANUFACTURER_EXTRACTION_PROMPT template
-        2. Make API request with exponential backoff and model fallback
-        3. Parse the response to extract structured manufacturer data
-        4. Validate and format the extracted data
+        Initialize the Claude Analyzer.
         
         Args:
-            url: The URL of the page being analyzed
-            content: The structured content extracted from the page
-            
-        Returns:
-            List of dictionaries containing manufacturer information
+            config_path: Path to the configuration file
         """
-        try:
-            self.logger.info(f"MANUFACTURER EXTRACTION: Starting extraction from {url}")
-            
-            # STEP 1: Format the prompt with the structured content
-            self.logger.info("STEP 1: Formatting manufacturer extraction prompt")
-            content_preview = content[:100] + '...' if len(content) > 100 else content
-            self.logger.info(f"Content preview for extraction: {content_preview}")
-            prompt = MANUFACTURER_EXTRACTION_PROMPT.format(content=content)
-            
-            # Prepare headers for API call
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            self.logger.info("STEP 2: Preparing to send manufacturer extraction request to Claude API")
-            
-            # Implement exponential backoff with model fallback
-            retry_count = 0
-            wait_time = self.base_wait_time
-            success = False
-            response = None
-            
-            while not success and retry_count < self.max_retries:
-                # Select current model based on fallback status
-                current_model = self.fallback_models[self.current_model_index]
-                
-                # Prepare payload with current model
-                payload = {
-                    "model": current_model,
-                    "max_tokens": 4000,
-                    "system": MANUFACTURER_SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                
-                # Track API calls
-                self.api_calls += 1
-                
-                # Make API request
-                self.logger.info(f"Making Claude API call with model {current_model} for manufacturer extraction (attempt {retry_count+1}/{self.max_retries})")
-                try:
-                    response = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=30  # Add timeout to prevent hanging
-                    )
-                    
-                    # Check for rate limiting or other errors
-                    if response.status_code == 200:
-                        # Success!
-                        success = True
-                    elif response.status_code == 429 or response.status_code >= 500:
-                        # Rate limit or server error - implement backoff and model fallback
-                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
-                        self.logger.warning(error_msg)
-                        
-                        # Try fallback model if available
-                        if self.current_model_index < len(self.fallback_models) - 1:
-                            self.current_model_index += 1
-                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
-                            # Reset wait time when switching models
-                            wait_time = self.base_wait_time
-                        else:
-                            # Wait with exponential backoff
-                            self.logger.info(f"Waiting {wait_time} seconds before retry")
-                            time.sleep(wait_time)
-                            # Increase wait time exponentially, but cap at max_wait_time
-                            wait_time = min(wait_time * 2, self.max_wait_time)
-                    else:
-                        # Other error - log and retry
-                        self.logger.error(f"API error: {response.status_code} - {response.text}")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, self.max_wait_time)
-                        
-                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
-                    # Network error - retry with backoff
-                    self.logger.error(f"Request error: {str(req_err)}")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, self.max_wait_time)
-                    
-                retry_count += 1
-                
-            # If we've exhausted all retries and still failed, return empty list
-            if not success:
-                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
-                return []
-                
-            # STEP 3: Process successful response from Claude API
-            self.logger.info("STEP 3: Processing Claude API response for manufacturer extraction")
-            response_data = response.json()
-            result = response_data["content"][0]["text"]
-            
-            # Log a preview of the response for debugging
-            result_preview = result[:150] + '...' if len(result) > 150 else result
-            self.logger.info(f"Claude API response preview: {result_preview}")
-            
-            # Periodically try to switch back to the primary model
-            current_time = time.time()
-            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
-                self.current_model_index = 0
-                self.last_model_switch_time = current_time
-                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
-            
-            # STEP 4: Parse the delimited response to extract structured manufacturer data
-            self.logger.info("STEP 4: Parsing response to extract manufacturer information")
-            self.logger.info("Looking for properly formatted JSON data between RESPONSE_START and RESPONSE_END markers")
-            parsed_data = self._parse_manufacturer_response(result)
-            
-            # STEP 5: Validate and return the extracted manufacturer data
-            if parsed_data and parsed_data.get('manufacturers'):
-                manufacturer_count = len(parsed_data['manufacturers'])
-                self.logger.info(f"✅ Successfully extracted {manufacturer_count} manufacturers from {url}")
-                
-                # Log a summary of each manufacturer found
-                for i, manufacturer in enumerate(parsed_data['manufacturers']):
-                    name = manufacturer.get('name', 'Unknown')
-                    categories_count = len(manufacturer.get('categories', []))
-                    self.logger.info(f"  Manufacturer #{i+1}: {name} with {categories_count} categories")
-                    
-                return parsed_data['manufacturers']
-            else:
-                self.logger.info(f"❌ No manufacturers found in {url} or response format invalid")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"Error extracting manufacturers: {str(e)}")
-            return []
-
-    def _extract_categories(self, url: str, manufacturer_name: str, content: str) -> List[str]:
-        """Extract category information for a specific manufacturer with exponential backoff and model fallback"""
-        try:
-            # Format the prompt with the structured content
-            prompt = CATEGORY_EXTRACTION_PROMPT.format(
-                content=content,
-                manufacturer_name=manufacturer_name
-            )
-            
-            # Prepare headers for API call
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            # Implement exponential backoff with model fallback
-            retry_count = 0
-            wait_time = self.base_wait_time
-            success = False
-            response = None
-            
-            while not success and retry_count < self.max_retries:
-                # Select current model based on fallback status
-                current_model = self.fallback_models[self.current_model_index]
-                
-                # Prepare payload with current model
-                payload = {
-                    "model": current_model,
-                    "max_tokens": 4000,
-                    "system": CATEGORY_SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                
-                # Track API calls
-                self.api_calls += 1
-                
-                # Make API request
-                self.logger.info(f"Making Claude API call with model {current_model} for category extraction (attempt {retry_count+1}/{self.max_retries})")
-                try:
-                    response = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=30  # Add timeout to prevent hanging
-                    )
-                    
-                    # Check for rate limiting or other errors
-                    if response.status_code == 200:
-                        # Success!
-                        success = True
-                    elif response.status_code == 429 or response.status_code >= 500:
-                        # Rate limit or server error - implement backoff and model fallback
-                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
-                        self.logger.warning(error_msg)
-                        
-                        # Try fallback model if available
-                        if self.current_model_index < len(self.fallback_models) - 1:
-                            self.current_model_index += 1
-                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
-                            # Reset wait time when switching models
-                            wait_time = self.base_wait_time
-                        else:
-                            # Wait with exponential backoff
-                            self.logger.info(f"Waiting {wait_time} seconds before retry")
-                            time.sleep(wait_time)
-                            # Increase wait time exponentially, but cap at max_wait_time
-                            wait_time = min(wait_time * 2, self.max_wait_time)
-                    else:
-                        # Other error - log and retry
-                        self.logger.error(f"API error: {response.status_code} - {response.text}")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, self.max_wait_time)
-                        
-                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
-                    # Network error - retry with backoff
-                    self.logger.error(f"Request error: {str(req_err)}")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, self.max_wait_time)
-                    
-                retry_count += 1
-                
-            # If we've exhausted all retries and still failed, return empty list
-            if not success:
-                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
-                return []
-                
-            # Process successful response
-            response_data = response.json()
-            result = response_data["content"][0]["text"]
-            
-            # Periodically try to switch back to the primary model
-            current_time = time.time()
-            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
-                self.current_model_index = 0
-                self.last_model_switch_time = current_time
-                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
-            
-            # Parse the delimited response
-            categories = self._parse_category_response(result)
-            
-            if categories:
-                self.logger.info(f"Found {len(categories)} raw categories for {manufacturer_name} in {url}")
-                
-                # Validate the extracted categories to ensure they are legitimate product categories
-                validated_categories = self.validate_categories(categories, manufacturer_name)
-                
-                if validated_categories:
-                    self.logger.info(f"Validated {len(validated_categories)} categories for {manufacturer_name} in {url}")
-                    return validated_categories
-                else:
-                    self.logger.info(f"No valid categories found after validation for {manufacturer_name} in {url}")
-                    return []
-            else:
-                self.logger.info(f"No categories found for {manufacturer_name} in {url}")
-                return []
-                
-        except Exception as e:
-            self.logger.error(f"Error extracting categories: {str(e)}")
-            return []
-
-    def _parse_manufacturer_response(self, response_text: str) -> Dict:
-        """Parse manufacturer response using strict delimited format"""
-        try:
-            # Initialize result structure
-            manufacturers = []
-
-            # Find content between RESPONSE_START and RESPONSE_END
-            match = re.search(r'# RESPONSE_START\s*(.*?)\s*# RESPONSE_END', response_text, re.DOTALL)
-            if not match:
-                self.logger.warning("No valid response delimiters found")
-                return {"manufacturers": []}
-
-            content = match.group(1).strip()
-            if not content:
-                return {"manufacturers": []}
-
-            # Split into manufacturer blocks
-            manufacturer_blocks = re.finditer(r'# MANUFACTURER_START\s*(.*?)\s*# MANUFACTURER_END', content, re.DOTALL)
-            
-            for block in manufacturer_blocks:
-                manufacturer_data = block.group(1).strip()
-                if not manufacturer_data:
-                    continue
-
-                # Initialize manufacturer dict
-                current_manufacturer = {
-                    "name": "",
-                    "urls": []
-                }
-
-                # Parse manufacturer data
-                for line in manufacturer_data.split('\n'):
-                    line = line.strip()
-                    if line.startswith('NAME:'):
-                        current_manufacturer["name"] = line.replace('NAME:', '').strip()
-                    elif line.startswith('URL:'):
-                        url = line.replace('URL:', '').strip()
-                        if url:
-                            current_manufacturer["urls"].append(url)
-
-                # Add manufacturer if we have a name
-                if current_manufacturer["name"]:
-                    manufacturers.append(current_manufacturer)
-
-            return {"manufacturers": manufacturers}
-
-        except Exception as e:
-            self.logger.error(f"Error parsing manufacturer response: {str(e)}")
-            return {"manufacturers": []}
-            
-    def _parse_category_response(self, response_text: str) -> List[str]:
-        """Parse category response using delimited format"""
-        try:
-            categories = []
-
-            # Find content between RESPONSE_START and RESPONSE_END
-            match = re.search(r'# RESPONSE_START\s*(.*?)\s*# RESPONSE_END', response_text, re.DOTALL)
-            if not match:
-                self.logger.warning("No valid category response delimiters found")
-                return []
-
-            content = match.group(1).strip()
-            if not content:
-                return []
-
-            # Extract all categories
-            for line in content.split('\n'):
-                line = line.strip()
-                if line.startswith('CATEGORY:'):
-                    category = line.replace('CATEGORY:', '').strip()
-                    if category:
-                        categories.append(category)
-
-            return categories
-
-        except Exception as e:
-            self.logger.error(f"Error parsing category response: {str(e)}")
-            return []
-
-    def extract_manufacturers(self, url: str, title: str, content: str, html_content: str = None) -> Dict:
-        """Extract manufacturer and category information from structured navigation elements"""
-        try:
-            if not html_content:
-                self.logger.warning(f"No HTML content provided for {url}, falling back to text analysis")
-                return {"manufacturers": []}
-
-            soup = BeautifulSoup(html_content, 'html.parser')
-            structured_content = []
-            
-            # 1. Extract navigation menus
-            for nav in soup.find_all('nav'):
-                links = nav.find_all('a')
-                if links:
-                    link_data = []
-                    for link in links:
-                        if link.get_text(strip=True):
-                            href = urljoin(url, link.get('href', '')) if link.get('href') else ''
-                            link_data.append(f"{link.get_text(strip=True)} [{href}]")
-                    if link_data:
-                        structured_content.append(f"Navigation Menu Links:\n" + "\n".join(link_data))
-
-            # 2. Extract sidebar/menu lists
-            for div in soup.find_all(['div', 'aside'], class_=lambda x: x and any(term in str(x).lower() 
-                                   for term in ['sidebar', 'menu', 'navigation'])):
-                for list_elem in div.find_all(['ul', 'ol']):
-                    links = list_elem.find_all('a')
-                    if links:
-                        link_data = []
-                        for link in links:
-                            if link.get_text(strip=True):
-                                href = urljoin(url, link.get('href', '')) if link.get('href') else ''
-                                link_data.append(f"{link.get_text(strip=True)} [{href}]")
-                        if link_data:
-                            structured_content.append(f"Menu List Links:\n" + "\n".join(link_data))
-
-            # 3. Extract category/product listings
-            for section in soup.find_all(['div', 'section'], class_=lambda x: x and any(term in str(x).lower() 
-                                       for term in ['category', 'product', 'catalog', 'listing'])):
-                links = section.find_all('a')
-                if links:
-                    link_data = []
-                    for link in links:
-                        if link.get_text(strip=True):
-                            href = urljoin(url, link.get('href', '')) if link.get('href') else ''
-                            link_data.append(f"{link.get_text(strip=True)} [{href}]")
-                    if link_data:
-                        structured_content.append(f"Category/Product Links:\n" + "\n".join(link_data))
-
-            # 4. Extract breadcrumb navigation
-            for crumb in soup.find_all(['nav', 'div', 'ol'], class_=lambda x: x and 'breadcrumb' in str(x).lower()):
-                links = crumb.find_all('a')
-                if links:
-                    link_data = []
-                    for link in links:
-                        if link.get_text(strip=True):
-                            href = urljoin(url, link.get('href', '')) if link.get('href') else ''
-                            link_data.append(f"{link.get_text(strip=True)} [{href}]")
-                    if link_data:
-                        structured_content.append(f"Breadcrumb Path:\n" + " > ".join(link_data))
-
-            # 5. Extract links with manufacturer/brand-related classes or paths
-            manufacturer_links = []
-            # Class-based detection
-            for link in soup.find_all('a', class_=lambda x: x and any(term in str(x).lower() 
-                                    for term in ['brand', 'manufacturer', 'vendor'])):
-                if link.get_text(strip=True):
-                    href = urljoin(url, link.get('href', '')) if link.get('href') else ''
-                    manufacturer_links.append(f"{link.get_text(strip=True)} [{href}]")
-            
-            # URL path-based detection
-            for link in soup.find_all('a', href=lambda x: x and any(term in str(x).lower() 
-                                    for term in ['/brand/', '/manufacturer/', '/vendor/'])):
-                if link.get_text(strip=True):
-                    href = urljoin(url, link.get('href', '')) if link.get('href') else ''
-                    manufacturer_links.append(f"{link.get_text(strip=True)} [{href}]")
-            
-            if manufacturer_links:
-                structured_content.append(f"Manufacturer/Brand Links:\n" + "\n".join(manufacturer_links))
-
-            # 6. Extract page title and main headings
-            if soup.title:
-                structured_content.insert(0, f"Page Title: {soup.title.string.strip()}")
-            
-            headings = []
-            for h in soup.find_all(['h1', 'h2']):
-                # Check if heading contains a link
-                heading_link = h.find('a')
-                if heading_link and heading_link.get('href'):
-                    href = urljoin(url, heading_link.get('href'))
-                    headings.append(f"{h.get_text(strip=True)} [{href}]")
-                else:
-                    headings.append(h.get_text(strip=True))
-            
-            if headings:
-                structured_content.insert(1, f"Main Headings:\n" + "\n".join(headings))
-
-            # Only proceed if we found structured content
-            if not structured_content:
-                self.logger.info(f"No structured content found in {url}")
-                return {"manufacturers": []}
-
-            # Add current URL for context
-            structured_content.insert(0, f"Current Page: {url}")
-
-            # Prepare the structured content for Claude
-            structured_text = "\n\n".join(structured_content)
-            self.logger.debug(f"Extracted structured content ({len(structured_text)} chars)")
-
-            # Step 1: Extract manufacturers first
-            manufacturers = self._extract_manufacturers(url, structured_text)
-            if not manufacturers:
-                self.logger.info(f"No manufacturers identified in {url}")
-                return {"manufacturers": []}
-            
-            # Step 2: For each manufacturer, extract categories in a separate call
-            result_manufacturers = []
-            for manufacturer in manufacturers:
-                manufacturer_name = manufacturer.get('name')
-                if not manufacturer_name:
-                    continue
-                    
-                # Extract categories for this manufacturer
-                categories = self._extract_categories(url, manufacturer_name, structured_text)
-                
-                # Add to result with categories
-                result_manufacturers.append({
-                    "name": manufacturer_name,
-                    "categories": categories,
-                    "urls": manufacturer.get('urls', [])
-                })
-                
-            # Return combined result
-            if result_manufacturers:
-                total_manufacturers = len(result_manufacturers)
-                total_categories = sum(len(m.get('categories', [])) for m in result_manufacturers)
-                self.logger.info(f"Found {total_manufacturers} manufacturers with {total_categories} categories in {url}")
-                return {"manufacturers": result_manufacturers}
-
-            self.logger.info(f"No valid manufacturers with categories identified in {url}")
-            return {"manufacturers": []}
-            
-        except Exception as e:
-            self.logger.error(f"Error extracting manufacturers from HTML: {str(e)}")
-            return {"manufacturers": []}
-
-    def _extract_manufacturers_initial(self, url: str, title: str, content: str) -> Dict:
-        """Extract manufacturer and category information using Claude with exponential backoff and model fallback"""
-        try:
-            # Prepare a truncated version of the content to avoid token limits
-            truncated_content = content[:4000] + "..." if len(content) > 4000 else content
-            
-            # Format the prompt with the page details
-            prompt = MANUFACTURER_EXTRACTION_PROMPT.format(
-                url=url,
-                title=title,
-                truncated_content=truncated_content
-            )
-            
-            # Prepare headers for API call
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            # Implement exponential backoff with model fallback
-            retry_count = 0
-            wait_time = self.base_wait_time
-            success = False
-            response = None
-            result = None
-            
-            while not success and retry_count < self.max_retries:
-                # Select current model based on fallback status
-                current_model = self.fallback_models[self.current_model_index]
-                
-                # Prepare payload with current model
-                payload = {
-                    "model": current_model,
-                    "max_tokens": 4000,
-                    "system": MANUFACTURER_SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                
-                # Track API calls
-                self.api_calls += 1
-                
-                # Make API request
-                self.logger.info(f"Making Claude API call with model {current_model} for initial manufacturer extraction (attempt {retry_count+1}/{self.max_retries})")
-                try:
-                    response = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=30  # Add timeout to prevent hanging
-                    )
-                    
-                    # Check for rate limiting or other errors
-                    if response.status_code == 200:
-                        # Success!
-                        success = True
-                        response_data = response.json()
-                        result = response_data["content"][0]["text"]
-                    elif response.status_code == 429 or response.status_code >= 500:
-                        # Rate limit or server error - implement backoff and model fallback
-                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
-                        self.logger.warning(error_msg)
-                        
-                        # Try fallback model if available
-                        if self.current_model_index < len(self.fallback_models) - 1:
-                            self.current_model_index += 1
-                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
-                            # Reset wait time when switching models
-                            wait_time = self.base_wait_time
-                        else:
-                            # Wait with exponential backoff
-                            self.logger.info(f"Waiting {wait_time} seconds before retry")
-                            time.sleep(wait_time)
-                            # Increase wait time exponentially, but cap at max_wait_time
-                            wait_time = min(wait_time * 2, self.max_wait_time)
-                    else:
-                        # Other error - log and retry
-                        self.logger.error(f"API error: {response.status_code} - {response.text}")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, self.max_wait_time)
-                        
-                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
-                    # Network error - retry with backoff
-                    self.logger.error(f"Request error: {str(req_err)}")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, self.max_wait_time)
-                    
-                retry_count += 1
-                
-            # If we've exhausted all retries and still failed, return None
-            if not success or not result:
-                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
-                return None
-                
-            # Periodically try to switch back to the primary model
-            current_time = time.time()
-            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
-                self.current_model_index = 0
-                self.last_model_switch_time = current_time
-                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
-            
-            self.logger.info(f"Claude manufacturer extraction for {url}: Response received")
-            
-            # Parse the response to extract manufacturers and categories
-            parsed_data = self._parse_delimited_response(result)
-            if parsed_data:
-                self.logger.info(f"Extracted {len(parsed_data.get('manufacturers', []))} manufacturers from {url}")
-            else:
-                self.logger.warning(f"No manufacturers extracted from {url}")
-                
-            return parsed_data
-            
-        except Exception as e:
-            self.logger.error(f"Error analyzing with Claude Haiku extraction: {str(e)}")
-            return None
-    
-    def analyze_page_type(self, url: str, content: str) -> Dict:
-        """
-        Analyze a page to determine if it's a brand page, brand category page, inconclusive, or other.
+        # Set up logging
+        self.logger = logging.getLogger('claude_analyzer')
         
-        This method implements the new page type classification system that categorizes pages into:
-        1. Brand page - Main page about a manufacturer/brand with their products/categories
-        2. Brand category page - Page dedicated to a specific product category from a brand
-        3. Inconclusive - Not enough information to make a determination
-        4. Other - Not related to brands/manufacturers or their product categories
+        # Load configuration
+        self.config_manager = ConfigManager(config_path)
+        if config_path:
+            self.config = self._load_config(config_path)
+        else:
+            self.config = self.config_manager.get_all()
         
-        Args:
-            url: The URL of the page being analyzed
-            content: The content extracted from the page (can be metadata, navigation, or full content)
-            
-        Returns:
-            Dictionary with the page type classification result
-        """
-        try:
-            self.logger.info(f"PAGE TYPE ANALYSIS: Analyzing page type for {url}")
-            
-            # Prepare a truncated version of the content if needed
-            original_length = len(content)
-            truncated_content = content[:3000] + "..." if original_length > 3000 else content
-            
-            if original_length > 3000:
-                self.logger.info(f"Content truncated from {original_length} to 3000 characters for API limits")
-            
-            # Format the prompt with the page details
-            self.logger.info("Formatting page type analysis prompt with content")
-            prompt = PAGE_TYPE_ANALYSIS_PROMPT.format(
-                url=url,
-                content=truncated_content
-            )
-            
-            # Prepare headers for API call
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            self.logger.info("Preparing to send page type analysis request to Claude API")
-            
-            # Implement exponential backoff with model fallback
-            retry_count = 0
-            wait_time = self.base_wait_time
-            success = False
-            response = None
-            
-            while not success and retry_count < self.max_retries:
-                # Select current model based on fallback status
-                current_model = self.fallback_models[self.current_model_index]
-                
-                # Prepare payload with current model
-                payload = {
-                    "model": current_model,
-                    "max_tokens": 100,
-                    "system": PAGE_TYPE_SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                
-                # Track API calls
-                self.api_calls += 1
-                
-                # Make API request
-                self.logger.info(f"Making Claude API call with model {current_model} (attempt {retry_count+1}/{self.max_retries})")
-                try:
-                    response = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=30  # Add timeout to prevent hanging
-                    )
-                    
-                    # Check for rate limiting or other errors
-                    if response.status_code == 200:
-                        # Success!
-                        success = True
-                    elif response.status_code == 429 or response.status_code >= 500:
-                        # Rate limit or server error - implement backoff and model fallback
-                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
-                        self.logger.warning(error_msg)
-                        
-                        # Try fallback model if available
-                        if self.current_model_index < len(self.fallback_models) - 1:
-                            self.current_model_index += 1
-                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
-                            # Reset wait time when switching models
-                            wait_time = self.base_wait_time
-                        else:
-                            # Wait with exponential backoff
-                            self.logger.info(f"Waiting {wait_time} seconds before retry")
-                            time.sleep(wait_time)
-                            # Increase wait time exponentially, but cap at max_wait_time
-                            wait_time = min(wait_time * 2, self.max_wait_time)
-                    else:
-                        # Other error - log and retry
-                        self.logger.error(f"API error: {response.status_code} - {response.text}")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, self.max_wait_time)
-                        
-                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
-                    # Network error - retry with backoff
-                    self.logger.error(f"Request error: {str(req_err)}")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, self.max_wait_time)
-                    
-                retry_count += 1
-                
-            # If we've exhausted all retries and still failed, return default
-            if not success:
-                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
-                return {"page_type": "inconclusive"}
-                
-            # Periodically try to switch back to the primary model
-            current_time = time.time()
-            if self.current_model_index > 0 and (current_time - self.last_model_switch_time) > 3600:  # Try every hour
-                self.current_model_index = 0
-                self.last_model_switch_time = current_time
-                self.logger.info(f"Attempting to switch back to primary model: {self.fallback_models[0]}")
-            
-            # Process the successful response from Claude API
-            self.logger.info("Processing Claude API response for page type analysis")
-            response_data = response.json()
-            answer = response_data["content"][0]["text"].strip()
-            
-            # Log a preview of the response for debugging
-            answer_preview = answer[:100] + '...' if len(answer) > 100 else answer
-            self.logger.info(f"Claude API response preview: {answer_preview}")
-            
-            # Parse the response to extract the page type result
-            self.logger.info("Parsing response to determine page type")
-            
-            # Extract content between RESPONSE_START and RESPONSE_END markers
-            response_pattern = r'# RESPONSE_START\s+(.*?)\s*# RESPONSE_END'
-            response_match = re.search(response_pattern, answer, re.DOTALL)
-            
-            if response_match:
-                # Successfully found the delimited response
-                content = response_match.group(1).strip()
-                self.logger.info(f"Found delimited response: {content}")
-                
-                # Extract the PAGE_TYPE field - now including 'inconclusive' as an option
-                page_type_match = re.search(r'PAGE_TYPE:\s*(brand_page|brand_category_page|inconclusive|other)', content, re.IGNORECASE)
-                if page_type_match:
-                    # Successfully found the PAGE_TYPE field
-                    page_type = page_type_match.group(1).strip().lower()
-                    
-                    # Log the final determination
-                    self.logger.info(f"Page type determined: {page_type}")
-                    
-                    return {"page_type": page_type}
-                else:
-                    # Missing the PAGE_TYPE field
-                    self.logger.error(f"Error: Missing PAGE_TYPE field in response: {content}")
-                    self.logger.info(f"Defaulting to 'inconclusive' due to parsing error")
-                    return {"page_type": "inconclusive"}
-            else:
-                # Missing the delimited response format
-                self.logger.error(f"Error: Response missing RESPONSE_START/END markers: {answer}")
-                self.logger.info(f"Defaulting to 'inconclusive' due to formatting error")
-                return {"page_type": "inconclusive"}
-            
-        except Exception as e:
-            self.logger.error(f"Error in page type analysis: {str(e)}")
-            return {"page_type": "inconclusive"}
-    
-    def extract_category_page_info(self, url: str, title: str, content: str) -> Dict:
-        """
-        Extract manufacturer name and category from a brand category page.
+        # Set up statistics
+        self.stats = {
+            'pages_analyzed': 0,
+            'manufacturer_pages_found': 0,
+            'tokens_used': 0,
+            'cache_hits': 0,
+            'errors': 0,
+            'categories_found': 0,
+            'claude_api_calls': 0,
+            'claude_api_cache_hits': 0,
+            'claude_api_prompt_tokens': 0,
+            'claude_api_completion_tokens': 0,
+            'claude_api_total_tokens': 0,
+            'claude_api_errors': 0
+        }
         
-        This method is specifically designed for pages that have been classified as
-        'brand_category_page' and extracts the essential information without the
-        full manufacturer data extraction process.
+        # Set up API configuration
+        self.claude_api_key = os.environ.get('CLAUDE_API_KEY')
+        if not self.claude_api_key:
+            self.claude_api_key = self.config_manager.get('claude_analyzer.api_key', '')
+            if not self.claude_api_key:
+                self.logger.error("No Claude API key found in environment variables or config")
+                raise ValueError("Claude API key is required. Set CLAUDE_API_KEY environment variable or configure it in config.yaml")
+                
+        self.claude_model = self.config_manager.get('claude_analyzer.claude_model', 'claude-3-5-haiku-20241022')
         
-        Args:
-            url: The URL of the page being analyzed
-            title: The title of the page
-            content: The content extracted from the page
-            
-        Returns:
-            Dictionary with manufacturer name and category
-        """
-        try:
-            self.logger.info(f"CATEGORY PAGE INFO: Extracting info from {url}")
-            
-            # Prepare a truncated version of the content if needed
-            original_length = len(content)
-            truncated_content = content[:2000] + "..." if original_length > 2000 else content
-            
-            if original_length > 2000:
-                self.logger.info(f"Content truncated from {original_length} to 2000 characters for API limits")
-            
-            # Format the prompt with the page details
-            self.logger.info("Formatting category page info extraction prompt")
-            prompt = CATEGORY_PAGE_INFO_PROMPT.format(
-                url=url,
-                title=title,
-                content=truncated_content
-            )
-            
-            # Prepare headers for API call
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            self.logger.info("Preparing to send category page info request to Claude API")
-            
-            # Implement exponential backoff with model fallback
-            retry_count = 0
-            wait_time = self.base_wait_time
-            success = False
-            response = None
-            
-            while not success and retry_count < self.max_retries:
-                # Select current model based on fallback status
-                current_model = self.fallback_models[self.current_model_index]
-                
-                # Prepare payload with current model
-                payload = {
-                    "model": current_model,
-                    "max_tokens": 100,
-                    "system": SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ]
-                }
-                
-                # Track API calls
-                self.api_calls += 1
-                
-                # Make API request
-                self.logger.info(f"Making Claude API call with model {current_model} (attempt {retry_count+1}/{self.max_retries})")
-                try:
-                    response = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=30  # Add timeout to prevent hanging
-                    )
-                    
-                    # Check for rate limiting or other errors
-                    if response.status_code == 200:
-                        # Success!
-                        success = True
-                    elif response.status_code == 429 or response.status_code >= 500:
-                        # Rate limit or server error - implement backoff and model fallback
-                        error_msg = f"API rate limit or server error: {response.status_code} - {response.text}"
-                        self.logger.warning(error_msg)
-                        
-                        # Try fallback model if available
-                        if self.current_model_index < len(self.fallback_models) - 1:
-                            self.current_model_index += 1
-                            self.logger.info(f"Switching to fallback model: {self.fallback_models[self.current_model_index]}")
-                            # Reset wait time when switching models
-                            wait_time = self.base_wait_time
-                        else:
-                            # Wait with exponential backoff
-                            self.logger.info(f"Waiting {wait_time} seconds before retry")
-                            time.sleep(wait_time)
-                            # Increase wait time exponentially, but cap at max_wait_time
-                            wait_time = min(wait_time * 2, self.max_wait_time)
-                    else:
-                        # Other error - log and retry
-                        self.logger.error(f"API error: {response.status_code} - {response.text}")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, self.max_wait_time)
-                        
-                except (requests.RequestException, ConnectionError, TimeoutError) as req_err:
-                    # Network error - retry with backoff
-                    self.logger.error(f"Request error: {str(req_err)}")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, self.max_wait_time)
-                    
-                retry_count += 1
-                
-            # If we've exhausted all retries and still failed, return empty result
-            if not success:
-                self.logger.error(f"Failed to get response from Claude API after {self.max_retries} attempts")
-                return {}
-                
-            # Process the successful response from Claude API
-            self.logger.info("Processing Claude API response for category page info")
-            response_data = response.json()
-            answer = response_data["content"][0]["text"].strip()
-            
-            # Log a preview of the response for debugging
-            answer_preview = answer[:100] + '...' if len(answer) > 100 else answer
-            self.logger.info(f"Claude API response preview: {answer_preview}")
-            
-            # Parse the response to extract the manufacturer and category
-            self.logger.info("Parsing response to extract manufacturer and category")
-            
-            # Extract content between RESPONSE_START and RESPONSE_END markers
-            response_pattern = r'# RESPONSE_START\s+(.*?)\s*# RESPONSE_END'
-            response_match = re.search(response_pattern, answer, re.DOTALL)
-            
-            if response_match:
-                # Successfully found the delimited response
-                content = response_match.group(1).strip()
-                self.logger.info(f"Found delimited response: {content}")
-                
-                # Extract the MANUFACTURER field
-                manufacturer_match = re.search(r'MANUFACTURER:\s*(.+?)(?:\n|$)', content)
-                category_match = re.search(r'CATEGORY:\s*(.+?)(?:\n|$)', content)
-                website_match = re.search(r'WEBSITE:\s*(.+?)(?:\n|$)', content)
-                
-                result = {}
-                
-                if manufacturer_match:
-                    manufacturer = manufacturer_match.group(1).strip()
-                    if manufacturer and manufacturer != "[manufacturer name]":
-                        result["manufacturer"] = manufacturer
-                
-                if category_match:
-                    category = category_match.group(1).strip()
-                    if category and category != "[category name]":
-                        result["category"] = category
-                
-                if website_match:
-                    website = website_match.group(1).strip()
-                    if website and website != "[official website if found, or empty]":
-                        result["website"] = website
-                
-                if "manufacturer" in result and "category" in result:
-                    self.logger.info(f"Successfully extracted manufacturer '{result['manufacturer']}' and category '{result['category']}'")
-                    return result
-                else:
-                    self.logger.error("Failed to extract both manufacturer and category")
-                    return {}
-            else:
-                # Missing the delimited response format
-                self.logger.error(f"Error: Response missing RESPONSE_START/END markers: {answer}")
-                return {}
-            
-        except Exception as e:
-            self.logger.error(f"Error in category page info extraction: {str(e)}")
-            return {}
-
-    def validate_categories(self, categories: List[str], manufacturer_name: str) -> List[str]:
-        """
-        Validate and normalize a list of extracted categories to ensure they are legitimate product categories.
+        # Set up response cache
+        self.response_cache = {}
         
-        This method performs the following validations:
-        1. Removes UI elements and navigation controls
-        2. Normalizes category names (standardizes format, removes duplicates)
-        3. Ensures categories are actual product lines, not marketing terms
-        4. Removes very short or generic terms
+        # Get prompt templates
+        self.prompts = self.config_manager.get('prompt_templates', {})
         
-        Args:
-            categories: List of extracted category names
-            manufacturer_name: Name of the manufacturer for context
-            
-        Returns:
-            List of validated and normalized category names
-        """
-        # Early return if no categories
-        if not categories:
-            return []
-            
-        self.logger.info(f"CATEGORY VALIDATION: Starting validation of {len(categories)} categories for {manufacturer_name}")
+        # Set up caching
+        self.enable_cache = self.config_manager.get('claude_analyzer.enable_cache', True)
+        self.cache_dir = self.config_manager.get('claude_analyzer.cache_dir', '.cache')
+        self.cache = {}
         
-        # Common UI elements and navigation controls to filter out - use exact matches only
-        ui_elements = [
-            'home', 'menu', 'search', 'login', 'register', 'contact', 'about', 'support',
-            'next', 'previous', 'view all', 'show more', 'back', 'forward', 'privacy', 'terms',
-            'cookie', 'sitemap', 'faq', 'help', 'cart', 'checkout', 'account', 'profile',
-            'facebook', 'twitter', 'instagram', 'youtube', 'linkedin'
-        ]
+        # Load keywords
+        self.positive_keywords = self.config_manager.get('claude_analyzer.positive_keywords', [])
+        self.negative_keywords = self.config_manager.get('claude_analyzer.negative_keywords', [])
         
-        # Filter out obvious UI elements and normalize categories
-        filtered_categories = []
-        for category in categories:
-            # Skip very short categories (likely not valid)
-            if len(category) < 3:
-                self.logger.info(f"Filtering out short category: '{category}'")
-                continue
-                
-            # Skip categories that EXACTLY match common UI elements (case-insensitive)
-            # But don't filter out legitimate product categories that might contain these words
-            is_ui_element = False
-            if category.lower() in [ui.lower() for ui in ui_elements]:
-                is_ui_element = True
-                self.logger.info(f"Filtering out UI element: '{category}'")
-            
-            # Don't filter out product categories like 'Home Automation Systems'
-            # which contain UI words but are legitimate categories
-                    
-            if not is_ui_element:
-                # Add the category if it's not already in the list (case-insensitive check)
-                if not any(cat.lower() == category.lower() for cat in filtered_categories):
-                    filtered_categories.append(category)
+        # Set up translation
+        self.translation_enabled = self.config_manager.get('claude_analyzer.translation_enabled', False)
+        self.target_languages = self.config_manager.get('languages.targets', {})
         
-        # If we have more than 5 categories, use Claude to validate them
-        # This helps with more complex validation that simple rules might miss
-        if len(filtered_categories) > 5 and hasattr(self, 'api_key') and self.api_key:
+        # Initialize translation manager if translation is enabled
+        self.translation_manager = None
+        if self.translation_enabled and self.target_languages:
             try:
-                # Check if CATEGORY_VALIDATION_PROMPT is defined
-                if 'CATEGORY_VALIDATION_PROMPT' not in globals():
-                    self.logger.warning("CATEGORY_VALIDATION_PROMPT not defined, skipping Claude validation")
-                    return filtered_categories
-                    
-                self.logger.info(f"Using Claude to validate {len(filtered_categories)} categories")
+                from scraper.translation_manager import TranslationManager
+                self.translation_manager = TranslationManager()
+                self.logger.info(f"Translation enabled for languages: {', '.join(self.target_languages.keys())}")
+            except Exception as e:
+                self.logger.error(f"Failed to initialize TranslationManager: {str(e)}")
+                self.translation_enabled = False
+        
+        self.logger.info(f"Claude Analyzer initialized with Claude model: {self.claude_model}")
+        self.logger.info(f"Caching {'enabled' if self.enable_cache else 'disabled'}")
+    
+    def _load_config(self, config_path: str) -> Dict:
+        """
+        Load configuration from YAML file.
+        
+        Args:
+            config_path: Path to configuration file
+            
+        Returns:
+            Configuration dictionary
+        """
+        try:
+            # Use default config path if none provided
+            if not config_path:
+                config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
+            
+            self.logger.info(f"Loading configuration from {config_path}")
+            
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
+            
+            return self.config
+        except Exception as e:
+            self.logger.error(f"Failed to load configuration: {e}")
+            raise
+    
+    def _get_cache_key(self, system_prompt: str, user_prompt: str, extra_data: str = "") -> str:
+        """
+        Generate a cache key for a Claude API call.
+        
+        Args:
+            system_prompt: System prompt
+            user_prompt: User prompt
+            extra_data: Any additional data to include in the key
+            
+        Returns:
+            Cache key as a string
+        """
+        # Combine all inputs into a single string
+        combined = f"{system_prompt}|{user_prompt}|{extra_data}"
+        
+        # Generate MD5 hash
+        return hashlib.md5(combined.encode('utf-8')).hexdigest()
+    
+    def _check_cache(self, cache_key: str) -> Optional[str]:
+        """
+        Check if a response is cached in memory.
+        
+        Args:
+            cache_key: Cache key to check
+            
+        Returns:
+            Cached response or None if not found
+        """
+        if not self.enable_cache:
+            return None
+        
+        try:
+            # Check if key exists in memory cache and is not expired
+            if cache_key in self.cache:
+                cache_entry = self.cache[cache_key]
+                expiration_time = cache_entry['timestamp'] + timedelta(seconds=86400)
                 
-                # Format the prompt with the categories and manufacturer name
-                categories_list = [f"- {cat}" for cat in filtered_categories]
-                categories_text = '\n'.join(categories_list)
+                if datetime.now() < expiration_time:
+                    self.stats['cache_hits'] += 1
+                    self.logger.debug(f"Cache hit for key: {cache_key[:8]}...")
+                    return cache_entry['response']
+                else:
+                    # Remove expired entry
+                    del self.cache[cache_key]
+        
+        except Exception as e:
+            self.logger.error(f"Error checking cache: {e}")
+        
+        return None
+    
+    def _update_cache(self, cache_key: str, response: str) -> None:
+        """
+        Update the in-memory cache with a new response.
+        
+        Args:
+            cache_key: Cache key
+            response: Response to cache
+        """
+        if not self.enable_cache:
+            return
+        
+        try:
+            # Store in memory cache with timestamp
+            self.cache[cache_key] = {
+                'response': response,
+                'timestamp': datetime.now()
+            }
+            
+            # Simple cache size management - limit to 1000 entries
+            if len(self.cache) > 1000:
+                # Remove oldest entries
+                sorted_keys = sorted(self.cache.keys(), 
+                                    key=lambda k: self.cache[k]['timestamp'])
+                for old_key in sorted_keys[:100]:  # Remove oldest 100 entries
+                    del self.cache[old_key]
                 
-                # Import the prompt template if needed
-                from scraper.prompt_templates import CATEGORY_VALIDATION_PROMPT
+        except Exception as e:
+            self.logger.error(f"Error updating cache: {e}")
+    
+    @retry(
+        retry=retry_if_exception_type((requests.exceptions.RequestException, ValueError)),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        stop=stop_after_attempt(5)
+    )
+    def _make_api_request(self, payload: Dict) -> Dict:
+        """
+        Make API request with retry logic.
+        
+        Args:
+            payload: Request payload
+            
+        Returns:
+            API response
+        """
+        try:
+            # Validate payload to ensure it's properly formatted
+            if not isinstance(payload, dict):
+                raise ValueError("Payload must be a dictionary")
+            
+            if 'messages' not in payload or not isinstance(payload['messages'], list):
+                raise ValueError("Payload must contain a 'messages' list")
+            
+            # Ensure messages are properly formatted
+            for msg in payload['messages']:
+                if not isinstance(msg, dict) or 'role' not in msg or 'content' not in msg:
+                    raise ValueError("Each message must have 'role' and 'content' fields")
                 
-                prompt = CATEGORY_VALIDATION_PROMPT.format(
-                    manufacturer=manufacturer_name,
-                    categories=categories_text
-                )
+                # Ensure content is not too large (Claude has a token limit)
+                if len(msg.get('content', '')) > 100000:  # Arbitrary limit to prevent huge requests
+                    msg['content'] = msg['content'][:100000] + "... [content truncated]"
+            
+            # Make request
+            response = requests.post(
+                self.api_base_url,
+                headers=self.headers,
+                json=payload,
+                timeout=60
+            )
+            
+            # Handle HTTP errors gracefully
+            if response.status_code != 200:
+                error_message = f"Claude API HTTP error: {response.status_code} - {response.text}"
+                self.logger.error(error_message)
                 
-                # Prepare headers for API call
-                headers = {
-                    "x-api-key": self.api_key,
-                    "content-type": "application/json",
-                    "anthropic-version": "2023-06-01"
-                }
+                # Handle rate limiting specially
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('retry-after', 60))
+                    self.logger.warning(f"Rate limited. Waiting {retry_after} seconds")
+                    time.sleep(retry_after)
+                    raise requests.exceptions.RequestException(f"Rate limited: {error_message}")
                 
-                # Use the Sonnet model for better validation quality
-                payload = {
-                    "model": self.sonnet_model,  # Use Sonnet for better validation
-                    "max_tokens": 2000,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a specialized translator for product categories."
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ]
-                }
+                # For other errors, raise the appropriate exception
+                response.raise_for_status()  # This will raise an HTTPError
+            
+            # Parse response
+            try:
+                response_data = response.json()
+                return response_data
+            except ValueError as e:
+                self.logger.error(f"Failed to parse JSON response: {e}")
+                raise ValueError(f"Invalid JSON response: {response.text}")
                 
-                # Make API request
-                self.logger.info(f"Making Claude API call with model {self.sonnet_model} for category validation")
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Request error: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected error in API request: {e}")
+            # Convert to RequestException for retry mechanism
+            raise requests.exceptions.RequestException(f"Error in API request: {str(e)}")
+    
+    def _call_claude_api(self, prompt: str, max_retries: int = 3) -> str:
+        """
+        Call Claude API with retry logic and caching.
+        
+        Args:
+            prompt: Prompt to send to Claude API
+            max_retries: Maximum number of retries
+            
+        Returns:
+            Claude API response
+        """
+        self.logger.debug(f"Calling Claude API with prompt length: {len(prompt)}")
+        
+        # Check cache first
+        cache_key = hashlib.md5(prompt.encode()).hexdigest()
+        if cache_key in self.response_cache:
+            self.logger.debug("Using cached Claude API response")
+            self.stats['claude_api_cache_hits'] += 1
+            return self.response_cache[cache_key]
+        
+        # Increment API call counter
+        self.stats['claude_api_calls'] += 1
+        
+        # Prepare request
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.claude_api_key,
+            "anthropic-version": "2023-06-01"
+        }
+        
+        # Use the messages API format for Claude 3.5 Haiku
+        body = {
+            "model": self.claude_model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 1000,
+            "temperature": 0.0
+        }
+        
+        # Make API request with retries
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
                 response = requests.post(
                     "https://api.anthropic.com/v1/messages",
                     headers=headers,
-                    json=payload,
+                    json=body,
                     timeout=30
                 )
                 
+                # Check if request was successful
                 if response.status_code == 200:
-                    # Process the response
-                    response_data = response.json()
-                    result = response_data["content"][0]["text"]
+                    # Parse response
+                    response_json = response.json()
+                    response_text = response_json.get('content', [{}])[0].get('text', '').strip()
                     
-                    # Parse the validated categories
-                    validated_categories = self._parse_category_response(result)
+                    # Cache response
+                    self.response_cache[cache_key] = response_text
                     
-                    if validated_categories:
-                        self.logger.info(f"Successfully validated categories: {len(validated_categories)} valid out of {len(filtered_categories)} original")
-                        return validated_categories
-                    else:
-                        self.logger.warning(f"No valid categories found after validation")
-                        return filtered_categories  # Fall back to filtered categories
+                    # Log token usage
+                    usage = response_json.get('usage', {})
+                    prompt_tokens = usage.get('input_tokens', 0)
+                    completion_tokens = usage.get('output_tokens', 0)
+                    self.stats['claude_api_prompt_tokens'] += prompt_tokens
+                    self.stats['claude_api_completion_tokens'] += completion_tokens
+                    self.stats['claude_api_total_tokens'] += prompt_tokens + completion_tokens
+                    
+                    self.logger.debug(f"Claude API response length: {len(response_text)}")
+                    return response_text
                 else:
-                    self.logger.error(f"API error during category validation: {response.status_code} - {response.text}")
-                    return filtered_categories  # Fall back to filtered categories
-                    
-            except Exception as e:
-                self.logger.error(f"Error during category validation: {str(e)}")
-                return filtered_categories  # Fall back to filtered categories
-        
-        self.logger.info(f"Completed category validation: {len(filtered_categories)} valid categories")
-        return filtered_categories
-        
-    def translate_categories_batch(self, categories_text: str, manufacturer_name: str, target_lang: str, response_format='delimited') -> List[str]:
-        """
-        Translate multiple categories at once to reduce API calls.
-        
-        Args:
-            categories_text: Newline-separated categories to translate
-            manufacturer_name: Manufacturer name to preserve
-            target_lang: Target language code
-            response_format: Format of the response ('delimited' or 'json')
-            
-        Returns:
-            List of translated categories
-        """
-        try:
-            # Map language codes to full names
-            language_names = {
-                'es': 'Spanish',
-                'pt': 'Portuguese',
-                'fr': 'French',
-                'it': 'Italian'
-            }
-            target_language = language_names.get(target_lang, 'Spanish')
-            
-            # Split categories into lines
-            categories_list = [cat.strip() for cat in categories_text.split('\n') if cat.strip()]
-            
-            # Prepare the categories_line_by_line format for the prompt template
-            categories_line_by_line = '\n'.join([f"{cat} → [Translation]" for cat in categories_list])
-            
-            # Format the prompt for batch translation
-            prompt = TRANSLATION_BATCH_PROMPT.format(
-                categories=categories_text,
-                manufacturer_name=manufacturer_name,
-                target_language=target_language,
-                categories_line_by_line=categories_line_by_line
-            )
-            
-            self.logger.info(f"Preparing to translate {len(categories_list)} categories to {target_language}")
-            self.logger.debug(f"Translation prompt: {prompt[:200]}...")
-            
-            # Prepare headers
-            headers = {
-                "x-api-key": self.api_key,
-                "content-type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            
-            # Implement exponential backoff with model fallback
-            retry_count = 0
-            wait_time = self.base_wait_time
-            success = False
-            response = None
-            
-            while not success and retry_count < self.max_retries:
-                current_model = self.fallback_models[self.current_model_index]
-                
-                # Prepare payload - use appropriate max_tokens for translations
-                payload = {
-                    "model": current_model,
-                    "max_tokens": 1000,  # Increased to handle multiple translations
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": TRANSLATION_SYSTEM_PROMPT
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ]
-                }
-                
-                self.api_calls += 1
-                self.logger.info(f"Making batch translation API call with model {current_model} (attempt {retry_count+1}/{self.max_retries})")
-                
-                try:
-                    response = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=30
-                    )
-                    
-                    if response.status_code == 200:
-                        success = True
-                        response_data = response.json()
-                        result = response_data["content"][0]["text"]
-                        
-                        if response_format == 'delimited':
-                            # Parse translations between delimiters
-                            match = re.search(r'# RESPONSE_START\s*(.+?)\s*# RESPONSE_END', result, re.DOTALL)
-                            if match:
-                                # Extract the translated lines
-                                translation_lines = [line.strip() for line in match.group(1).strip().split('\n') if line.strip()]
-                                
-                                # Parse each line to extract the translation part
-                                translations = []
-                                for line in translation_lines:
-                                    # Look for the arrow separator and extract the translation
-                                    arrow_match = re.search(r'→\s*(.+)$', line)
-                                    if arrow_match:
-                                        translation = arrow_match.group(1).strip()
-                                        # Remove any brackets that might have been included
-                                        translation = re.sub(r'^\[|\]$', '', translation).strip()
-                                        translations.append(translation)
-                                    else:
-                                        # If no arrow found, log warning but don't fail
-                                        self.logger.warning(f"Could not parse translation from line: {line}")
-                                
-                                # Verify we have the right number of translations
-                                if len(translations) != len(categories_list):
-                                    self.logger.warning(f"Expected {len(categories_list)} translations but got {len(translations)}")
-                                    # If we have fewer translations than categories, pad with originals
-                                    if len(translations) < len(categories_list):
-                                        translations.extend(categories_list[len(translations):])
-                                    # If we have more translations than categories, truncate
-                                    elif len(translations) > len(categories_list):
-                                        translations = translations[:len(categories_list)]
-                                
-                                self.logger.info(f"Successfully translated {len(translations)} categories to {target_language}")
-                                return translations
-                            else:
-                                raise ValueError("No valid translations found in response")
-                        elif response_format == 'json':
-                            # Parse JSON response
-                            try:
-                                result_json = json.loads(result)
-                                translations = result_json.get('translations', [])
-                                if len(translations) != len(categories_list):
-                                    self.logger.warning(f"Expected {len(categories_list)} translations but got {len(translations)}")
-                                    # If we have fewer translations than categories, pad with originals
-                                    if len(translations) < len(categories_list):
-                                        translations.extend(categories_list[len(translations):])
-                                    # If we have more translations than categories, truncate
-                                    elif len(translations) > len(categories_list):
-                                        translations = translations[:len(categories_list)]
-                                
-                                self.logger.info(f"Successfully translated {len(translations)} categories to {target_language}")
-                                return translations
-                            except json.JSONDecodeError:
-                                self.logger.error(f"Failed to parse JSON response: {result}")
-                                raise ValueError("Invalid JSON response")
-                        else:
-                            raise ValueError("Invalid response format")
-                            
-                    elif response.status_code == 429:
-                        if self.current_model_index < len(self.fallback_models) - 1:
-                            self.current_model_index += 1
-                            self.logger.warning(f"Rate limited - falling back to {self.fallback_models[self.current_model_index]}")
-                        else:
-                            self.logger.warning(f"Rate limited on all models - waiting {wait_time}s")
-                            time.sleep(wait_time)
-                            wait_time = min(wait_time * 2, self.max_wait_time)
-                        retry_count += 1
-                    else:
-                        self.logger.error(f"API error: {response.status_code} - {response.text}")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, self.max_wait_time)
-                        retry_count += 1
-                        
-                except Exception as e:
-                    self.logger.error(f"Request error: {str(e)}")
-                    time.sleep(wait_time)
-                    wait_time = min(wait_time * 2, self.max_wait_time)
+                    # Log error and retry
+                    self.logger.warning(f"Claude API request failed with status code {response.status_code}: {response.text}")
                     retry_count += 1
-            
-            if not success:
-                self.logger.error(f"Failed to translate categories after {self.max_retries} attempts")
-                # Return original categories as fallback
-                return categories_list
-                
-        except Exception as e:
-            self.logger.error(f"Batch translation error: {str(e)}")
-            # Return original categories as fallback
-            if isinstance(categories_text, str):
-                return [cat.strip() for cat in categories_text.split('\n') if cat.strip()]
-            return []
+                    time.sleep(2 ** retry_count)  # Exponential backoff
+            except Exception as e:
+                self.logger.error(f"Error calling Claude API: {str(e)}")
+                retry_count += 1
+                time.sleep(2 ** retry_count)  # Exponential backoff
+        
+        # If we get here, all retries failed
+        self.logger.error(f"All retries failed when calling Claude API")
+        self.stats['claude_api_errors'] += 1
+        return ""
     
-    def translate_category(self, category: str, manufacturer_name: str, target_lang: str) -> str:
+    def translate_category(self, category: str, source_lang: str = 'en', target_lang: str = 'en') -> str:
         """
-        Legacy method for single category translation.
-        Now uses batch translation under the hood for efficiency.
+        Translate a category from source language to target language.
         
         Args:
-            category: Original category name
-            manufacturer_name: Manufacturer name to preserve
-            target_lang: Target language code (e.g., 'es', 'pt', 'fr', 'it')
+            category: Category to translate
+            source_lang: Source language code
+            target_lang: Target language code
             
         Returns:
-            Translated category name
+            Translated category
         """
-        try:
-            # Skip translation for very short categories or those containing numbers
-            if len(category) < 3 or any(char.isdigit() for char in category):
-                self.logger.info(f"Skipping translation for short or numeric category: {category}")
-                return category
-                
-            # Use batch translation with a single category
-            translations = self.translate_categories_batch(category, manufacturer_name, target_lang)
-            
-            if translations and len(translations) > 0:
-                translated = translations[0]
-                
-                # Validate translation
-                if translated and len(translated) >= 3:
-                    # Check if manufacturer name is preserved
-                    if manufacturer_name.lower() in translated.lower():
-                        self.logger.info(f"Translated '{category}' to '{translated}' ({target_lang})")
-                        return translated
-                    else:
-                        # Add manufacturer name if missing
-                        translated = f"{manufacturer_name} {translated}"
-                        self.logger.info(f"Added manufacturer to translation: '{translated}' ({target_lang})")
-                        return translated
-                        
-            self.logger.warning(f"Failed to get valid translation for '{category}'")
+        if not self.translation_enabled:
             return category
+        
+        if source_lang == target_lang:
+            return category
+        
+        # Check cache first
+        cache_key = f"{category}_{source_lang}_{target_lang}"
+        if cache_key in self.translation_cache:
+            self.logger.debug(f"Translation cache hit for: {category}")
+            return self.translation_cache[cache_key]
+        
+        self.logger.info(f"Translating category: {category} from {source_lang} to {target_lang}")
+        
+        # Prepare prompt
+        system_prompt = """You are a translation assistant. Your task is to translate product categories from one language to another.
+Respond ONLY with the translated text, no other text or explanation.
+"""
+        
+        user_prompt = f"""Translate the following product category from {source_lang} to {target_lang}:
+{category}
+
+Respond ONLY with the translated text.
+"""
+        
+        # Call Claude API
+        try:
+            response = self._call_claude_api(system_prompt + user_prompt)
             
+            # Clean up response
+            translated = response.strip()
+            
+            # Cache the result
+            self.translation_cache[cache_key] = translated
+            
+            self.logger.debug(f"Translated '{category}' to '{translated}'")
+            return translated
         except Exception as e:
             self.logger.error(f"Error translating category: {str(e)}")
             return category
+    
+    # STEP 1: Keyword filtering (no Claude API call)
+    def keyword_filter(self, url: str, title: str, content: str) -> Dict:
+        """
+        Filter pages based on keywords to quickly categorize pages without using Claude API.
+        This method only examines titles, metadata, and headers - not the full content.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content (will be used to extract metadata and headers only)
+            
+        Returns:
+            Dictionary with filter results:
+                - passed: Boolean indicating if the page passed the filter
+                - page_type: One of 'brand_page', 'brand_category_page', 'other', or 'inconclusive'
+                - positive_keywords: List of positive keywords found
+                - negative_keywords: List of negative keywords found
+        """
+        self.logger.info(f"Applying keyword filter to URL: {url}")
+        
+        # Extract metadata and headers from content
+        metadata = self._extract_metadata_from_content(content)
+        
+        # Get keywords from config
+        positive_keywords = self.positive_keywords
+        negative_keywords = self.negative_keywords
+        
+        # Check for positive keywords in title
+        positive_matches_title = []
+        for keyword in positive_keywords:
+            if keyword.lower() in title.lower():
+                positive_matches_title.append(keyword)
+        
+        # Check for positive keywords in metadata
+        positive_matches_metadata = []
+        for keyword in positive_keywords:
+            if keyword.lower() in metadata.lower():
+                positive_matches_metadata.append(keyword)
+        
+        # Check for negative keywords in title
+        negative_matches_title = []
+        for keyword in negative_keywords:
+            if keyword.lower() in title.lower():
+                negative_matches_title.append(keyword)
+        
+        # Check for negative keywords in metadata
+        negative_matches_metadata = []
+        for keyword in negative_keywords:
+            if keyword.lower() in metadata.lower():
+                negative_matches_metadata.append(keyword)
+        
+        # Combine matches
+        positive_matches = list(set(positive_matches_title + positive_matches_metadata))
+        negative_matches = list(set(negative_matches_title + negative_matches_metadata))
+        
+        # Log the matches for debugging
+        if positive_matches:
+            self.logger.debug(f"Positive keywords found: {positive_matches}")
+        
+        if negative_matches:
+            self.logger.debug(f"Negative keywords found: {negative_matches}")
+        
+        # Check URL patterns for brand or category indicators
+        brand_url_patterns = ['/brand/', '/brands/', '/manufacturer/', '/manufacturers/', 
+                             '/about/', '/company/', '/about-us/', '/our-company/']
+        url_suggests_brand = any(pattern in url.lower() for pattern in brand_url_patterns)
+        
+        # Check if title contains brand-related terms
+        brand_title_terms = ['brand', 'brands', 'manufacturer', 'manufacturers', 'official', 
+                            'company', 'about us', 'about', 'our story', 'history']
+        title_suggests_brand = any(term in title.lower() for term in brand_title_terms)
+        
+        # Check for category-related patterns in URL
+        category_url_patterns = ['/category/', '/categories/', '/products/', '/catalog/', 
+                                '/collection/', '/collections/', '/range/', '/series/']
+        url_suggests_category = any(pattern in url.lower() for pattern in category_url_patterns)
+        
+        # Check for category-related terms in title
+        category_title_terms = ['category', 'categories', 'products', 'catalog', 
+                               'collection', 'collections', 'range', 'series']
+        title_suggests_category = any(term in title.lower() for term in category_title_terms)
+        
+        # SIMPLIFIED FILTERING LOGIC
+        
+        # Strong indicators for brand pages
+        if url_suggests_brand or title_suggests_brand:
+            self.logger.info(f"URL or title suggests a brand page")
+            return {
+                'passed': True,
+                'page_type': 'brand_page',
+                'positive_keywords': positive_matches,
+                'negative_keywords': negative_matches
+            }
+        
+        # Strong indicators for category pages
+        if url_suggests_category or title_suggests_category:
+            self.logger.info(f"URL or title suggests a category page")
+            return {
+                'passed': True,
+                'page_type': 'brand_category_page',
+                'positive_keywords': positive_matches,
+                'negative_keywords': negative_matches
+            }
+        
+        # If we have positive keywords, it's worth checking
+        if positive_matches:
+            self.logger.info(f"Page has positive keywords, needs further analysis")
+            return {
+                'passed': True,
+                'page_type': 'inconclusive',
+                'positive_keywords': positive_matches,
+                'negative_keywords': negative_matches
+            }
+        
+        # Default case: mark as inconclusive for further analysis
+        self.logger.info(f"Page has no clear indicators, marking as inconclusive for further analysis")
+        return {
+            'passed': True,
+            'page_type': 'inconclusive',
+            'positive_keywords': positive_matches,
+            'negative_keywords': negative_matches
+        }
+    
+    def analyze_metadata(self, url: str, title: str, metadata: str, keyword_filter_result: Dict = None) -> Dict:
+        """
+        Analyze page metadata using Claude API to determine if a page is a manufacturer page.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            metadata: Page metadata
+            keyword_filter_result: Result from keyword_filter method
+            
+        Returns:
+            Dictionary with analysis results:
+                - page_type: One of 'brand_page', 'brand_category_page', 'other', or 'inconclusive'
+                - confidence: Confidence score (0-1)
+        """
+        self.logger.info(f"Step 2: Analyzing metadata for URL: {url}")
+        
+        # If we have a keyword filter result with a definitive page type, use it for context
+        page_type_hint = ""
+        if keyword_filter_result and keyword_filter_result.get('page_type') in ['brand_page', 'brand_category_page']:
+            page_type_hint = f"The keyword analysis suggests this might be a {keyword_filter_result.get('page_type').replace('_', ' ')}."
+            if keyword_filter_result.get('positive_keywords'):
+                page_type_hint += f" Positive keywords found: {', '.join(keyword_filter_result.get('positive_keywords'))}."
+        
+        # Prepare prompt
+        system_prompt = """You are an AI assistant that analyzes web page metadata to determine if a page is related to a manufacturer/brand.
+Your task is to classify the page into one of three categories:
+1. Brand page: A page about a manufacturer/brand, typically the main page or about page.
+2. Brand category page: A page listing products or categories from a specific manufacturer/brand.
+3. Other: Not related to a manufacturer/brand.
+
+Respond ONLY with one of these exact classifications: "brand_page", "brand_category_page", or "other".
+"""
+        
+        user_prompt = f"""URL: {url}
+Title: {title}
+Metadata: {metadata}
+{page_type_hint}
+
+Based on this information, classify this page as "brand_page", "brand_category_page", or "other".
+"""
+        
+        # Call Claude API
+        try:
+            response = self._call_claude_api(system_prompt + user_prompt)
+            
+            # Extract page type from response
+            page_type = response.strip().lower()
+            
+            # Validate page type
+            valid_page_types = ['brand_page', 'brand_category_page', 'other']
+            if page_type not in valid_page_types:
+                # Try to extract the page type from the response
+                for valid_type in valid_page_types:
+                    if valid_type in page_type:
+                        page_type = valid_type
+                        break
+                else:
+                    self.logger.warning(f"Invalid page type from Claude API: {page_type}, marking as inconclusive")
+                    page_type = 'inconclusive'
+            
+            self.logger.info(f"Metadata analysis result: {page_type}")
+            
+            return {
+                'page_type': page_type,
+                'confidence': 0.8 if page_type != 'inconclusive' else 0.5
+            }
+        except Exception as e:
+            self.logger.error(f"Error analyzing metadata: {str(e)}")
+            return {
+                'page_type': 'inconclusive',
+                'confidence': 0.0
+            }
+    
+    def analyze_content(self, url: str, title: str, content: str) -> Dict:
+        """
+        Analyze truncated page content and headers.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        self.logger.info(f"Step 4: Content analysis for URL: {url}")
+        
+        # Extract main content (truncated)
+        main_content = self._extract_main_content(content)
+        
+        # Extract key elements
+        key_elements = self._extract_key_elements(content)
+        
+        # Prepare prompt
+        system_prompt = """You are an AI assistant that analyzes web page content to determine if a page is related to a manufacturer/brand.
+Your task is to classify the page into one of three categories:
+1. Brand page: A page about a manufacturer/brand, typically the main page or about page.
+2. Brand category page: A page listing products or categories from a specific manufacturer/brand.
+3. Other: Not related to a manufacturer/brand.
+
+Respond ONLY with one of these exact classifications: "brand_page", "brand_category_page", or "other".
+"""
+        
+        user_prompt = f"""URL: {url}
+Title: {title}
+Content:
+{main_content}
+Key Elements:
+{key_elements}
+
+Based on this information, classify this page as "brand_page", "brand_category_page", or "other".
+"""
+        
+        # Call Claude API
+        try:
+            response = self._call_claude_api(system_prompt + user_prompt)
+            
+            # Parse response
+            page_type = response.strip().lower()
+            
+            # Validate page type
+            valid_page_types = ['brand_page', 'brand_category_page', 'other']
+            if page_type not in valid_page_types:
+                # Try to extract the page type from the response
+                for valid_type in valid_page_types:
+                    if valid_type in page_type:
+                        page_type = valid_type
+                        break
+                else:
+                    self.logger.warning(f"Invalid page type from Claude API: {page_type}, marking as inconclusive")
+                    page_type = 'inconclusive'
+            
+            self.logger.info(f"Content analysis result: {page_type}")
+            
+            return {
+                'page_type': page_type,
+                'confidence': 0.8 if page_type != 'inconclusive' else 0.5
+            }
+        except Exception as e:
+            self.logger.error(f"Error analyzing content: {str(e)}")
+            return {
+                'page_type': 'inconclusive',
+                'confidence': 0.0
+            }
+    
+    def extract_manufacturer_data(self, url: str, title: str, content: str, page_type: str) -> List[str]:
+        """
+        Extract manufacturer data based on page type.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content
+            page_type: Page type ('brand_page' or 'brand_category_page')
+            
+        Returns:
+            List of extracted categories
+        """
+        self.logger.info(f"Extracting manufacturer data for page type: {page_type}")
+        
+        # Extract categories based on page type
+        if page_type == 'brand_page':
+            return self.extract_manufacturer_data_for_brand_page(url, title, content)
+        elif page_type == 'brand_category_page':
+            return self.extract_manufacturer_data_for_category_page(url, title, content)
+        else:
+            self.logger.warning(f"Unsupported page type for manufacturer data extraction: {page_type}")
+            return []
+    
+    def extract_manufacturer_data_for_brand_page(self, url: str, title: str, content: str) -> Dict:
+        """
+        Extract manufacturer data for a brand page.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content
+            
+        Returns:
+            Dictionary with manufacturer name, categories, and URL
+        """
+        self.logger.info(f"Extracting manufacturer data for brand page: {url}")
+        
+        # Extract key elements from the content
+        key_elements = self._extract_key_elements(content)
+        
+        # Extract main content (truncated)
+        main_content = self._extract_main_content(content, max_chars=1500)
+        
+        # Prepare prompt for Claude API
+        system_prompt = """You are an expert in analyzing manufacturer websites and extracting product categories.
+Your task is to identify all product categories from a manufacturer's website.
+Respond with ONLY a list of product categories, one per line, with no additional text or explanation.
+Focus on main product categories, not individual products or subcategories.
+"""
+        
+        user_prompt = f"""URL: {url}
+Title: {title}
+
+Key Elements:
+{key_elements}
+
+Truncated Content:
+{main_content}
+
+Extract all product categories from this manufacturer page. List ONLY the main product categories, one per line.
+"""
+        
+        # Call Claude API
+        try:
+            response = self._call_claude_api(system_prompt + user_prompt)
+            
+            # Parse categories - one per line
+            categories = []
+            if response:
+                for line in response.strip().split('\n'):
+                    category = line.strip()
+                    if category:
+                        categories.append(category)
+            
+            # Translate categories if enabled
+            if self.translation_manager and categories:
+                from scraper.translation_manager import TranslationManager
+                translation_manager = TranslationManager()
+                
+                # Get target languages from config
+                target_languages = self.config_manager.get('languages.targets', {})
+                
+                # Translate to each target language
+                for lang_code, lang_name in target_languages.items():
+                    self.logger.info(f"Translating {len(categories)} categories to {lang_name}")
+                    translated_categories = translation_manager.translate_list(categories, 'en', lang_code)
+                    
+                    # Log the translations
+                    for i, (orig, trans) in enumerate(zip(categories, translated_categories)):
+                        self.logger.debug(f"  {i+1}. '{orig}' -> '{trans}'")
+            
+            # Update statistics
+            self.stats['categories_found'] += len(categories)
+            
+            # Extract manufacturer name from title or URL
+            manufacturer_name = self._extract_manufacturer_name(url, title)
+            
+            # Return extracted data
+            return {
+                'manufacturer_name': manufacturer_name,
+                'categories': categories,
+                'url': url
+            }
+        except Exception as e:
+            self.logger.error(f"Error extracting manufacturer data for brand page: {str(e)}")
+            return []
+    
+    def extract_manufacturer_data_for_category_page(self, url: str, title: str, content: str) -> List[str]:
+        """
+        Extract manufacturer data for a category page.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content
+            
+        Returns:
+            List of extracted categories
+        """
+        self.logger.info(f"Extracting manufacturer data for category page: {url}")
+        
+        # Extract key elements
+        key_elements = self._extract_key_elements(content)
+        
+        # Prepare prompt for Claude API
+        system_prompt = """You are an expert in analyzing manufacturer websites and extracting product categories.
+Your task is to identify the main product category from this specific category page.
+Respond with ONLY the category name, nothing else.
+"""
+        
+        user_prompt = f"""URL: {url}
+Title: {title}
+
+Key Elements:
+{key_elements}
+
+Based on this information, what is the SINGLE main product category represented on this page?
+Respond with ONLY the category name, no explanations or additional text.
+"""
+        
+        # Call Claude API
+        try:
+            response = self._call_claude_api(system_prompt + user_prompt)
+            
+            # Clean up response
+            category = response.strip() if response else None
+            
+            # Translate category if enabled
+            if self.translation_manager and category:
+                category = self.translate_category(category)
+            
+            self.logger.info(f"Extracted category: {category}")
+            return [category] if category else []
+        except Exception as e:
+            self.logger.error(f"Error extracting manufacturer data for category page: {str(e)}")
+            return []
+    
+    def analyze_page(self, url: str, title: str, content: str, metadata: str = None) -> Dict:
+        """
+        Analyze a page to determine if it's a manufacturer page and extract relevant data.
+        
+        This method follows a 3-step process:
+        1. Keyword filtering (no Claude API call)
+        2. Metadata analysis (Claude API call with title and metadata)
+        3. Content analysis (Claude API call with truncated content)
+        
+        Args:
+            url: Page URL
+            title: Page title
+            content: Page content
+            metadata: Optional page metadata (headers, meta tags)
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        self.logger.info(f"Analyzing page: {url}")
+        
+        # Extract metadata if not provided
+        if metadata is None:
+            metadata = self._extract_metadata_from_content(content)
+        
+        # STEP 1: Keyword filtering
+        keyword_result = self.keyword_filter(url, title, content)
+        
+        # If keyword filter indicates this is definitely not a manufacturer page, skip further analysis
+        if not keyword_result['passed']:
+            self.logger.info(f"Page failed keyword filter: {url}")
+            return {
+                'is_manufacturer_page': False,
+                'page_type': 'other',
+                'categories': [],
+                'analysis_method': 'keyword_filter'
+            }
+        
+        # If keyword filter gives a definitive result, use it
+        if keyword_result['page_type'] in ['brand_page', 'brand_category_page']:
+            page_type = keyword_result['page_type']
+            is_manufacturer_page = page_type == 'brand_page'
+            is_category_page = page_type == 'brand_category_page'
+            
+            # For manufacturer pages, extract categories
+            categories = []
+            if is_manufacturer_page or is_category_page:
+                categories = self.extract_manufacturer_data(url, title, content, page_type)
+            
+            return {
+                'is_manufacturer_page': is_manufacturer_page,
+                'is_category_page': is_category_page,
+                'page_type': page_type,
+                'categories': categories,
+                'analysis_method': 'keyword_filter'
+            }
+        
+        # STEP 2: Metadata analysis
+        try:
+            metadata_result = self.analyze_metadata(url, title, metadata)
+            
+            # If metadata analysis gives a definitive result, use it
+            if metadata_result['page_type'] != 'inconclusive':
+                page_type = metadata_result['page_type']
+                is_manufacturer_page = page_type == 'brand_page'
+                is_category_page = page_type == 'brand_category_page'
+                
+                # For manufacturer pages, extract categories
+                categories = []
+                if is_manufacturer_page or is_category_page:
+                    categories = self.extract_manufacturer_data(url, title, content, page_type)
+                
+                return {
+                    'is_manufacturer_page': is_manufacturer_page,
+                    'is_category_page': is_category_page,
+                    'page_type': page_type,
+                    'categories': categories,
+                    'analysis_method': 'metadata_analysis'
+                }
+        except Exception as e:
+            self.logger.error(f"Error in metadata analysis: {str(e)}")
+        
+        # STEP 3: Content analysis
+        try:
+            content_result = self.analyze_content(url, title, content)
+            
+            page_type = content_result['page_type']
+            is_manufacturer_page = page_type == 'brand_page'
+            is_category_page = page_type == 'brand_category_page'
+            
+            # For manufacturer pages, extract categories
+            categories = []
+            if is_manufacturer_page or is_category_page:
+                categories = self.extract_manufacturer_data(url, title, content, page_type)
+            
+            return {
+                'is_manufacturer_page': is_manufacturer_page,
+                'is_category_page': is_category_page,
+                'page_type': page_type,
+                'categories': categories,
+                'analysis_method': 'content_analysis'
+            }
+        except Exception as e:
+            self.logger.error(f"Error in content analysis: {str(e)}")
+        
+        # Default: not a manufacturer page
+        self.logger.info(f"All analysis methods failed, marking as not a manufacturer page: {url}")
+        return {
+            'is_manufacturer_page': False,
+            'is_category_page': False,
+            'page_type': 'other',
+            'categories': [],
+            'analysis_method': 'default'
+        }
+    
+    def _extract_key_elements(self, content: str) -> str:
+        """
+        Extract key elements from HTML content that are likely to contain valuable information
+        about manufacturers and product categories.
+        
+        Extracts:
+        - Headers (h1, h2, h3)
+        - List items from unordered and ordered lists (ul/ol)
+        - Strong/bold text
+        - Breadcrumb navigation
+        - Menu items
+        
+        Args:
+            content: HTML content
+            
+        Returns:
+            Extracted key elements as a string
+        """
+        key_elements = []
+        
+        try:
+            # Parse HTML content
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Extract headers (h1, h2, h3)
+            for header in soup.find_all(['h1', 'h2', 'h3']):
+                header_text = header.get_text(strip=True)
+                if header_text:
+                    key_elements.append(f"{header.name}: {header_text}")
+            
+            # Extract breadcrumb navigation
+            breadcrumbs = []
+            for breadcrumb in soup.find_all(class_=lambda c: c and ('breadcrumb' in c.lower() or 'bread-crumb' in c.lower())):
+                for item in breadcrumb.find_all(['li', 'a', 'span']):
+                    text = item.get_text(strip=True)
+                    if text and text not in breadcrumbs and len(text) < 50:  # Avoid duplicates and long text
+                        breadcrumbs.append(text)
+            
+            if breadcrumbs:
+                key_elements.append("Breadcrumb: " + " > ".join(breadcrumbs))
+            
+            # Extract list items from unordered and ordered lists
+            # Focus on short lists that are likely to be categories or menu items
+            for list_tag in soup.find_all(['ul', 'ol']):
+                # Skip very long lists (likely not category lists)
+                list_items = list_tag.find_all('li')
+                if len(list_items) > 15:
+                    continue
+                
+                # Check if this list is likely a menu or category list
+                list_text = list_tag.get_text(strip=True)
+                if len(list_text) > 500:  # Skip long text lists
+                    continue
+                
+                # Extract items
+                items = []
+                for item in list_items:
+                    item_text = item.get_text(strip=True)
+                    if item_text and len(item_text) < 50:  # Skip very long items
+                        items.append(item_text)
+                
+                if items:
+                    key_elements.append(f"List: {', '.join(items)}")
+            
+            # Extract strong/bold text that might indicate important categories or features
+            for strong in soup.find_all(['strong', 'b']):
+                # Skip if inside a header (already captured)
+                if strong.find_parent(['h1', 'h2', 'h3']):
+                    continue
+                
+                strong_text = strong.get_text(strip=True)
+                if strong_text and len(strong_text) < 50:  # Skip very long text
+                    key_elements.append(f"Strong: {strong_text}")
+            
+            # Extract menu items (common class names for menus)
+            menu_classes = ['menu', 'nav', 'navigation', 'navbar', 'main-menu', 'categories']
+            for menu_class in menu_classes:
+                for menu in soup.find_all(class_=lambda c: c and menu_class in c.lower()):
+                    menu_items = []
+                    for item in menu.find_all('a'):
+                        item_text = item.get_text(strip=True)
+                        if item_text and len(item_text) < 30:  # Skip very long menu items
+                            menu_items.append(item_text)
+                    
+                    if menu_items:
+                        key_elements.append(f"Menu: {', '.join(menu_items[:10])}")  # Limit to 10 items
+                        break  # Only get one menu of each type
+            
+            self.logger.debug(f"Extracted {len(key_elements)} key elements")
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting key elements: {str(e)}")
+        
+        return "\n".join(key_elements)
+
+    def _extract_main_content(self, content: str, max_chars: int = 1500) -> str:
+        """
+        Extract the main content from HTML, removing headers, footers, navigation, etc.
+        Truncates the content to the specified maximum number of characters.
+        
+        Args:
+            content: HTML content
+            max_chars: Maximum number of characters to return
+            
+        Returns:
+            Extracted main content as a string
+        """
+        try:
+            # Parse HTML content
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Remove script, style, nav, footer, header tags
+            for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe']):
+                tag.decompose()
+            
+            # Get the text content
+            text = soup.get_text(separator=' ', strip=True)
+            
+            # Truncate to max_chars
+            if len(text) > max_chars:
+                text = text[:max_chars] + "..."
+            
+            return text
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting main content: {str(e)}")
+            return content[:max_chars] if content else ""
+
+    def _extract_metadata_from_content(self, content: str) -> str:
+        """
+        Extract metadata from HTML content, including meta tags, headers, and title.
+        
+        Args:
+            content: HTML content
+            
+        Returns:
+            Extracted metadata as a string
+        """
+        metadata = []
+        
+        try:
+            # Parse HTML content
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Extract title
+            title = soup.title.string if soup.title else ""
+            if title:
+                metadata.append(f"Title: {title.strip()}")
+            
+            # Extract meta tags
+            for meta in soup.find_all('meta'):
+                name = meta.get('name', meta.get('property', ''))
+                content = meta.get('content', '')
+                if name and content:
+                    metadata.append(f"Meta {name}: {content}")
+            
+            # Extract key elements
+            key_elements = self._extract_key_elements(content)
+            if key_elements:
+                metadata.append(f"Key Elements:\n{key_elements}")
+            
+            # Extract Open Graph tags (often contain valuable information)
+            for meta in soup.find_all('meta', property=lambda x: x and x.startswith('og:')):
+                content = meta.get('content', '')
+                if content:
+                    property_name = meta.get('property', '')
+                    metadata.append(f"OG {property_name}: {content}")
+            
+            self.logger.debug(f"Extracted {len(metadata)} metadata items")
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting metadata: {str(e)}")
+        
+        return "\n".join(metadata)
+
+    def get_statistics(self) -> Dict:
+        """
+        Get statistics about Claude Analyzer usage.
+        
+        Returns:
+            Dictionary with usage statistics
+        """
+        return self.stats
+    
+    def reset_statistics(self) -> None:
+        """Reset usage statistics."""
+        self.stats = {
+            'pages_analyzed': 0,
+            'manufacturer_pages_found': 0,
+            'tokens_used': 0,
+            'cache_hits': 0,
+            'errors': 0,
+            'categories_found': 0,
+            'claude_api_calls': 0,
+            'claude_api_cache_hits': 0,
+            'claude_api_prompt_tokens': 0,
+            'claude_api_completion_tokens': 0,
+            'claude_api_total_tokens': 0,
+            'claude_api_errors': 0
+        }
+        self.logger.info("Statistics reset")
+
+    def _extract_manufacturer_name(self, url: str, title: str) -> str:
+        """
+        Extract manufacturer name from URL or title.
+        
+        Args:
+            url: Page URL
+            title: Page title
+            
+        Returns:
+            Manufacturer name
+        """
+        manufacturer_name = None
+        
+        # Check for common patterns in URL
+        url_parts = url.split('/')
+        for i, part in enumerate(url_parts):
+            if part.lower() in ['brand', 'brands', 'manufacturer', 'manufacturers'] and i+1 < len(url_parts):
+                manufacturer_name = url_parts[i+1].replace('-', ' ').replace('_', ' ').title()
+                break
+        
+        # If no manufacturer name found in URL, try to extract from title
+        if not manufacturer_name:
+            # Look for patterns like "Brand Name - Categories" or "Categories - Brand Name"
+            title_parts = title.split('-')
+            if len(title_parts) > 1:
+                # Assume the brand name is either the first or last part
+                manufacturer_name = title_parts[0].strip()
+        
+        return manufacturer_name
