@@ -118,3 +118,37 @@ prompt_templates:
         ...
       ]
     }
+
+# Web crawler configuration
+web_crawler:
+  # Crawler behavior
+  max_depth: 3
+  max_urls_per_domain: 100
+  max_concurrent_requests: 5
+  request_delay: 1.0
+  timeout: 30
+  user_agent: 'Mozilla/5.0 (compatible; NDaiviBot/1.0; +https://ndaivi.com/bot)'
+  respect_robots_txt: true
+  follow_redirects: true
+  
+  # Domain restrictions
+  allowed_domains: []
+  disallowed_domains: []
+  allowed_url_patterns: []
+  disallowed_url_patterns: []
+  
+  # Content handling
+  max_content_size: 5242880  # 5MB
+  extract_metadata: true
+  extract_links: true
+  extract_text: true
+  
+  # Database and state
+  db_path: 'scraper/data/crawler.db'
+  
+  # Crawl mode
+  restrict_to_start_domain: true
+  single_domain_mode: true
+  
+  # Stats
+  stats_update_interval: 10  # Update stats every 10 URLs
