@@ -10,6 +10,7 @@ import sys
 import argparse
 import logging
 import time
+import json
 from typing import Dict, Any, List, Optional
 
 # Add the project root to the path
@@ -134,54 +135,186 @@ def run_crawler(
         crawler.close()
         logger.info("Crawler closed")
 
+def get_backlog_batch(batch_size: int = 10) -> None:
+    """
+    Get a batch of URLs from the backlog for analysis and print them as JSON.
+    
+    Args:
+        batch_size: Maximum number of URLs to return
+    """
+    # Load configuration
+    config_manager = ConfigManager()
+    crawler_config = config_manager.get('web_crawler', {})
+    
+    if not crawler_config:
+        logger.error("Failed to load web crawler configuration")
+        return
+    
+    # Create crawler
+    crawler = WebCrawler(config=crawler_config)
+    
+    try:
+        # Get batch from backlog
+        batch = crawler.get_backlog_batch(batch_size=batch_size)
+        
+        # Print as JSON
+        print(json.dumps(batch, indent=2))
+        
+        # Log stats
+        logger.info(f"Retrieved {len(batch)} URLs from backlog")
+        
+        # Print backlog stats
+        backlog_stats = crawler.get_backlog_stats()
+        logger.info(f"Backlog stats: {backlog_stats.get('backlog_size')}/{backlog_stats.get('backlog_capacity')} URLs in backlog ({backlog_stats.get('backlog_usage')*100:.1f}%)")
+    finally:
+        # Close crawler
+        crawler.close()
+
+def mark_as_processed(url: str) -> None:
+    """
+    Mark a URL as processed and remove it from the backlog.
+    
+    Args:
+        url: URL to mark as processed
+    """
+    # Load configuration
+    config_manager = ConfigManager()
+    crawler_config = config_manager.get('web_crawler', {})
+    
+    if not crawler_config:
+        logger.error("Failed to load web crawler configuration")
+        return
+    
+    # Create crawler
+    crawler = WebCrawler(config=crawler_config)
+    
+    try:
+        # Mark URL as processed
+        success = crawler.mark_as_processed(url)
+        
+        if success:
+            logger.info(f"Successfully marked URL as processed: {url}")
+            print(f"Successfully marked URL as processed: {url}")
+        else:
+            logger.error(f"Failed to mark URL as processed: {url}")
+            print(f"Failed to mark URL as processed: {url}")
+        
+        # Print backlog stats
+        backlog_stats = crawler.get_backlog_stats()
+        logger.info(f"Backlog stats: {backlog_stats.get('backlog_size')}/{backlog_stats.get('backlog_capacity')} URLs in backlog ({backlog_stats.get('backlog_usage')*100:.1f}%)")
+    finally:
+        # Close crawler
+        crawler.close()
+
+def update_config(config_updates: Dict[str, Any]) -> None:
+    """
+    Update the crawler configuration.
+    
+    Args:
+        config_updates: Dictionary of configuration updates
+    """
+    # Load configuration
+    config_manager = ConfigManager()
+    crawler_config = config_manager.get('web_crawler', {})
+    
+    if not crawler_config:
+        logger.error("Failed to load web crawler configuration")
+        return
+    
+    # Create crawler
+    crawler = WebCrawler(config=crawler_config)
+    
+    try:
+        # Update config
+        crawler.update_config(config_updates)
+        logger.info(f"Updated crawler configuration: {config_updates}")
+        print(f"Updated crawler configuration: {json.dumps(config_updates, indent=2)}")
+    finally:
+        # Close crawler
+        crawler.close()
+
 def main():
     """Main function to parse arguments and run the crawler."""
     parser = argparse.ArgumentParser(description='Run the NDAIVI web crawler')
-    parser.add_argument('start_url', help='URL to start crawling from')
-    parser.add_argument('--max-urls', type=int, help='Maximum number of URLs to process')
-    parser.add_argument('--max-time', type=int, help='Maximum time to run in seconds')
-    parser.add_argument('--max-depth', type=int, help='Maximum crawl depth')
-    parser.add_argument('--single-domain', action='store_true', help='Restrict to the start domain only')
-    parser.add_argument('--db-path', help='Path to the crawler database')
-    parser.add_argument('--delay', type=float, help='Delay between requests in seconds')
-    parser.add_argument('--user-agent', help='User agent string to use')
-    parser.add_argument('--allowed-domains', nargs='+', help='List of allowed domains')
-    parser.add_argument('--disallowed-domains', nargs='+', help='List of disallowed domains')
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # Crawl command
+    crawl_parser = subparsers.add_parser('crawl', help='Start crawling from a URL')
+    crawl_parser.add_argument('start_url', help='URL to start crawling from')
+    crawl_parser.add_argument('--max-urls', type=int, help='Maximum number of URLs to process')
+    crawl_parser.add_argument('--max-time', type=int, help='Maximum time to run in seconds')
+    crawl_parser.add_argument('--max-depth', type=int, help='Maximum crawl depth')
+    crawl_parser.add_argument('--single-domain', action='store_true', help='Restrict to the start domain only')
+    crawl_parser.add_argument('--db-path', help='Path to the crawler database')
+    crawl_parser.add_argument('--delay', type=float, help='Delay between requests in seconds')
+    crawl_parser.add_argument('--user-agent', help='User agent string to use')
+    crawl_parser.add_argument('--allowed-domains', nargs='+', help='List of allowed domains')
+    crawl_parser.add_argument('--disallowed-domains', nargs='+', help='List of disallowed domains')
+    
+    # Get backlog batch command
+    backlog_parser = subparsers.add_parser('get-backlog', help='Get a batch of URLs from the backlog')
+    backlog_parser.add_argument('--batch-size', type=int, default=10, help='Number of URLs to get from the backlog')
+    
+    # Mark as processed command
+    mark_parser = subparsers.add_parser('mark-processed', help='Mark a URL as processed')
+    mark_parser.add_argument('url', help='URL to mark as processed')
+    
+    # Update config command
+    config_parser = subparsers.add_parser('update-config', help='Update the crawler configuration')
+    config_parser.add_argument('--config-json', required=True, help='JSON string with configuration updates')
     
     args = parser.parse_args()
     
-    # Build configuration overrides
-    config_overrides = {}
+    # Ensure logs directory exists
+    os.makedirs('logs', exist_ok=True)
     
-    if args.max_depth is not None:
-        config_overrides['max_depth'] = args.max_depth
-    
-    if args.single_domain:
-        config_overrides['single_domain_mode'] = True
-        config_overrides['restrict_to_start_domain'] = True
-    
-    if args.db_path:
-        config_overrides['db_path'] = args.db_path
-    
-    if args.delay is not None:
-        config_overrides['request_delay'] = args.delay
-    
-    if args.user_agent:
-        config_overrides['user_agent'] = args.user_agent
-    
-    if args.allowed_domains:
-        config_overrides['allowed_domains'] = args.allowed_domains
-    
-    if args.disallowed_domains:
-        config_overrides['disallowed_domains'] = args.disallowed_domains
-    
-    # Run the crawler
-    run_crawler(
-        start_url=args.start_url,
-        max_urls=args.max_urls,
-        max_time=args.max_time,
-        config_overrides=config_overrides
-    )
+    # Handle commands
+    if args.command == 'crawl':
+        # Build configuration overrides
+        config_overrides = {}
+        
+        if args.max_depth is not None:
+            config_overrides['max_depth'] = args.max_depth
+        
+        if args.single_domain:
+            config_overrides['single_domain_mode'] = True
+            config_overrides['restrict_to_start_domain'] = True
+        
+        if args.db_path:
+            config_overrides['db_path'] = args.db_path
+        
+        if args.delay is not None:
+            config_overrides['request_delay'] = args.delay
+        
+        if args.user_agent:
+            config_overrides['user_agent'] = args.user_agent
+        
+        if args.allowed_domains:
+            config_overrides['allowed_domains'] = args.allowed_domains
+        
+        if args.disallowed_domains:
+            config_overrides['disallowed_domains'] = args.disallowed_domains
+        
+        # Run the crawler
+        run_crawler(
+            start_url=args.start_url,
+            max_urls=args.max_urls,
+            max_time=args.max_time,
+            config_overrides=config_overrides
+        )
+    elif args.command == 'get-backlog':
+        get_backlog_batch(batch_size=args.batch_size)
+    elif args.command == 'mark-processed':
+        mark_as_processed(url=args.url)
+    elif args.command == 'update-config':
+        try:
+            config_updates = json.loads(args.config_json)
+            update_config(config_updates)
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON format: {args.config_json}")
+            print(f"Invalid JSON format: {args.config_json}")
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()

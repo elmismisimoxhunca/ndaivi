@@ -9,6 +9,7 @@ import os
 import sys
 import logging
 import time
+import argparse
 from typing import Dict, Any
 
 # Add the project root to the path
@@ -26,6 +27,23 @@ logging.basicConfig(
         logging.FileHandler('logs/crawler_test.log')
     ]
 )
+
+# Set more restrictive log levels for noisy modules
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+logging.getLogger('bs4').setLevel(logging.WARNING)
+logging.getLogger('content_extractor').setLevel(logging.INFO)
+
+# Create a filter to prevent logging of large content
+class ContentFilter(logging.Filter):
+    def filter(self, record):
+        if hasattr(record, 'msg') and isinstance(record.msg, str) and len(record.msg) > 500:
+            record.msg = record.msg[:500] + '... [content truncated]'
+        return True
+
+# Apply filter to all handlers
+for handler in logging.root.handlers:
+    handler.addFilter(ContentFilter())
 
 logger = logging.getLogger('crawler_test')
 
@@ -46,22 +64,85 @@ def stats_callback(stats: Dict[str, Any]) -> None:
 
 def main():
     """Main function to test the web crawler."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Test the web crawler with a specific URL')
+    parser.add_argument('start_url', nargs='?', default="https://example.com", 
+                        help='URL to start crawling from (default: https://example.com)')
+    parser.add_argument('--max-urls', type=int, default=10, 
+                        help='Maximum number of URLs to crawl (default: 10)')
+    parser.add_argument('--max-depth', type=int, default=None, 
+                        help='Maximum depth to crawl (default: use config value)')
+    parser.add_argument('--delay', type=float, default=None, 
+                        help='Delay between requests in seconds (default: use config value)')
+    parser.add_argument('--timeout', type=int, default=None, 
+                        help='Request timeout in seconds (default: use config value)')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                        default='INFO', help='Logging level (default: INFO)')
+    parser.add_argument('--clean', action='store_true',
+                        help='Clean database before starting (default: False)')
+    
+    args = parser.parse_args()
+    
+    # Set log level
+    logger.setLevel(getattr(logging, args.log_level))
+    
     # Ensure the data directory exists
-    os.makedirs('scraper/data', exist_ok=True)
+    data_dir = os.path.abspath('scraper/data')
+    logs_dir = os.path.abspath('logs')
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
     
     # Load configuration
     config_manager = ConfigManager()
-    crawler_config = config_manager.get_config('web_crawler')
+    crawler_config = config_manager.get('web_crawler')
     
     if not crawler_config:
         logger.error("Failed to load web crawler configuration")
         return
     
+    # Set absolute database path
+    if 'db_path' in crawler_config:
+        if not os.path.isabs(crawler_config['db_path']):
+            crawler_config['db_path'] = os.path.abspath(crawler_config['db_path'])
+    else:
+        crawler_config['db_path'] = os.path.join(data_dir, 'crawler.db')
+    
+    # Clean database if requested
+    if args.clean and os.path.exists(crawler_config['db_path']):
+        try:
+            logger.info(f"Cleaning database: {crawler_config['db_path']}")
+            os.remove(crawler_config['db_path'])
+            # Also remove journal files
+            journal_file = f"{crawler_config['db_path']}-journal"
+            if os.path.exists(journal_file):
+                os.remove(journal_file)
+            logger.info("Database cleaned successfully")
+        except Exception as e:
+            logger.error(f"Failed to clean database: {e}")
+    
+    # Override config with command line arguments if provided
+    if args.max_depth is not None:
+        crawler_config['max_depth'] = args.max_depth
+    if args.delay is not None:
+        crawler_config['request_delay'] = args.delay
+    if args.timeout is not None:
+        crawler_config['timeout'] = args.timeout
+    
+    # Set max URLs from command line argument
+    crawler_config['max_urls'] = args.max_urls
+    
+    # Ensure domain restriction is enabled
+    crawler_config['restrict_to_start_domain'] = True
+    crawler_config['allow_subdomains'] = False  # Only crawl exact domain, not subdomains
+    
     # Create and configure the crawler
-    start_url = "https://example.com"
+    start_url = args.start_url
     
     logger.info(f"Initializing crawler with start URL: {start_url}")
     logger.info(f"Using database: {crawler_config.get('db_path', 'default.db')}")
+    logger.info(f"Max depth: {crawler_config.get('max_depth')}")
+    logger.info(f"Request delay: {crawler_config.get('request_delay')}s")
+    logger.info(f"Timeout: {crawler_config.get('timeout')}s")
     
     crawler = WebCrawler(
         config=crawler_config,
@@ -73,8 +154,8 @@ def main():
     
     # Start crawling
     try:
-        logger.info("Starting crawl process")
-        crawler.crawl(max_urls=10)  # Limit to 10 URLs for testing
+        logger.info(f"Starting crawl process (max URLs: {args.max_urls})")
+        crawler.crawl(max_urls=args.max_urls)
     except KeyboardInterrupt:
         logger.info("Crawl interrupted by user")
     except Exception as e:
