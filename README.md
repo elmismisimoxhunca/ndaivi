@@ -1,6 +1,6 @@
 # NDAIVI - Python Scraping Engine for Manuals
 
-*Updated on March 15, 2025*
+*Updated on March 22, 2025*
 
 ## Project Overview
 NDAIVI is an automated scraping engine designed to extract user manuals from competitor and manufacturer websites. The system populates an SQLite database that can be used by a React frontend and Flask admin system. The primary goal is to self-populate and maintain a manuals database with minimal manual intervention.
@@ -21,29 +21,34 @@ NDAIVI is an automated scraping engine designed to extract user manuals from com
   - anthropic: AI analysis with Claude API
   - schedule: Periodic updates
   - yaml: Configuration management
+  - redis: Message-based communication between components
 - **Database**: SQLite (manuals.db)
+- **Message Broker**: Redis
 - **Virtual Environment**: `/var/ndaivimanuales/ndaivi`
 
 ## Project Structure
 ```
 /var/ndaivimanuales/
 ├── config.yaml           # Main configuration file
-├── main.py               # Entry point for the scraper
-├── run_claude_scraper.py # Script to run Claude-based scraping
-├── cli.py                # Command-line interface
-├── utils.py              # Utility functions
-├── validate_data.py      # Data validation tools
+├── run.py                # Main application entry point with interactive CLI
+├── utils/                # Utility components
+│   ├── __init__.py
+│   └── redis_manager.py  # Redis communication manager
 ├── database/             # Database components
 │   ├── __init__.py
 │   ├── db_manager.py     # Database connection manager
 │   └── schema.py         # Database schema definitions
 ├── scraper/              # Scraping components
 │   ├── __init__.py
-│   ├── competitor_scraper.py # Main scraper for competitor sites
+│   ├── web_crawler.py    # Web crawler implementation
+│   ├── crawler_worker.py # Worker for the web crawler
 │   ├── claude_analyzer.py    # Claude AI integration
+│   ├── analyzer_worker.py    # Worker for the Claude analyzer
+│   ├── stats_manager.py      # Statistics tracking
 │   └── prompt_templates.py   # Templates for Claude prompts
 ├── logs/                 # Log files directory
-│   └── ndaivi.log        # Main log file
+│   ├── ndaivi.log        # Main log file
+│   └── crawler.log       # Crawler-specific log file
 └── docs/                 # Documentation
 ```
 
@@ -61,10 +66,13 @@ NDAIVI is an automated scraping engine designed to extract user manuals from com
 ### 2. Claude AI Integration
 - Uses Anthropic's Claude API for intelligent data extraction
 - Specialized prompt templates for consistent data formatting
-- Two main functions:
-  - Manufacturer page detection
-  - Manufacturer data extraction (name, categories, website)
+- Four-step analysis process:
+  1. **Keyword Filter**: Quick filtering without API calls
+  2. **Metadata Analysis**: Analyzes page metadata using Claude
+  3. **Link Analysis**: Analyzes page links if metadata is inconclusive
+  4. **Content Analysis**: Analyzes page content as a final step
 - Strict delimited response format for reliable parsing
+- Caching for API responses to reduce costs
 
 ### 3. Database Management
 - SQLite database with optimized configuration
@@ -76,10 +84,26 @@ NDAIVI is an automated scraping engine designed to extract user manuals from com
   - ScraperLog for logging events
 - Thread-safe database manager to prevent locks
 
-### 4. Monitoring System
+### 4. Redis-Based Messaging Architecture
+- Decoupled components that communicate via Redis pub/sub channels
+- Each component runs in its own thread for concurrent operation
+- Key Redis channels:
+  - `ndaivi:crawler:commands` - Commands for the crawler
+  - `ndaivi:crawler:status` - Status updates from the crawler
+  - `ndaivi:analyzer:commands` - Commands for the analyzer
+  - `ndaivi:analyzer:status` - Status updates from the analyzer
+  - `ndaivi:stats` - Statistics from all components
+  - `ndaivi:system` - System-wide messages
+
+### 5. Interactive CLI
+- Simple command-line interface for controlling the system
+- Commands: crawl, analyze, stats, status, help, exit
+- Real-time status updates and statistics
+
+### 6. Monitoring System
 - Comprehensive logging to file and database
-- Statistics tracking and reporting
-- Health monitoring
+- Statistics tracking and reporting via Redis
+- Health monitoring and status updates
 
 ## Configuration
 The system is configured via `config.yaml` which includes:
@@ -89,26 +113,31 @@ The system is configured via `config.yaml` which includes:
 - Crawling parameters (depth, delay, user agent)
 - Language settings for translations
 - Keyword filters
+- Redis connection settings
 
 ## Usage
 ```bash
-# Basic usage
-python main.py
+# Start the application with interactive CLI
+python run.py
 
 # With custom config
-python main.py --config custom_config.yaml
+python run.py --config custom_config.yaml
+```
 
-# Validate config only
-python main.py --validate-only
-
-# Display statistics only
-python main.py --stats-only
+### Interactive CLI Commands
+```
+crawl <url> [max_urls] [max_depth] - Start crawling from a URL
+analyze <url> - Analyze a specific URL with Claude
+stats - Display current statistics
+status - Show system status
+help - Display available commands
+exit - Exit the application
 ```
 
 ## Logging
 Logs are stored in the `logs/` directory:
 - `ndaivi.log`: Main application log
-- `competitor_scraper.log`: Detailed scraping logs
+- `crawler.log`: Detailed crawler logs
 
 ## Database Schema
 - **products**: Stores product information

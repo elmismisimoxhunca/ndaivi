@@ -33,7 +33,7 @@ claude_analyzer:
   cache_ttl: 86400
   cache_dir: ".cache"
   max_tokens: 4000
-  temperature: 0.1
+  temperature: 0.0
   min_confidence_threshold: 0.7
 
 # Keywords for filtering
@@ -132,7 +132,7 @@ web_crawler:
   follow_redirects: true
   
   # Domain restrictions
-  allowed_domains: []
+  allowed_domains: [manualslib.com]
   disallowed_domains: []
   allowed_url_patterns: []
   disallowed_url_patterns: []
@@ -152,3 +152,38 @@ web_crawler:
   
   # Stats
   stats_update_interval: 10  # Update stats every 10 URLs
+
+# Redis configuration
+redis:
+  host: 'localhost'
+  port: 6379
+  db: 0
+  password: null
+  socket_timeout: 5
+  socket_connect_timeout: 5
+  retry_on_timeout: true
+  health_check_interval: 30
+
+# Application configuration
+application:
+  # Component settings
+  components:
+    crawler:
+      enabled: true
+      worker_threads: 1
+    analyzer:
+      enabled: true
+      worker_threads: 1
+      batch_size: 10
+    stats:
+      enabled: true
+      update_interval: 5  # Update stats every 5 seconds
+  
+  # Redis channels
+  channels:
+    crawler_commands: 'ndaivi:crawler:commands'
+    crawler_status: 'ndaivi:crawler:status'
+    analyzer_commands: 'ndaivi:analyzer:commands'
+    analyzer_status: 'ndaivi:analyzer:status'
+    stats: 'ndaivi:stats'
+    system: 'ndaivi:system'

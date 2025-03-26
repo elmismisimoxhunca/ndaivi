@@ -144,10 +144,24 @@ def main():
     logger.info(f"Request delay: {crawler_config.get('request_delay')}s")
     logger.info(f"Timeout: {crawler_config.get('timeout')}s")
     
+    # Extract the domain from the start URL
+    from urllib.parse import urlparse
+    parsed_url = urlparse(start_url)
+    start_domain = parsed_url.netloc
+    
+    # Add the start domain to allowed domains if not already present
+    if 'allowed_domains' not in crawler_config or not crawler_config['allowed_domains']:
+        crawler_config['allowed_domains'] = [start_domain]
+    elif start_domain not in crawler_config['allowed_domains']:
+        crawler_config['allowed_domains'].append(start_domain)
+    
     crawler = WebCrawler(
         config=crawler_config,
         stats_callback=stats_callback
     )
+    
+    # Set the start domain explicitly
+    crawler.start_domain = start_domain
     
     # Add the start URL
     crawler.add_url(start_url)
