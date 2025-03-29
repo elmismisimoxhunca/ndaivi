@@ -1,0 +1,1691 @@
+#!/usr/bin/env python3
+"""
+NDAIVI Main Application
+
+This is the main container application that coordinates all components of the NDAIVI system
+using a Redis message-based architecture for effective communication between:
+- Web Crawler
+- Claude Analyzer
+- Stats Manager
+- Database Manager
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+import argparse
+import signal
+import yaml
+from typing import Dict, List, Any, Optional, Union
+import threading
+import cmd
+import subprocess
+import psutil
+
+# Add the project root to the path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Import components
+from scraper.crawler_worker import CrawlerWorker
+from scraper.analyzer_worker import AnalyzerWorker
+from scraper.db_manager import DBManager
+from utils.redis_manager import get_redis_manager
+from utils.config_manager import ConfigManager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('logs/ndaivi.log')
+    ]
+)
+
+# Set more restrictive log levels for noisy modules
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+
+logger = logging.getLogger('ndaivi')
+
+class StatsManager:
+    """
+    Manages system-wide statistics.
+    
+    This class collects and aggregates statistics from all components
+    and provides methods to retrieve and display them.
+    """
+    
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the stats manager.
+        
+        Args:
+            config: Configuration dictionary
+        """
+        self.config = config
+        self.redis_manager = get_redis_manager(config)
+        
+        # Ensure Redis manager is started
+        if not self.redis_manager.is_connected():
+            self.redis_manager.start()
+            
+        self.stats = {
+            'crawler': {
+                'urls_processed': 0,
+                'urls_queued': 0,
+                'urls_failed': 0,
+                'domains_discovered': set(),
+                'content_types': {},
+                'status_codes': {},
+                'crawl_rate': 0.0  # URLs per second
+            },
+            'analyzer': {
+                'pages_analyzed': 0,
+                'manufacturer_pages': 0,
+                'category_pages': 0,
+                'other_pages': 0,
+                'categories_extracted': 0,
+                'translations_completed': 0,
+                'analysis_rate': 0.0  # Pages per second
+            },
+            'system': {
+                'start_time': time.time(),
+                'last_update': time.time(),
+                'uptime': 0,
+                'status': 'idle'
+            }
+        }
+        
+        # Subscribe to stats channel
+        self.stats_channel = self.redis_manager.get_channel('stats')
+        self.crawler_status_channel = self.redis_manager.get_channel('crawler_status')
+        self.analyzer_status_channel = self.redis_manager.get_channel('analyzer_status')
+        
+        # Subscribe to all channels
+        self.redis_manager.subscribe(self.stats_channel, self._handle_stats)
+        self.redis_manager.subscribe(self.crawler_status_channel, self._handle_crawler_status)
+        self.redis_manager.subscribe(self.analyzer_status_channel, self._handle_analyzer_status)
+        
+        # Update interval
+        self.update_interval = config.get('application', {}).get('components', {}).get('stats', {}).get('update_interval', 5)
+        
+        # Worker state
+        self.running = False
+        self.worker_thread = None
+        
+        # Stats history for time-based metrics
+        self.history = {
+            'crawler': {
+                'timestamps': [],
+                'urls_processed': [],
+                'max_history': 100
+            },
+            'analyzer': {
+                'timestamps': [],
+                'pages_analyzed': [],
+                'max_history': 100
+            }
+        }
+        
+        # Lock for thread safety
+        self.lock = threading.Lock()
+    
+    # Add method to publish stats to Redis for background process monitoring
+    def publish_stats_to_redis(self):
+        """Publish current stats to Redis for background process monitoring."""
+        try:
+            # Ensure Redis is connected
+            if not self.redis_manager.is_connected():
+                logger.warning("Redis not connected. Attempting to reconnect...")
+                if not self.redis_manager.connect():
+                    logger.error("Failed to reconnect to Redis")
+                    return
+                
+            with self.lock:
+                # Create a copy of stats to avoid thread safety issues
+                stats_copy = {
+                    'crawler': dict(self.stats['crawler']),
+                    'analyzer': dict(self.stats['analyzer']),
+                    'system': dict(self.stats['system'])
+                }
+                
+                # Convert sets to lists for JSON serialization
+                if isinstance(stats_copy['crawler'].get('domains_discovered'), set):
+                    stats_copy['crawler']['domains_discovered'] = list(stats_copy['crawler']['domains_discovered'])
+                
+                # Publish to Redis
+                self.redis_manager.store_data('ndaivi:stats:global', stats_copy)
+                self.redis_manager.store_data('ndaivi:crawler:stats', stats_copy['crawler'])
+                self.redis_manager.store_data('ndaivi:analyzer:stats', stats_copy['analyzer'])
+        except Exception as e:
+            logger.error(f"Error publishing stats to Redis: {e}")
+    
+    def start(self) -> bool:
+        """
+        Start the stats manager.
+        
+        Returns:
+            bool: True if started successfully, False otherwise
+        """
+        if self.running:
+            logger.warning("Stats manager already running")
+            return True
+        
+        try:
+            # Start worker thread
+            self.running = True
+            self.worker_thread = threading.Thread(target=self._worker_loop)
+            self.worker_thread.daemon = True
+            self.worker_thread.start()
+            
+            logger.info("Stats manager started successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error starting stats manager: {e}")
+            self.running = False
+            return False
+    
+    def _worker_loop(self) -> None:
+        """
+        Main worker loop that periodically stores stats.
+        This runs in a separate thread.
+        """
+        last_store_time = 0
+        
+        while self.running:
+            try:
+                # Store stats periodically
+                current_time = time.time()
+                if current_time - last_store_time >= self.update_interval:
+                    self._store_stats()
+                    self._update_rates()
+                    # Publish stats to Redis for background process monitoring
+                    self.publish_stats_to_redis()
+                    last_store_time = current_time
+                
+                # Update system uptime
+                with self.lock:
+                    self.stats['system']['uptime'] = time.time() - self.stats['system']['start_time']
+                
+                # Small sleep to prevent CPU hogging
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"Error in stats manager loop: {e}")
+                time.sleep(1)  # Back off on error
+    
+    def _handle_stats(self, stats_message: Dict[str, Any]) -> None:
+        """
+        Handle stats updates from components.
+        
+        Args:
+            stats_message: Stats message dictionary
+        """
+        try:
+            component = stats_message.get('component')
+            stats = stats_message.get('stats', {})
+            
+            if component == 'crawler':
+                self._update_crawler_stats(stats)
+            elif component == 'analyzer':
+                self._update_analyzer_stats(stats)
+        except Exception as e:
+            logger.error(f"Error handling stats message: {e}")
+    
+    def _handle_crawler_status(self, status_message: Dict[str, Any]) -> None:
+        """
+        Handle crawler status updates.
+        
+        Args:
+            status_message: Status message dictionary
+        """
+        try:
+            status = status_message.get('status')
+            message = status_message.get('message', '')
+            
+            with self.lock:
+                if status == 'crawling':
+                    self.stats['system']['status'] = 'crawling'
+                elif status == 'idle' and self.stats['system']['status'] == 'crawling':
+                    self.stats['system']['status'] = 'analyzing'
+                
+                # Store the last crawler message
+                self.stats['crawler']['last_message'] = message
+                self.stats['system']['last_update'] = time.time()
+        except Exception as e:
+            logger.error(f"Error handling crawler status message: {e}")
+    
+    def _handle_analyzer_status(self, status_message: Dict[str, Any]) -> None:
+        """
+        Handle analyzer status updates.
+        
+        Args:
+            status_message: Status message dictionary
+        """
+        try:
+            status = status_message.get('status')
+            message = status_message.get('message', '')
+            
+            with self.lock:
+                if status == 'analyzing':
+                    self.stats['system']['status'] = 'analyzing'
+                elif status == 'idle' and self.stats['system']['status'] == 'analyzing':
+                    self.stats['system']['status'] = 'idle'
+                
+                # Store the last analyzer message
+                self.stats['analyzer']['last_message'] = message
+                self.stats['system']['last_update'] = time.time()
+        except Exception as e:
+            logger.error(f"Error handling analyzer status message: {e}")
+    
+    def _update_crawler_stats(self, stats: Dict[str, Any]) -> None:
+        """
+        Update crawler statistics.
+        
+        Args:
+            stats: Crawler stats dictionary
+        """
+        with self.lock:
+            crawler_stats = self.stats['crawler']
+            
+            # Update basic stats
+            crawler_stats['urls_processed'] = stats.get('urls_processed', crawler_stats['urls_processed'])
+            crawler_stats['urls_queued'] = stats.get('urls_queued', crawler_stats['urls_queued'])
+            crawler_stats['urls_failed'] = stats.get('urls_failed', crawler_stats['urls_failed'])
+            
+            # Update domains set
+            domains = stats.get('domains', [])
+            if domains:
+                if isinstance(crawler_stats['domains_discovered'], set):
+                    crawler_stats['domains_discovered'].update(domains)
+                else:
+                    crawler_stats['domains_discovered'] = set(domains)
+            
+            # Update content types
+            content_types = stats.get('content_types', {})
+            for content_type, count in content_types.items():
+                if content_type in crawler_stats['content_types']:
+                    crawler_stats['content_types'][content_type] += count
+                else:
+                    crawler_stats['content_types'][content_type] = count
+            
+            # Update status codes
+            status_codes = stats.get('status_codes', {})
+            for status_code, count in status_codes.items():
+                status_code_str = str(status_code)
+                if status_code_str in crawler_stats['status_codes']:
+                    crawler_stats['status_codes'][status_code_str] += count
+                else:
+                    crawler_stats['status_codes'][status_code_str] = count
+            
+            # Update system timestamp
+            self.stats['system']['last_update'] = time.time()
+            
+            # Update history for rate calculation
+            self._update_history('crawler', crawler_stats['urls_processed'])
+    
+    def _update_analyzer_stats(self, stats: Dict[str, Any]) -> None:
+        """
+        Update analyzer statistics.
+        
+        Args:
+            stats: Analyzer stats dictionary
+        """
+        with self.lock:
+            analyzer_stats = self.stats['analyzer']
+            
+            # Update basic stats
+            analyzer_stats['pages_analyzed'] = stats.get('pages_analyzed', analyzer_stats['pages_analyzed'])
+            analyzer_stats['manufacturer_pages'] = stats.get('manufacturer_pages', analyzer_stats['manufacturer_pages'])
+            analyzer_stats['category_pages'] = stats.get('category_pages', analyzer_stats['category_pages'])
+            analyzer_stats['other_pages'] = stats.get('other_pages', analyzer_stats['other_pages'])
+            
+            # Update categories and translations
+            analyzer_stats['categories_extracted'] = stats.get('categories_extracted', analyzer_stats['categories_extracted'])
+            analyzer_stats['translations_completed'] = stats.get('translations_completed', analyzer_stats['translations_completed'])
+            
+            # Update system timestamp
+            self.stats['system']['last_update'] = time.time()
+            
+            # Update history for rate calculation
+            self._update_history('analyzer', analyzer_stats['pages_analyzed'])
+    
+    def _update_history(self, component: str, value: int) -> None:
+        """
+        Update history for a component metric.
+        
+        Args:
+            component: Component name
+            value: Current value
+        """
+        history = self.history.get(component)
+        if not history:
+            return
+        
+        current_time = time.time()
+        
+        # Add current values
+        history['timestamps'].append(current_time)
+        history['urls_processed' if component == 'crawler' else 'pages_analyzed'].append(value)
+        
+        # Trim history if needed
+        if len(history['timestamps']) > history['max_history']:
+            history['timestamps'] = history['timestamps'][-history['max_history']:]
+            history['urls_processed' if component == 'crawler' else 'pages_analyzed'] = history['urls_processed' if component == 'crawler' else 'pages_analyzed'][-history['max_history']:]
+    
+    def _update_rates(self) -> None:
+        """Update processing rates based on history."""
+        with self.lock:
+            # Update crawler rate
+            crawler_history = self.history['crawler']
+            if len(crawler_history['timestamps']) >= 2:
+                time_diff = crawler_history['timestamps'][-1] - crawler_history['timestamps'][0]
+                if time_diff > 0:
+                    value_diff = crawler_history['urls_processed'][-1] - crawler_history['urls_processed'][0]
+                    self.stats['crawler']['crawl_rate'] = value_diff / time_diff
+            
+            # Update analyzer rate
+            analyzer_history = self.history['analyzer']
+            if len(analyzer_history['timestamps']) >= 2:
+                time_diff = analyzer_history['timestamps'][-1] - analyzer_history['timestamps'][0]
+                if time_diff > 0:
+                    value_diff = analyzer_history['pages_analyzed'][-1] - analyzer_history['pages_analyzed'][0]
+                    self.stats['analyzer']['analysis_rate'] = value_diff / time_diff
+    
+    def _store_stats(self) -> None:
+        """Store current stats to database or file."""
+        # Publish stats to Redis for background process monitoring
+        try:
+            # Ensure Redis is connected
+            if not self.redis_manager.is_connected():
+                logger.warning("Redis not connected. Attempting to reconnect...")
+                if not self.redis_manager.connect():
+                    logger.error("Failed to reconnect to Redis")
+                    return
+                
+            with self.lock:
+                # Create a copy of stats to avoid thread safety issues
+                stats_copy = {
+                    'crawler': dict(self.stats['crawler']),
+                    'analyzer': dict(self.stats['analyzer']),
+                    'system': dict(self.stats['system'])
+                }
+                
+                # Convert sets to lists for JSON serialization
+                if isinstance(stats_copy['crawler'].get('domains_discovered'), set):
+                    stats_copy['crawler']['domains_discovered'] = list(stats_copy['crawler']['domains_discovered'])
+                
+                # Publish to Redis
+                self.redis_manager.store_data('ndaivi:stats:global', stats_copy)
+                self.redis_manager.store_data('ndaivi:crawler:stats', stats_copy['crawler'])
+                self.redis_manager.store_data('ndaivi:analyzer:stats', stats_copy['analyzer'])
+        except Exception as e:
+            logger.error(f"Error publishing stats to Redis: {e}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get current statistics.
+        
+        Returns:
+            Dict[str, Any]: Current statistics
+        """
+        with self.lock:
+            # Create a copy of stats to avoid thread safety issues
+            stats_copy = {
+                'crawler': dict(self.stats['crawler']),
+                'analyzer': dict(self.stats['analyzer']),
+                'system': dict(self.stats['system'])
+            }
+            
+            # Convert sets to lists for JSON serialization
+            if isinstance(stats_copy['crawler'].get('domains_discovered'), set):
+                stats_copy['crawler']['domains_discovered'] = list(stats_copy['crawler']['domains_discovered'])
+            
+            return stats_copy
+    
+    def format_stats(self) -> str:
+        """
+        Format statistics for display.
+        
+        Returns:
+            str: Formatted statistics
+        """
+        stats = self.get_stats()
+        
+        # Format system stats
+        system_stats = stats['system']
+        uptime = system_stats['uptime']
+        uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s"
+        
+        # Format crawler stats
+        crawler_stats = stats['crawler']
+        
+        # Format analyzer stats
+        analyzer_stats = stats['analyzer']
+        
+        # Build formatted string
+        formatted = [
+            "=== NDAIVI System Statistics ===",
+            f"Status: {system_stats['status']}",
+            f"Uptime: {uptime_str}",
+            "",
+            "--- Crawler Statistics ---",
+            f"URLs Processed: {crawler_stats.get('urls_processed', 0)}",
+            f"URLs Queued: {crawler_stats.get('urls_queued', 0)}",
+            f"URLs Failed: {crawler_stats.get('urls_failed', 0)}",
+            f"Domains Discovered: {len(crawler_stats.get('domains_discovered', []))}",
+            f"Crawl Rate: {crawler_stats.get('crawl_rate', 0.0):.2f} URLs/second",
+            "",
+            "--- Analyzer Statistics ---",
+            f"Pages Analyzed: {analyzer_stats.get('pages_analyzed', 0)}",
+            f"Manufacturer Pages: {analyzer_stats.get('manufacturer_pages', 0)}",
+            f"Category Pages: {analyzer_stats.get('category_pages', 0)}",
+            f"Other Pages: {analyzer_stats.get('other_pages', 0)}",
+            f"Categories Extracted: {analyzer_stats.get('categories_extracted', 0)}",
+            f"Translations Completed: {analyzer_stats.get('translations_completed', 0)}",
+            f"Analysis Rate: {analyzer_stats.get('analysis_rate', 0.0):.2f} pages/second"
+        ]
+        
+        return "\n".join(formatted)
+    
+    def print_stats(self) -> None:
+        """Print current statistics to console."""
+        print(self.format_stats())
+
+class NDaiviCLI(cmd.Cmd):
+    """
+    Interactive command-line interface for the NDAIVI system.
+    
+    This class provides a simple command-line interface for controlling
+    the NDAIVI system, including commands for crawling, analyzing,
+    viewing statistics, and managing the system.
+    """
+    
+    intro = """
+    ███╗   ██╗██████╗  █████╗ ██╗██╗   ██╗██╗
+    ████╗  ██║██╔══██╗██╔══██╗██║██║   ██║██║
+    ██╔██╗ ██║██║  ██║███████║██║██║   ██║██║
+    ██║╚██╗██║██║  ██║██╔══██║██║╚██╗ ██╔╝██║
+    ██║ ╚████║██████╔╝██║  ██║██║ ╚████╔╝ ██║
+    ╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝  ╚═╝
+    
+    NDAIVI Crawler System - Interactive Mode
+    Type 'help' or '?' to list commands.
+    """
+    prompt = 'ndaivi> '
+    
+    def __init__(self, app):
+        """
+        Initialize the CLI with a reference to the NDAIVI app.
+        
+        Args:
+            app: NDAIVI application instance
+        """
+        super().__init__()
+        self.app = app
+    
+    def do_start(self, arg):
+        """
+        Start the NDAIVI system.
+        
+        Usage: start
+        """
+        if self.app.running:
+            print("NDAIVI system is already running")
+            return
+        
+        if self.app.start():
+            print("NDAIVI system started successfully")
+        else:
+            print("Failed to start NDAIVI system")
+    
+    def do_crawl(self, arg):
+        """
+        Start a crawl job.
+        Usage: crawl <start_url> [max_urls N] [max_depth N]
+        
+        Examples:
+            crawl manualslib.com
+            crawl manualslib.com max_urls 10 max_depth 2
+            crawl manualslib.com max-urls 10 max-depth 2
+        """
+        args = arg.split()
+        if not args:
+            print("Error: Start URL is required")
+            print("Usage: crawl <start_url> [max_urls N] [max_depth N]")
+            return
+        
+        start_url = args[0]
+        if not start_url.startswith(('http://', 'https://')):
+            start_url = 'https://' + start_url
+        
+        max_urls = None
+        max_depth = None
+        
+        # Parse optional arguments
+        i = 1
+        while i < len(args):
+            # Support both underscore and hyphen formats
+            current_arg = args[i].lower()
+            if current_arg == 'max_urls' or current_arg == 'max-urls':
+                if i + 1 < len(args):
+                    try:
+                        max_urls = int(args[i + 1])
+                        i += 2
+                    except ValueError:
+                        print(f"Error: Invalid max_urls value: {args[i + 1]}")
+                        return
+                else:
+                    print("Error: max_urls requires a value")
+                    return
+            elif current_arg == 'max_depth' or current_arg == 'max-depth':
+                if i + 1 < len(args):
+                    try:
+                        max_depth = int(args[i + 1])
+                        i += 2
+                    except ValueError:
+                        print(f"Error: Invalid max_depth value: {args[i + 1]}")
+                        return
+                else:
+                    print("Error: max_depth requires a value")
+                    return
+            else:
+                print(f"Error: Unknown argument: {args[i]}")
+                return
+        
+        # Ensure the system is running
+        if not self.app.running:
+            print("Starting NDAIVI system...")
+            if not self.app.start():
+                print("Failed to start NDAIVI system")
+                return
+        
+        # Start the crawl
+        if self.app.run_crawler(start_url, max_urls, max_depth):
+            print(f"Started crawl job for {start_url}")
+            if max_urls:
+                print(f"Maximum URLs: {max_urls}")
+            if max_depth:
+                print(f"Maximum depth: {max_depth}")
+        else:
+            print(f"Failed to start crawl job for {start_url}")
+    
+    def do_start_background(self, arg):
+        """
+        Start the NDAIVI system in background mode.
+        
+        Usage: start_background <start_url> [max_urls N] [max_depth N]
+        
+        Examples:
+            start_background manualslib.com
+            start_background manualslib.com max_urls 100 max_depth 3
+            start_background manualslib.com max-urls 100 max-depth 3
+        """
+        args = arg.split()
+        if not args:
+            print("Error: Start URL is required")
+            print("Usage: start_background <start_url> [max_urls N] [max_depth N]")
+            return
+        
+        start_url = args[0]
+        if not start_url.startswith(('http://', 'https://')):
+            start_url = 'https://' + start_url
+        
+        max_urls = None
+        max_depth = None
+        
+        # Parse optional arguments
+        i = 1
+        while i < len(args):
+            # Support both underscore and hyphen formats
+            current_arg = args[i].lower()
+            if current_arg == 'max_urls' or current_arg == 'max-urls':
+                if i + 1 < len(args):
+                    try:
+                        max_urls = int(args[i + 1])
+                        i += 2
+                    except ValueError:
+                        print(f"Error: Invalid max_urls value: {args[i + 1]}")
+                        return
+                else:
+                    print("Error: max_urls requires a value")
+                    return
+            elif current_arg == 'max_depth' or current_arg == 'max-depth':
+                if i + 1 < len(args):
+                    try:
+                        max_depth = int(args[i + 1])
+                        i += 2
+                    except ValueError:
+                        print(f"Error: Invalid max_depth value: {args[i + 1]}")
+                        return
+                else:
+                    print("Error: max_depth requires a value")
+                    return
+            else:
+                print(f"Error: Unknown argument: {args[i]}")
+                return
+        
+        # Start the background process
+        if self.app.start_background(start_url, max_urls, max_depth):
+            print(f"Started NDAIVI system in background mode for {start_url}")
+            if max_urls:
+                print(f"Maximum URLs: {max_urls}")
+            if max_depth:
+                print(f"Maximum depth: {max_depth}")
+        else:
+            print("Failed to start NDAIVI system in background mode")
+    
+    def do_status(self, arg):
+        """
+        Display current status of all components.
+        
+        Usage: status [background]
+        
+        If 'background' is specified, shows status of the background process.
+        Otherwise, shows status of the current process.
+        """
+        if arg.strip() == 'background' or not self.app.running:
+            status = self.app.get_background_status()
+            if status['running']:
+                print(f"Background process is running with PID {status['pid']}")
+                print(f"Uptime: {status['uptime']:.2f} seconds")
+                print(f"Memory usage: {status['memory_usage']:.2f} MB")
+                print(f"CPU usage: {status['cpu_usage']:.2f}%")
+                
+                # Display crawler stats
+                if status.get('crawler_stats'):
+                    print("\nCrawler Status and Progress:")
+                    crawler_stats = status['crawler_stats']
+                    print(f"  URLs Processed: {crawler_stats.get('urls_processed', 0)}")
+                    print(f"  URLs Queued: {crawler_stats.get('urls_queued', 0)}")
+                    print(f"  URLs Failed: {crawler_stats.get('urls_failed', 0)}")
+                    print(f"  Domains Discovered: {len(crawler_stats.get('domains_discovered', []))} domains")
+                    print(f"  Crawl Rate: {crawler_stats.get('crawl_rate', 0.0):.2f} URLs/second")
+                    
+                    # Show content types and status codes for better progress tracking
+                    if crawler_stats.get('content_types'):
+                        print("\n  Content Types:")
+                        for content_type, count in crawler_stats['content_types'].items():
+                            print(f"    {content_type}: {count}")
+                    
+                    if crawler_stats.get('status_codes'):
+                        print("\n  Status Codes:")
+                        for status_code, count in crawler_stats['status_codes'].items():
+                            print(f"    {status_code}: {count}")
+                
+                # Display analyzer stats
+                if status.get('analyzer_stats'):
+                    print("\nAnalyzer Status and Progress:")
+                    analyzer_stats = status['analyzer_stats']
+                    print(f"  Pages Analyzed: {analyzer_stats.get('pages_analyzed', 0)}")
+                    print(f"  Manufacturer Pages: {analyzer_stats.get('manufacturer_pages', 0)}")
+                    print(f"  Category Pages: {analyzer_stats.get('category_pages', 0)}")
+                    print(f"  Other Pages: {analyzer_stats.get('other_pages', 0)}")
+                    print(f"  Categories Extracted: {analyzer_stats.get('categories_extracted', 0)}")
+                    print(f"  Translations Completed: {analyzer_stats.get('translations_completed', 0)}")
+                    print(f"  Analysis Rate: {analyzer_stats.get('analysis_rate', 0.0):.2f} pages/second")
+                
+                # Display crawler output if available
+                if status.get('crawler_output'):
+                    print("\nLatest Crawler Output:")
+                    for line in status['crawler_output']:
+                        print(f"  {line.strip()}")
+                
+                # Display analyzer output if available
+                if status.get('analyzer_output'):
+                    print("\nLatest Analyzer Output:")
+                    for line in status['analyzer_output']:
+                        print(f"  {line.strip()}")
+                
+                # Display last output from main log
+                if status.get('last_output'):
+                    print("\nLast output from system log:")
+                    for line in status['last_output'][-10:]:  # Show last 10 lines
+                        print(f"  {line.strip()}")
+                return
+            elif not self.app.running:
+                print("No background process is running and the current system is not running")
+                return
+        
+        if not self.app.running:
+            print("NDAIVI system is not running")
+            return
+        
+        stats = self.app.get_stats()
+        system_status = stats['system']['status']
+        
+        print(f"NDAIVI System Status: {system_status}")
+        
+        # Print component statuses
+        print("\nComponent Status:")
+        print(f"  Crawler: {'Running' if self.app.crawler_worker.running else 'Stopped'}")
+        print(f"  Analyzer: {'Running' if self.app.analyzer_worker.running else 'Stopped'}")
+        print(f"  Stats Manager: {'Running' if self.app.stats_manager.running else 'Stopped'}")
+        
+        # Print current job status if available
+        if hasattr(self.app.crawler_worker, 'current_job') and self.app.crawler_worker.current_job:
+            job = self.app.crawler_worker.current_job
+            print("\nCurrent Crawl Job:")
+            print(f"  Start URL: {job.get('start_url', 'Unknown')}")
+            print(f"  Max URLs: {job.get('max_urls', 'Unlimited')}")
+            print(f"  Max Depth: {job.get('max_depth', 'Unlimited')}")
+        
+        # Print latest stats
+        crawler_stats = stats['crawler']
+        print("\nCrawler Progress:")
+        print(f"  URLs Processed: {crawler_stats.get('urls_processed', 0)}")
+        print(f"  URLs Queued: {crawler_stats.get('urls_queued', 0)}")
+        print(f"  URLs Failed: {crawler_stats.get('urls_failed', 0)}")
+        print(f"  Domains Discovered: {len(crawler_stats.get('domains_discovered', []))} domains")
+        print(f"  Crawl Rate: {crawler_stats.get('crawl_rate', 0.0):.2f} URLs/second")
+        
+        analyzer_stats = stats['analyzer']
+        print("\nAnalyzer Progress:")
+        print(f"  Pages Analyzed: {analyzer_stats.get('pages_analyzed', 0)}")
+        print(f"  Manufacturer Pages: {analyzer_stats.get('manufacturer_pages', 0)}")
+        print(f"  Category Pages: {analyzer_stats.get('category_pages', 0)}")
+        print(f"  Other Pages: {analyzer_stats.get('other_pages', 0)}")
+        print(f"  Analysis Rate: {analyzer_stats.get('analysis_rate', 0.0):.2f} pages/second")
+        
+        # Try to show latest crawler and analyzer logs
+        try:
+            print("\nLatest Crawler Activity:")
+            crawler_log = os.path.join('logs', 'crawler.log')
+            if os.path.exists(crawler_log):
+                with open(crawler_log, 'r') as f:
+                    lines = f.readlines()
+                    for line in lines[-5:]:  # Show last 5 lines
+                        print(f"  {line.strip()}")
+            
+            print("\nLatest Analyzer Activity:")
+            analyzer_log = os.path.join('logs', 'analyzer.log')
+            if os.path.exists(analyzer_log):
+                with open(analyzer_log, 'r') as f:
+                    lines = f.readlines()
+                    for line in lines[-5:]:  # Show last 5 lines
+                        print(f"  {line.strip()}")
+        except Exception as e:
+            logger.error(f"Error reading component logs: {e}")
+    
+    def do_stats(self, arg):
+        """
+        Display current system statistics.
+        
+        Usage: stats [background]
+        
+        If 'background' is specified, shows statistics of the background process.
+        Otherwise, shows statistics of the current process.
+        """
+        if arg.strip() == 'background' or not self.app.running:
+            status = self.app.get_background_status()
+            if status['running']:
+                print(f"Background Process Statistics (PID: {status['pid']})")
+                print(f"Uptime: {status['uptime']:.2f} seconds")
+                print(f"Memory usage: {status['memory_usage']:.2f} MB")
+                print(f"CPU usage: {status['cpu_usage']:.2f}%")
+                
+                # Display global stats from Redis
+                if status.get('crawler_stats') or status.get('analyzer_stats'):
+                    print("\n=== NDAIVI System Statistics ===")
+                    
+                    # Format system stats
+                    uptime = status['uptime']
+                    uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s"
+                    print(f"Uptime: {uptime_str}")
+                    
+                    # Display crawler stats
+                    if status.get('crawler_stats'):
+                        crawler_stats = status['crawler_stats']
+                        print("\n--- Crawler Statistics ---")
+                        print(f"URLs Processed: {crawler_stats.get('urls_processed', 0)}")
+                        print(f"URLs Queued: {crawler_stats.get('urls_queued', 0)}")
+                        print(f"URLs Failed: {crawler_stats.get('urls_failed', 0)}")
+                        print(f"Domains Discovered: {len(crawler_stats.get('domains_discovered', []))}")
+                        print(f"Crawl Rate: {crawler_stats.get('crawl_rate', 0.0):.2f} URLs/second")
+                        
+                        # Display content types
+                        if crawler_stats.get('content_types'):
+                            print("\nContent Types:")
+                            for content_type, count in crawler_stats['content_types'].items():
+                                print(f"  {content_type}: {count}")
+                        
+                        # Display status codes
+                        if crawler_stats.get('status_codes'):
+                            print("\nStatus Codes:")
+                            for status_code, count in crawler_stats['status_codes'].items():
+                                print(f"  {status_code}: {count}")
+                    
+                    # Display analyzer stats
+                    if status.get('analyzer_stats'):
+                        analyzer_stats = status['analyzer_stats']
+                        print("\n--- Analyzer Statistics ---")
+                        print(f"Pages Analyzed: {analyzer_stats.get('pages_analyzed', 0)}")
+                        print(f"Manufacturer Pages: {analyzer_stats.get('manufacturer_pages', 0)}")
+                        print(f"Category Pages: {analyzer_stats.get('category_pages', 0)}")
+                        print(f"Other Pages: {analyzer_stats.get('other_pages', 0)}")
+                        print(f"Categories Extracted: {analyzer_stats.get('categories_extracted', 0)}")
+                        print(f"Translations Completed: {analyzer_stats.get('translations_completed', 0)}")
+                        print(f"Analysis Rate: {analyzer_stats.get('analysis_rate', 0.0):.2f} pages/second")
+                else:
+                    print("\nNo statistics available yet")
+                
+                # Display crawler output if available
+                if status.get('crawler_output'):
+                    print("\nLatest Crawler Activity:")
+                    for line in status['crawler_output']:
+                        print(f"  {line.strip()}")
+                
+                # Display analyzer output if available
+                if status.get('analyzer_output'):
+                    print("\nLatest Analyzer Activity:")
+                    for line in status['analyzer_output']:
+                        print(f"  {line.strip()}")
+                
+                return
+            elif not self.app.running:
+                print("No background process is running and the current system is not running")
+                return
+        
+        if not self.app.running:
+            print("NDAIVI system is not running")
+            return
+        
+        # Print formatted stats using the StatsManager
+        self.app.stats_manager.print_stats()
+        
+        # Try to show latest crawler and analyzer logs
+        try:
+            print("\nLatest Crawler Activity:")
+            crawler_log = os.path.join('logs', 'crawler.log')
+            if os.path.exists(crawler_log):
+                with open(crawler_log, 'r') as f:
+                    lines = f.readlines()
+                    for line in lines[-5:]:  # Show last 5 lines
+                        print(f"  {line.strip()}")
+            
+            print("\nLatest Analyzer Activity:")
+            analyzer_log = os.path.join('logs', 'analyzer.log')
+            if os.path.exists(analyzer_log):
+                with open(analyzer_log, 'r') as f:
+                    lines = f.readlines()
+                    for line in lines[-5:]:  # Show last 5 lines
+                        print(f"  {line.strip()}")
+        except Exception as e:
+            logger.error(f"Error reading component logs: {e}")
+    
+    def do_stop(self, arg):
+        """
+        Stop the current crawl job or the entire system.
+        
+        Usage: stop [background|all]
+        
+        If 'background' is specified, stops the background process.
+        If 'all' is specified, stops both the current process and background process.
+        Otherwise, stops the current process.
+        """
+        if arg.strip() == 'background':
+            if self.app.stop_background_process():
+                print("Background process stopped")
+            else:
+                print("No background process to stop")
+            return
+        
+        if arg.strip() == 'all':
+            # Stop background process first
+            self.app.stop_background_process()
+            print("Background process stopped")
+            
+            # Then stop current process
+            if self.app.running:
+                self.app.stop()
+                print("NDAIVI system stopped")
+            else:
+                print("NDAIVI system is not running")
+            return
+        
+        # Stop current process
+        if not self.app.running:
+            print("NDAIVI system is not running")
+            return
+        
+        self.app.stop()
+        print("NDAIVI system stopped")
+    
+    def do_pause(self, arg):
+        """
+        Pause the crawler.
+        
+        Usage: pause
+        """
+        if not self.app.running:
+            print("NDAIVI system is not running")
+            return
+        
+        # Send pause command to crawler
+        command = {'command': 'pause'}
+        self.app.redis_manager.publish(self.app.crawler_worker.command_channel, command)
+        print("Pause command sent to crawler")
+    
+    def do_resume(self, arg):
+        """
+        Resume the crawler.
+        
+        Usage: resume
+        """
+        if not self.app.running:
+            print("NDAIVI system is not running")
+            return
+        
+        # Send resume command to crawler
+        command = {'command': 'resume'}
+        self.app.redis_manager.publish(self.app.crawler_worker.command_channel, command)
+        print("Resume command sent to crawler")
+    
+    def do_analyze(self, arg):
+        """
+        Analyze a URL manually.
+        Usage: analyze <url>
+        """
+        if not arg:
+            print("Error: URL is required")
+            print("Usage: analyze <url>")
+            return
+        
+        url = arg.strip()
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        if not self.app.running:
+            print("Starting NDAIVI system...")
+            if not self.app.start():
+                print("Failed to start NDAIVI system")
+                return
+        
+        # Send analyze command to analyzer
+        command = {
+            'command': 'analyze',
+            'params': {'url': url}
+        }
+        self.app.redis_manager.publish(self.app.analyzer_worker.command_channel, command)
+        print(f"Analyze command sent for {url}")
+    
+    def do_exit(self, arg):
+        """
+        Exit the program.
+        
+        Usage: exit
+        """
+        print("Exiting NDAIVI system...")
+        self.app.stop()
+        return True
+    
+    def do_quit(self, arg):
+        """
+        Exit the program.
+        
+        Usage: quit
+        """
+        return self.do_exit(arg)
+    
+    def do_help(self, arg):
+        """
+        List available commands with their descriptions.
+        
+        Usage: help [command]
+        """
+        if arg:
+            # Show help for specific command
+            super().do_help(arg)
+            return
+        
+        # Show general help
+        print("\nAvailable commands:")
+        print("  start             - Start the NDAIVI system")
+        print("  start_background  - Start the NDAIVI system in background mode")
+        print("  crawl             - Start a crawl job")
+        print("  pause             - Pause the crawler")
+        print("  resume            - Resume the crawler")
+        print("  stop              - Stop the current crawl job or the entire system")
+        print("  analyze           - Analyze a URL manually")
+        print("  stats             - Display current system statistics")
+        print("  status            - Display current status of all components")
+        print("  exit/quit         - Exit the program")
+        print("  help              - Display this help message")
+        print("\nFor detailed help on a specific command, type: help <command>")
+
+class NDaiviApp:
+    """
+    Main NDAIVI application that coordinates all components.
+    
+    This class initializes and manages all components of the NDAIVI system,
+    including the crawler, analyzer, and stats manager.
+    """
+    
+    def __init__(self):
+        """Initialize the NDAIVI application."""
+        # Ensure logs directory exists
+        os.makedirs('logs', exist_ok=True)
+        
+        # Load configuration
+        self.config = self._load_config()
+        
+        # Initialize Redis manager
+        self.redis_manager = get_redis_manager(self.config)
+        
+        # Ensure Redis manager is started
+        if not self.redis_manager.is_connected():
+            self.redis_manager.start()
+            
+        # Initialize components
+        self.crawler_worker = CrawlerWorker(self.config)
+        self.analyzer_worker = AnalyzerWorker(self.config)
+        self.stats_manager = StatsManager(self.config)
+        
+        # Flag for running state
+        self.running = False
+        
+        # Background process information
+        self.background_process = None
+        self.background_pid = None
+        self.background_log_file = None
+        
+        # Register signal handlers
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+    
+    def _load_config(self) -> Dict[str, Any]:
+        """
+        Load configuration from config.yaml.
+        
+        Returns:
+            Dict[str, Any]: Configuration dictionary
+        """
+        config_manager = ConfigManager()
+        return config_manager.get_all()
+    
+    def _handle_signal(self, signum: int, frame) -> None:
+        """
+        Handle termination signals.
+        
+        Args:
+            signum: Signal number
+            frame: Current stack frame
+        """
+        logger.info(f"Received signal {signum}, shutting down...")
+        self.stop()
+        sys.exit(0)
+    
+    def start(self) -> bool:
+        """
+        Start the NDAIVI application and all components.
+        
+        Returns:
+            bool: True if started successfully, False otherwise
+        """
+        if self.running:
+            logger.warning("NDAIVI application already running")
+            return True
+        
+        try:
+            # Start Redis manager and check connection
+            if not self.redis_manager.is_connected():
+                if not self.redis_manager.connect():
+                    logger.error("Failed to connect to Redis")
+                    return False
+            
+            # Start stats manager
+            if not self.stats_manager.start():
+                logger.error("Failed to start stats manager")
+                return False
+            
+            # Start crawler worker
+            if not self.crawler_worker.start():
+                logger.error("Failed to start crawler worker")
+                self.stats_manager.stop()
+                return False
+            
+            # Start analyzer worker
+            if not self.analyzer_worker.start():
+                logger.error("Failed to start analyzer worker")
+                self.crawler_worker.stop()
+                self.stats_manager.stop()
+                return False
+            
+            self.running = True
+            logger.info("NDAIVI application started successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error starting NDAIVI application: {e}")
+            self.stop()
+            return False
+    
+    def stop(self) -> None:
+        """Stop the NDAIVI application and all components."""
+        if not self.running:
+            return
+        
+        # Stop background process if running
+        self.stop_background_process()
+        
+        # Stop components in reverse order
+        logger.info("Stopping NDAIVI application...")
+        
+        try:
+            self.analyzer_worker.stop()
+        except Exception as e:
+            logger.error(f"Error stopping analyzer worker: {e}")
+        
+        try:
+            self.crawler_worker.stop()
+        except Exception as e:
+            logger.error(f"Error stopping crawler worker: {e}")
+        
+        try:
+            self.stats_manager.stop()
+        except Exception as e:
+            logger.error(f"Error stopping stats manager: {e}")
+        
+        self.running = False
+        logger.info("NDAIVI application stopped")
+    
+    def start_background(self, target_website: str, max_urls: int = None, max_depth: int = None) -> bool:
+        """
+        Start the NDAIVI application in background mode.
+        
+        Args:
+            target_website: Target website to crawl
+            max_urls: Maximum number of URLs to crawl
+            max_depth: Maximum depth to crawl
+            
+        Returns:
+            bool: True if started successfully, False otherwise
+        """
+        # Ensure app data directory exists
+        app_data_dir = self.config.get('app_data_dir', '/tmp')
+        os.makedirs(app_data_dir, exist_ok=True)
+        
+        # Create log file
+        log_file = os.path.join(app_data_dir, 'ndaivi.log')
+        
+        # Create command
+        cmd = [sys.executable, os.path.abspath(__file__), '--background', '--target', target_website]
+        if max_urls is not None:
+            cmd.extend(['--max-urls', str(max_urls)])
+        if max_depth is not None:
+            cmd.extend(['--max-depth', str(max_depth)])
+        
+        # Start the process
+        try:
+            logger.info(f"Starting NDAIVI application in background mode: {' '.join(cmd)}")
+            
+            # Open log file
+            log_fd = open(log_file, 'w')
+            
+            # Start the process
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_fd,
+                stderr=log_fd,
+                start_new_session=True
+            )
+            
+            # Store the process ID in a file
+            pid_file = os.path.join(app_data_dir, 'ndaivi.pid')
+            with open(pid_file, 'w') as f:
+                f.write(str(process.pid))
+            
+            # Wait a second to make sure the process started
+            time.sleep(1)
+            
+            # Check if the process is still running
+            if process.poll() is None:
+                logger.info(f"NDAIVI application started in background mode with PID {process.pid}")
+                return True
+            else:
+                logger.error(f"NDAIVI application failed to start in background mode")
+                return False
+        except Exception as e:
+            logger.error(f"Error starting NDAIVI application in background mode: {e}")
+            return False
+    
+    def stop_background_process(self) -> bool:
+        """
+        Stop the background process.
+        
+        Returns:
+            bool: True if stopped successfully, False otherwise
+        """
+        # Check if PID file exists
+        app_data_dir = self.config.get('app_data_dir', '/tmp')
+        pid_file = os.path.join(app_data_dir, 'ndaivi.pid')
+        
+        if not os.path.exists(pid_file):
+            logger.warning("No background process found")
+            return False
+        
+        try:
+            # Read PID from file
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            
+            # Try to terminate the process
+            process = psutil.Process(pid)
+            process.terminate()
+            
+            # Wait for process to terminate
+            try:
+                process.wait(timeout=5)
+                logger.info(f"Background process with PID {pid} terminated")
+            except psutil.TimeoutExpired:
+                # Force kill if not terminated after timeout
+                process.kill()
+                logger.info(f"Background process with PID {pid} killed")
+            
+            # Remove PID file
+            os.remove(pid_file)
+            
+            return True
+        except (ProcessLookupError, psutil.NoSuchProcess):
+            # Process is not running, just remove the PID file
+            os.remove(pid_file)
+            logger.info("Background process was not running, removed PID file")
+            return True
+        except Exception as e:
+            logger.error(f"Error stopping background process: {e}")
+            return False
+    
+    def get_background_status(self) -> Dict[str, Any]:
+        """
+        Get the status of the background process.
+        
+        Returns:
+            Dict[str, Any]: Status information
+        """
+        status = {
+            'running': False,
+            'pid': None,
+            'uptime': 0,
+            'memory_usage': 0,
+            'cpu_usage': 0,
+            'log_file': None,
+            'crawler_stats': {},
+            'analyzer_stats': {},
+            'global_stats': {},
+            'last_output': []
+        }
+        
+        # Check if the background process is running
+        pid_file = os.path.join(self.config.get('app_data_dir', '/tmp'), 'ndaivi.pid')
+        if not os.path.exists(pid_file):
+            return status
+        
+        try:
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            
+            # Check if the process is running
+            process = psutil.Process(pid)
+            if process.is_running():
+                status['running'] = True
+                status['pid'] = pid
+                status['uptime'] = time.time() - process.create_time()
+                status['memory_usage'] = process.memory_info().rss / 1024 / 1024  # MB
+                status['cpu_usage'] = process.cpu_percent(interval=0.1)
+                
+                # Get log file path
+                log_file = os.path.join(self.config.get('app_data_dir', '/tmp'), 'ndaivi.log')
+                status['log_file'] = log_file
+                
+                # Get the last few lines of the log file
+                if os.path.exists(log_file):
+                    with open(log_file, 'r') as f:
+                        lines = f.readlines()
+                        status['last_output'] = lines[-20:]  # Last 20 lines
+                
+                # Try to get stats from Redis
+                if self.redis_manager.is_connected():
+                    try:
+                        # Get crawler stats
+                        crawler_stats = self.redis_manager.get_data('ndaivi:crawler:stats')
+                        if crawler_stats:
+                            status['crawler_stats'] = crawler_stats
+                        
+                        # Get analyzer stats
+                        analyzer_stats = self.redis_manager.get_data('ndaivi:analyzer:stats')
+                        if analyzer_stats:
+                            status['analyzer_stats'] = analyzer_stats
+                        
+                        # Get global stats
+                        global_stats = self.redis_manager.get_data('ndaivi:stats:global')
+                        if global_stats:
+                            status['global_stats'] = global_stats
+                    except Exception as redis_error:
+                        logger.error(f"Error retrieving stats from Redis: {redis_error}")
+                else:
+                    logger.warning("Redis not connected when trying to get background status")
+                
+                # Also try to get latest crawler and analyzer output
+                try:
+                    # Check for crawler output in process logs
+                    crawler_output = []
+                    analyzer_output = []
+                    
+                    # Try to read from process-specific log files if they exist
+                    crawler_log = os.path.join('logs', 'crawler.log')
+                    if os.path.exists(crawler_log):
+                        with open(crawler_log, 'r') as f:
+                            crawler_output = f.readlines()[-10:]  # Last 10 lines
+                    
+                    analyzer_log = os.path.join('logs', 'analyzer.log')
+                    if os.path.exists(analyzer_log):
+                        with open(analyzer_log, 'r') as f:
+                            analyzer_output = f.readlines()[-10:]  # Last 10 lines
+                    
+                    # Add to last_output if found
+                    if crawler_output:
+                        status['crawler_output'] = crawler_output
+                    if analyzer_output:
+                        status['analyzer_output'] = analyzer_output
+                except Exception as e:
+                    logger.error(f"Error getting component logs: {e}")
+        except (ProcessLookupError, psutil.NoSuchProcess):
+            # Process is not running
+            os.remove(pid_file)
+        except Exception as e:
+            logger.error(f"Error getting background process status: {e}")
+        
+        return status
+    
+    def interactive_mode(self) -> None:
+        """Run the application in interactive mode."""
+        cli = NDaiviCLI(self)
+        cli.cmdloop()
+    
+    def run_crawler(self, target_website: str, max_urls: int = None, max_depth: int = None) -> bool:
+        """
+        Run the crawler on a target website.
+        
+        Args:
+            target_website: Target website to crawl
+            max_urls: Maximum number of URLs to crawl
+            max_depth: Maximum depth to crawl
+            
+        Returns:
+            bool: True if started successfully, False otherwise
+        """
+        logger = logging.getLogger(__name__)
+        
+        # Get the crawler command channel from config
+        channel = self.redis_manager.get_channel('crawler_commands')
+        
+        # Prepare the command
+        command = {
+            'command': 'crawl',
+            'params': {
+                'start_url': target_website,
+                'job_id': f"job_{int(time.time())}",
+                'max_urls': max_urls,
+                'max_depth': max_depth,
+                'active': True  # Start crawling immediately
+            }
+        }
+        
+        # Log the channel name for debugging
+        logger.info(f"Sending crawl command to channel: {channel}")
+        
+        # Publish the command
+        success = self.redis_manager.publish(channel, command)
+        
+        if success:
+            logger.info(f"Successfully sent crawl command for {target_website}")
+            
+            # Also try sending directly to the ndaivi:crawler:commands channel as a fallback
+            direct_channel = 'ndaivi:crawler:commands'
+            if channel != direct_channel:
+                logger.info(f"Also sending to direct channel: {direct_channel}")
+                self.redis_manager.publish(direct_channel, command)
+        else:
+            logger.error(f"Failed to send crawl command for {target_website}")
+            return False
+            
+        return True
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get current system statistics.
+        
+        Returns:
+            Dict[str, Any]: System statistics
+        """
+        return self.stats_manager.get_stats()
+        
+    def start_container_app(self) -> bool:
+        """
+        Start the container app for coordinating crawler and analyzer.
+        
+        Returns:
+            bool: True if started successfully, False otherwise
+        """
+        logger = logging.getLogger(__name__)
+        
+        try:
+            # Import the container app module
+            from container_app import ContainerApp
+            
+            # Create container app instance
+            self.container_app = ContainerApp()
+            
+            # Start container app
+            success = self.container_app.start()
+            
+            if success:
+                logger.info("Container app started successfully")
+            else:
+                logger.error("Failed to start container app")
+                
+            return success
+        except Exception as e:
+            logger.error(f"Error starting container app: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+    
+    def stop_container_app(self) -> bool:
+        """
+        Stop the container app.
+        
+        Returns:
+            bool: True if stopped successfully, False otherwise
+        """
+        logger = logging.getLogger(__name__)
+        
+        try:
+            if hasattr(self, 'container_app'):
+                self.container_app.stop()
+                logger.info("Container app stopped")
+                return True
+            else:
+                logger.warning("Container app not running")
+                return False
+        except Exception as e:
+            logger.error(f"Error stopping container app: {e}")
+            return False
+
+def main():
+    """Main entry point for the NDAIVI application."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='NDAIVI Crawler System')
+    parser.add_argument('--interactive', '-i', action='store_true', help='Run in interactive mode')
+    parser.add_argument('--crawl', '-c', metavar='URL', help='Start a crawl from the given URL')
+    parser.add_argument('--max-urls', '--max_urls', '-m', type=int, default=100, help='Maximum URLs to crawl')
+    parser.add_argument('--max-depth', '--max_depth', '-d', type=int, default=3, help='Maximum crawl depth')
+    parser.add_argument('--background', '-b', action='store_true', help='Run in background mode')
+    parser.add_argument('--target', '-t', metavar='URL', help='Target website to crawl in background mode')
+    parser.add_argument('--start-detach', '--start_detach', '-s', action='store_true', help='Start the application in detached mode')
+    parser.add_argument('--status', action='store_true', help='Get the status of the background process')
+    parser.add_argument('--stop', action='store_true', help='Stop the background process')
+    parser.add_argument('--config', metavar='FILE', help='Path to configuration file')
+    parser.add_argument('--container', action='store_true', help='Start the container app for coordinating crawler and analyzer')
+    parser.add_argument('--full-system', '--full_system', action='store_true', help='Start the full system including container app, crawler, and analyzer')
+
+    args = parser.parse_args()
+    
+    # Create and start the application
+    app = NDaiviApp()
+    
+    # Handle full system mode
+    if args.full_system:
+        logger.info("Starting full NDAIVI system with container app")
+        
+        # Start the application
+        if not app.start():
+            logger.error("Failed to start NDAIVI application")
+            return
+            
+        # Start the container app
+        if not app.start_container_app():
+            logger.error("Failed to start container app")
+            app.stop()
+            return
+            
+        # Get target website from config if not specified
+        target_website = args.target
+        if not target_website:
+            target_website = app.config.get('web_crawler', {}).get('target_website')
+            if not target_website:
+                logger.error("No target website specified and none found in config")
+                app.stop_container_app()
+                app.stop()
+                return
+                
+        # Start the crawler
+        app.run_crawler(target_website, args.max_urls, args.max_depth)
+        
+        # Keep running until stopped
+        try:
+            logger.info(f"Full system running, crawling {target_website}")
+            print("NDAIVI system is running. Press Ctrl+C to stop.")
+            print("Use 'python main.py status' to check system status.")
+            
+            while app.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, shutting down...")
+        finally:
+            app.stop_container_app()
+            app.stop()
+    
+    # Handle container app only mode
+    elif args.container:
+        logger.info("Starting container app")
+        
+        # Start the application
+        if not app.start():
+            logger.error("Failed to start NDAIVI application")
+            return
+            
+        # Start the container app
+        if not app.start_container_app():
+            logger.error("Failed to start container app")
+            app.stop()
+            return
+            
+        # Keep running until stopped
+        try:
+            logger.info("Container app running")
+            print("Container app is running. Press Ctrl+C to stop.")
+            print("Use 'python main.py status' to check system status.")
+            
+            while app.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, shutting down...")
+        finally:
+            app.stop_container_app()
+            app.stop()
+    
+    # Handle background mode
+    elif args.background:
+        # Run in background mode
+        if not args.target:
+            logger.error("Target website is required for background mode")
+            return
+        
+        # Start the application
+        if not app.start():
+            logger.error("Failed to start NDAIVI application")
+            return
+        
+        # Start the crawler
+        app.run_crawler(args.target, args.max_urls, args.max_depth)
+        
+        # Keep running until stopped
+        try:
+            logger.info(f"Running in background mode, crawling {args.target}")
+            while app.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, shutting down...")
+        finally:
+            app.stop()
+    
+    # Handle start-detach mode
+    elif args.start_detach:
+        if not app.start():
+            logger.error("Failed to start NDAIVI application")
+            return
+        
+        logger.info("NDAIVI application started in detached mode")
+    
+    # Handle status check
+    elif args.status:
+        status = app.get_background_status()
+        if status['running']:
+            print(f"Background process is running with PID {status['pid']}")
+            print(f"Uptime: {status['uptime']:.2f} seconds")
+            print(f"Memory usage: {status['memory_usage']:.2f} MB")
+            print(f"CPU usage: {status['cpu_usage']:.2f}%")
+            print(f"Log file: {status['log_file']}")
+        else:
+            print("No background process is running")
+    
+    # Handle stop command
+    elif args.stop:
+        if app.stop_background_process():
+            print("Background process stopped")
+        else:
+            print("No background process to stop")
+    
+    # Handle interactive mode
+    elif args.interactive:
+        # Start the application in interactive mode
+        app.interactive_mode()
+    
+    # Handle direct crawl command
+    elif args.crawl:
+        # Start the application
+        if not app.start():
+            logger.error("Failed to start NDAIVI application")
+            return
+        
+        # Start the crawler
+        app.run_crawler(args.crawl, args.max_urls, args.max_depth)
+        
+        # Keep running until stopped
+        try:
+            logger.info(f"Crawling {args.crawl}")
+            while app.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, shutting down...")
+        finally:
+            app.stop()
+    
+    # Default to interactive mode if no arguments provided
+    else:
+        app.interactive_mode()
+
+if __name__ == "__main__":
+    main()

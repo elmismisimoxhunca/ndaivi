@@ -39,8 +39,9 @@ class AnalyzerWorker:
         self.analyzer_config = config.get('claude_analyzer', {})
         self.redis_manager = get_redis_manager(config)
         
-        # Initialize the Claude analyzer
-        self.analyzer = ClaudeAnalyzer(self.analyzer_config)
+        # Initialize the Claude analyzer with the full config
+        # Pass None as config_path to use the ConfigManager's default behavior
+        self.analyzer = ClaudeAnalyzer(None)
         
         # Initialize the database manager
         db_path = config.get('web_crawler', {}).get('db_path', 'scraper/data/crawler.db')

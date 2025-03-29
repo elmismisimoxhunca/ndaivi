@@ -121,8 +121,12 @@ prompt_templates:
 
 # Web crawler configuration
 web_crawler:
+  # Target website - used as the default start URL if none is specified
+  target_website: "manualslib.com"
+  
   # Crawler behavior
   max_depth: 3
+  max_urls: null  # null means no limit (for production), set a number for testing
   max_urls_per_domain: 100
   max_concurrent_requests: 5
   request_delay: 1.0
@@ -152,6 +156,11 @@ web_crawler:
   
   # Stats
   stats_update_interval: 10  # Update stats every 10 URLs
+  
+  # Backlog management
+  backlog_min_threshold: 128  # Request more URLs when backlog falls below this
+  backlog_target_size: 1024   # Fill backlog up to this many URLs
+  backlog_check_interval: 30  # Check backlog size every 30 seconds
 
 # Redis configuration
 redis:
@@ -171,6 +180,8 @@ application:
     crawler:
       enabled: true
       worker_threads: 1
+      auto_start: false  # Don't start crawler automatically
+      resume_from_db: true  # Resume from database state
     analyzer:
       enabled: true
       worker_threads: 1
@@ -185,5 +196,8 @@ application:
     crawler_status: 'ndaivi:crawler:status'
     analyzer_commands: 'ndaivi:analyzer:commands'
     analyzer_status: 'ndaivi:analyzer:status'
+    analyzer_results: 'ndaivi:analyzer:results'  # Channel for analyzer to report completed URLs
+    backlog_status: 'ndaivi:backlog:status'      # Channel for backlog status updates
+    backlog_request: 'ndaivi:backlog:request'    # Channel for requesting more URLs
     stats: 'ndaivi:stats'
     system: 'ndaivi:system'

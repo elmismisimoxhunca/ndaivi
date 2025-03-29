@@ -248,8 +248,8 @@ class RedisManager:
             bool: True if published successfully, False otherwise
         """
         try:
-            # Serialize message to JSON
-            message_json = json.dumps(message)
+            # Serialize message to JSON with custom handling for sets
+            message_json = json.dumps(message, default=self._json_serializer)
             
             # Publish to channel
             self.redis_client.publish(channel, message_json)
@@ -284,8 +284,8 @@ class RedisManager:
             bool: True if stored successfully, False otherwise
         """
         try:
-            # Serialize data to JSON
-            data_json = json.dumps(data)
+            # Serialize data to JSON with custom handling for sets
+            data_json = json.dumps(data, default=self._json_serializer)
             
             # Store in Redis
             if expiry:
@@ -355,17 +355,72 @@ class RedisManager:
             stats = {
                 'connected_clients': info.get('connected_clients', 0),
                 'used_memory_human': info.get('used_memory_human', '0B'),
-                'total_connections_received': info.get('total_connections_received', 0),
                 'total_commands_processed': info.get('total_commands_processed', 0),
-                'keyspace_hits': info.get('keyspace_hits', 0),
-                'keyspace_misses': info.get('keyspace_misses', 0),
-                'uptime_in_seconds': info.get('uptime_in_seconds', 0)
+                'uptime_in_seconds': info.get('uptime_in_seconds', 0),
+                'uptime_in_days': info.get('uptime_in_days', 0),
+                'redis_version': info.get('redis_version', 'unknown')
             }
             
             return stats
         except Exception as e:
             logger.error(f"Error getting Redis stats: {e}")
-            return {}
+            return {
+                'error': str(e),
+                'status': 'disconnected'
+            }
+    
+    def is_connected(self) -> bool:
+        """
+        Check if Redis is connected.
+        
+        Returns:
+            bool: True if connected, False otherwise
+        """
+        try:
+            # Try to ping Redis
+            return self.redis_client.ping()
+        except Exception as e:
+            logger.error(f"Redis connection check failed: {e}")
+            return False
+    
+    def connect(self) -> bool:
+        """
+        Attempt to connect or reconnect to Redis.
+        
+        Returns:
+            bool: True if connected successfully, False otherwise
+        """
+        try:
+            # Create a new Redis client
+            self.redis_client = self._create_redis_client()
+            
+            # Test the connection
+            if self.redis_client.ping():
+                logger.info("Successfully connected to Redis")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {e}")
+            return False
+            
+    def _json_serializer(self, obj):
+        """
+        Custom JSON serializer to handle non-serializable types.
+        
+        Args:
+            obj: Object to serialize
+            
+        Returns:
+            Serializable representation of the object
+        """
+        # Handle sets by converting to lists
+        if isinstance(obj, set):
+            return list(obj)
+        # Handle other non-serializable types as needed
+        try:
+            return str(obj)
+        except:
+            return None
 
 # Singleton instance
 _redis_manager_instance = None

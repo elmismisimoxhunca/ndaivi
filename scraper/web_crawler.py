@@ -975,6 +975,7 @@ class WebCrawler:
         # Initialize result with default values
         result = {
             'url': url,
+            'domain': '',
             'depth': depth,
             'status': 'error',
             'error': None,
@@ -982,7 +983,11 @@ class WebCrawler:
             'links_added': 0,
             'content_type': '',
             'content_length': 0,
-            'processing_time': 0
+            'processing_time': 0,
+            'status_code': 0,
+            'title': '',
+            'content': '',
+            'links': []
         }
         
         # Initialize all stats entries we'll use to prevent KeyErrors
@@ -992,10 +997,22 @@ class WebCrawler:
             self.stats['urls_failed'] = 0
         if 'processing_times' not in self.stats:
             self.stats['processing_times'] = []
+        if 'content_types' not in self.stats:
+            self.stats['content_types'] = {}
+        if 'status_codes' not in self.stats:
+            self.stats['status_codes'] = {}
         
         start_time = time.time()
         
         try:
+            # Parse URL to get domain
+            parsed_url = urlparse(url)
+            domain = parsed_url.netloc
+            result['domain'] = domain
+            
+            # Log that we're processing this URL
+            self.logger.info(f"Processing URL: {url} (depth: {depth}, domain: {domain})")
+            
             # Check if URL is already visited
             if isinstance(self.visited_urls, VisitedUrlManager):
                 try:
@@ -1071,6 +1088,29 @@ class WebCrawler:
             # Get content type and length (with safe defaults)
             result['content_type'] = response.get('content_type', '')
             result['content_length'] = int(response.get('content_length', 0))
+            result['status_code'] = int(response.get('status_code', 0))
+            result['content'] = response.get('content', '')
+            
+            # Try to extract title
+            try:
+                if result['content'] and result['content_type'] and result['content_type'].startswith('text/html'):
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(result['content'], 'html.parser')
+                    title_tag = soup.find('title')
+                    if title_tag:
+                        result['title'] = title_tag.text.strip()
+            except Exception as e:
+                self.logger.error(f"Error extracting title: {str(e)}")
+            
+            # Update stats for content type and status code
+            content_type = result['content_type']
+            if content_type:
+                self.stats['content_types'][content_type] = self.stats['content_types'].get(content_type, 0) + 1
+            
+            status_code = result['status_code']
+            if status_code:
+                status_code_str = str(status_code)
+                self.stats['status_codes'][status_code_str] = self.stats['status_codes'].get(status_code_str, 0) + 1
             
             # Extract links if this is HTML content
             content_type = response.get('content_type', '')
@@ -1092,8 +1132,9 @@ class WebCrawler:
                         self.logger.error(f"Error extracting links: {str(e)}")
                         extracted_links = []
                     
-                # Set links_extracted count
+                # Set links_extracted count and store links in result
                 result['links_extracted'] = len(extracted_links)
+                result['links'] = extracted_links
                 
                 # Add links to queue if not empty
                 if extracted_links:
@@ -1127,9 +1168,6 @@ class WebCrawler:
             
             # Add URL to visited URLs
             try:
-                parsed_url = urlparse(url)
-                domain = parsed_url.netloc if parsed_url else ''
-                
                 if isinstance(self.visited_urls, VisitedUrlManager):
                     try:
                         self.visited_urls.add(
@@ -1138,7 +1176,9 @@ class WebCrawler:
                             depth,
                             int(response.get('status_code', 0)),
                             response.get('content_type', ''),
-                            int(response.get('content_length', 0))
+                            int(response.get('content_length', 0)),
+                            result.get('title', ''),
+                            response.get('content', '')
                         )
                     except Exception as e:
                         self.logger.error(f"Error adding URL to visited URLs: {str(e)}")
@@ -1150,73 +1190,45 @@ class WebCrawler:
             # Call callbacks with try/except blocks
             try:
                 for callback in self.callbacks.get('on_url_processed', []):
-                    try:
-                        callback(url, response, result)
-                    except Exception as e:
-                        self.logger.error(f"Error in on_url_processed callback: {str(e)}")
-                    
-                for callback in self.callbacks.get('on_content_extracted', []):
-                    try:
-                        callback(url, response.get('content', ''), result)
-                    except Exception as e:
-                        self.logger.error(f"Error in on_content_extracted callback: {str(e)}")
+                    callback(url, result)
             except Exception as e:
-                self.logger.error(f"Error in callbacks section: {str(e)}")
+                self.logger.error(f"Error in on_url_processed callback: {str(e)}")
                 
+            # Call content extracted callbacks
+            try:
+                for callback in self.callbacks.get('on_content_extracted', []):
+                    callback(url, depth, result.get('title', ''), result.get('content', ''), {})
+            except Exception as e:
+                self.logger.error(f"Error in on_content_extracted callback: {str(e)}")
+            
+            # Update stats
+            self.stats['urls_processed'] = int(self.stats.get('urls_processed', 0)) + 1
+            
+            # Set status to success
             result['status'] = 'success'
             
         except Exception as e:
-            tb = traceback.format_exc()
-            self.logger.error(f"Error processing URL {url}: {str(e)}\n{tb}")
+            self.logger.error(f"Error processing URL {url}: {str(e)}")
             result['status'] = 'error'
             result['error'] = str(e)
+            self.stats['urls_failed'] = int(self.stats.get('urls_failed', 0)) + 1
             
-            # Update failed URLs count safely
-            try:
-                failed = int(self.stats.get('urls_failed', 0))
-                self.stats['urls_failed'] = failed + 1
-            except (TypeError, ValueError) as e:
-                self.logger.error(f"Error updating urls_failed stat: {str(e)}")
-                self.stats['urls_failed'] = 1
-            
-        # Calculate processing time - ensure no None values are used in arithmetic
-        try:
+        finally:
+            # Calculate processing time
             end_time = time.time()
-            processing_time = float(end_time - start_time)
+            processing_time = end_time - start_time
             result['processing_time'] = processing_time
             
-            # Add to processing times for stats, with safety checks
-            if isinstance(self.stats.get('processing_times'), list):
-                self.stats['processing_times'].append(processing_time)
-            else:
-                self.stats['processing_times'] = [processing_time]
-        except Exception as e:
-            self.logger.error(f"Error calculating processing time: {str(e)}")
-            result['processing_time'] = 0.0
-        
-        # Update stats callback with extreme defensive coding
-        if self.stats_callback:
-            try:
-                # Create a completely safe copy with no None values
-                safe_stats = {}
-                for key, value in self.get_stats().items():
-                    if value is None:
-                        if key in ['elapsed_time', 'avg_processing_time']:
-                            safe_stats[key] = 0.0
-                        elif isinstance(value, (list, set)):
-                            safe_stats[key] = type(value)()
-                        elif isinstance(value, dict):
-                            safe_stats[key] = {}
-                        else:
-                            safe_stats[key] = 0
-                    else:
-                        safe_stats[key] = value
-                
-                self.stats_callback(safe_stats)
-            except Exception as e:
-                self.logger.error(f"Error in stats callback: {str(e)}")
+            # Add to processing times list (up to 100 entries)
+            self.stats['processing_times'].append(processing_time)
+            if len(self.stats['processing_times']) > 100:
+                self.stats['processing_times'] = self.stats['processing_times'][-100:]
             
-        return result
+            # Update stats
+            self._update_stats()
+            
+            # Return result
+            return result
     
     def process_next_url(self) -> Dict:
         """
@@ -1465,8 +1477,45 @@ class WebCrawler:
     
     def close(self):
         """Close the crawler and release resources."""
-        if self.db:
-            self.db.close()
+        if self.session:
+            self.session.close()
+        
+        self.logger.info("Crawler closed")
+    
+    def reset(self):
+        """
+        Reset the crawler state, clearing the URL queue and statistics.
+        """
+        self.logger.info("Resetting crawler state")
+        
+        # Clear the URL queue
+        self.url_queue.clear()
+        
+        # Reset statistics
+        self.stats = {
+            'start_time': None,
+            'end_time': None,
+            'elapsed_time': 0,
+            'urls_processed': 0,
+            'urls_queued': 0,
+            'urls_failed': 0,
+            'domains_discovered': set(),
+            'processing_times': []
+        }
+        
+        # Reset the start domain
+        self.start_domain = None
+        
+        # If using database, clear the URL queue in the database
+        if self.use_database and self.url_queue_manager:
+            try:
+                # This would require adding a method to clear the queue in the database
+                # For now, we'll just log that this should be implemented
+                self.logger.warning("Database queue reset not implemented")
+            except Exception as e:
+                self.logger.error(f"Error resetting database queue: {e}")
+        
+        self.logger.info("Crawler state reset complete")
     
     def _update_stats(self):
         """Update and store current stats."""

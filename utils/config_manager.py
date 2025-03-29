@@ -65,6 +65,13 @@ class ConfigManager:
             Configuration dictionary
         """
         try:
+            # Handle case where config_path is already a dictionary (direct config)
+            if isinstance(self._config_path, dict):
+                self.logger.info(f"Loading configuration from provided dictionary")
+                config = self._config_path
+                self._config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
+                return config
+                
             # Use default config path if none provided
             if not self._config_path:
                 self._config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
@@ -182,6 +189,11 @@ class ConfigManager:
             config: Configuration dictionary to save
         """
         try:
+            # Ensure config_path is a valid string path
+            if not isinstance(self._config_path, str):
+                self._config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
+                self.logger.warning(f"Config path was not a string, using default path: {self._config_path}")
+                
             # Create directory if it doesn't exist
             os.makedirs(os.path.dirname(self._config_path), exist_ok=True)
             
@@ -191,7 +203,6 @@ class ConfigManager:
             self.logger.info(f"Configuration saved to {self._config_path}")
         except Exception as e:
             self.logger.error(f"Failed to save configuration: {e}")
-            raise
     
     def _validate_config(self, config: Dict) -> None:
         """
