@@ -16,29 +16,18 @@ Workflow:
 6. This system can run in the background and stats may be checked at any moment
 """
 
+import os
+import sys
+import time
 import json
+import signal
 import logging
 import threading
-import time
-import os
-import signal
-import sys
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, Any, List, Optional, Callable
 
-# Add the parent directory to the path to import from utils
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utils.redis_manager import get_redis_manager
-from utils.config_manager import ConfigManager
+from utils.config_manager import get_config
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/container_app.log'),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 # Global flags for signal handling
@@ -94,8 +83,7 @@ class ContainerApp:
         """
         # Load configuration
         self.config_path = config_path
-        self.config_manager = ConfigManager(config_path)
-        self.config = self.config_manager.get_all()
+        self.config = get_config(config_path)
         
         # Initialize Redis manager
         self.redis_manager = get_redis_manager(self.config)
@@ -145,7 +133,9 @@ class ContainerApp:
             'backlog_requests': 0,
             'crawler_status': 'unknown',
             'analyzer_status': 'unknown',
-            'last_crawler_update': 0
+            'last_crawler_update': 0,
+            'queued_urls': [],
+            'processing_urls': []
         }
         
         # Application state
@@ -157,94 +147,176 @@ class ContainerApp:
         # Processing configuration
         self.max_concurrent_processing = self.config.get('application', {}).get('components', {}).get('container_app', {}).get('max_concurrent_processing', 10)
         
+        # Initialize monitoring attributes
+        self.monitor_thread = None
+        self.monitor_running = False
+        
         logger.info(f"Container app initialized with backlog thresholds: min={self.backlog_min_threshold}, target={self.backlog_target_size}")
     
     def start(self) -> bool:
         """
-        Start the container application.
+        Start the container application and its components.
         
         Returns:
-            bool: True if started successfully, False otherwise
+            bool: True if started successfully
         """
         if self.running:
-            logger.warning("Container app already running")
+            logger.info("Container application already running")
             return True
+            
+        logger.info("Starting container application...")
         
         try:
-            # Ensure Redis manager is connected
-            if not self.redis_manager.is_connected():
-                success = self.redis_manager.start()
-                if not success:
-                    logger.error("Failed to connect to Redis")
-                    return False
-            
-            # Subscribe to channels
+            # Initialize Redis manager
+            self.redis_manager = get_redis_manager(self.config)
+            if not self.redis_manager:
+                logger.error("Failed to initialize Redis manager")
+                return False
+                
+            # Subscribe to status channels
             self.redis_manager.subscribe(self.crawler_status_channel, self._handle_crawler_status)
             self.redis_manager.subscribe(self.analyzer_status_channel, self._handle_analyzer_status)
             self.redis_manager.subscribe(self.backlog_status_channel, self._handle_backlog_status)
             self.redis_manager.subscribe(self.analyzer_results_channel, self._handle_analyzer_result)
             
-            # Start worker thread
+            # Initialize crawler and analyzer status
+            self.crawler_status = {
+                'status': 'running',
+                'message': 'Crawler component started',
+                'timestamp': time.time(),
+                'component': 'crawler'
+            }
+            
+            self.analyzer_status = {
+                'status': 'running',
+                'message': 'Analyzer component started',
+                'timestamp': time.time(),
+                'component': 'analyzer'
+            }
+            
+            # Set running flag
             self.running = True
-            self.stats['start_time'] = time.time()
+            
+            # Start worker thread
             self.worker_thread = threading.Thread(target=self._worker_loop)
             self.worker_thread.daemon = True
             self.worker_thread.start()
             
-            # Publish system status
-            self._publish_status('starting', 'Container app starting')
+            # Start components
+            self._start_crawler()
+            self._start_analyzer()
             
-            # Start crawler and analyzer components
-            logger.info("Starting crawler component...")
-            crawler_started = self.start_crawler()
-            if not crawler_started:
-                logger.warning("Failed to start crawler component")
-            
-            logger.info("Starting analyzer component...")
-            analyzer_started = self.start_analyzer()
-            if not analyzer_started:
-                logger.warning("Failed to start analyzer component")
-            
-            # Start a crawl job with the target website from config
-            if crawler_started:
-                target_website = self.config.get('web_crawler', {}).get('target_website')
-                if target_website:
-                    logger.info(f"Starting initial crawl job with target website: {target_website}")
-                    time.sleep(1)  # Give the crawler a moment to initialize
-                    self.start_crawl_job(target_website)
-                else:
-                    logger.warning("No target website configured in config.yaml")
-            
-            logger.info("Container app started successfully")
+            logger.info("Container application started successfully")
             return True
         except Exception as e:
-            logger.error(f"Error starting container app: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self.running = False
+            logger.error(f"Error starting container application: {e}")
             return False
     
-    def stop(self) -> None:
-        """Stop the container application."""
+    def start_monitor(self) -> None:
+        """Start monitoring system status."""
+        if not self.monitor_thread or not self.monitor_thread.is_alive():
+            self.monitor_running = True
+            self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self.monitor_thread.start()
+            logger.info("Monitor started")
+            
+    def stop_monitor(self) -> None:
+        """Stop monitoring system status."""
+        self.monitor_running = False
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=1.0)
+            logger.info("Monitor stopped")
+            
+    def _monitor_loop(self) -> None:
+        """Monitor loop that displays system status."""
+        while self.monitor_running:
+            try:
+                status = self.get_status()
+                
+                # Clear screen and print status
+                print("\033[2J\033[H", end="")  # Clear screen and move cursor to top
+                print("\nNDAIVI System Monitor")
+                print("===================")
+                print(f"\nCrawler: {status['crawler']['status']} - {status['crawler']['message']}")
+                print(f"Analyzer: {status['analyzer']['status']} - {status['analyzer']['message']}")
+                print(f"\nBacklog size: {status.get('backlog_size', 0)}")
+                print(f"URLs processed: {status.get('processed_count', 0)}")
+                print(f"URLs queued: {status.get('backlog_size', 0)}")
+                print("\nPress Ctrl+C to stop monitoring...")
+                
+                time.sleep(1.0)  # Update every second
+                
+            except Exception as e:
+                logger.error(f"Error in monitor loop: {e}")
+                time.sleep(1.0)  # Wait before retrying
+    
+    def stop(self) -> bool:
+        """
+        Stop the container application and all components.
+        
+        Returns:
+            bool: True if stopped successfully
+        """
         if not self.running:
-            return
+            logger.info("Container application already stopped")
+            return True
+            
+        logger.info("Stopping container application...")
         
-        self.running = False
-        
-        # Wait for worker thread to terminate
-        if self.worker_thread:
-            self.worker_thread.join(timeout=1.0)
-        
-        # Unsubscribe from channels
-        self.redis_manager.unsubscribe(self.crawler_status_channel)
-        self.redis_manager.unsubscribe(self.analyzer_status_channel)
-        self.redis_manager.unsubscribe(self.backlog_status_channel)
-        self.redis_manager.unsubscribe(self.analyzer_results_channel)
-        
-        # Publish system status
-        self._publish_status('stopping', 'Container app stopping')
-        
-        logger.info("Container app stopped")
+        try:
+            # Set flags to stop all processing
+            self.running = False
+            self.paused = False
+            
+            # Stop the monitor thread
+            if hasattr(self, 'monitor_thread') and self.monitor_thread and self.monitor_thread.is_alive():
+                logger.info("Stopping monitor thread...")
+                try:
+                    self.monitor_thread.join(timeout=2.0)
+                except Exception as e:
+                    logger.error(f"Error stopping monitor thread: {e}")
+            
+            # Send stop commands to components
+            stop_command = {'command': 'stop'}
+            self.redis_manager.publish(self.crawler_commands_channel, stop_command)
+            self.redis_manager.publish(self.analyzer_commands_channel, stop_command)
+            
+            # Wait for components to stop (max 5 seconds)
+            wait_start = time.time()
+            while time.time() - wait_start < 5:
+                if (self.crawler_status.get('status') == 'stopped' and 
+                    self.analyzer_status.get('status') == 'stopped'):
+                    break
+                time.sleep(0.1)
+            
+            # Unsubscribe from all channels
+            logger.info("Unsubscribing from Redis channels...")
+            channels = [
+                self.crawler_status_channel,
+                self.analyzer_status_channel,
+                self.backlog_status_channel,
+                self.analyzer_results_channel,
+                self.container_status_channel
+            ]
+            for channel in channels:
+                try:
+                    self.redis_manager.unsubscribe(channel)
+                except Exception as e:
+                    logger.error(f"Error unsubscribing from {channel}: {e}")
+            
+            # Close Redis connection
+            logger.info("Closing Redis connection...")
+            try:
+                self.redis_manager.close()
+            except Exception as e:
+                logger.error(f"Error closing Redis connection: {e}")
+            
+            logger.info("Container application stopped successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error stopping container application: {e}")
+            return False
     
     def _worker_loop(self) -> None:
         """
@@ -352,38 +424,64 @@ class ContainerApp:
         Handle a status update from the crawler.
         
         Args:
-            message: Status message
+            message: Status message dictionary
         """
         try:
-            # Log the status update
-            status = message.get('status', 'unknown')
-            details = message.get('message', '')
-            logger.info(f"Crawler status update: {status} - {details}")
+            status = message.get('status')
+            msg = message.get('message')
+            data = message.get('data', {})
+            timestamp = message.get('timestamp', time.time())
             
             # Update crawler status
-            with self.lock:
-                self.crawler_status = message
-                self.stats['last_crawler_update'] = time.time()
+            self.crawler_status = {
+                'status': status,
+                'message': msg,
+                'timestamp': timestamp,
+                'data': data,
+                'component': 'crawler'
+            }
             
-            # If the crawler is processing a URL, add it to the processing list
-            if status == 'crawling' and 'Processing URL:' in details:
-                url = details.replace('Processing URL:', '').strip()
-                if url:
-                    with self.lock:
-                        # Add to processing list if not already there
-                        if url not in [item.get('url') for item in self.processing]:
-                            self.processing.append({
-                                'url': url,
-                                'timestamp': time.time(),
-                                'component': 'crawler'
-                            })
-                            logger.debug(f"Added URL to processing list: {url}")
+            # Log status update
+            logger.info(f"Crawler status: {status} - {msg}")
+            if data:
+                logger.info(f"Crawler data: {json.dumps(data, indent=2)}")
             
-            # Publish system status update
-            self._publish_status('running', f"Crawler: {status} - {details}")
+            # Publish to container status channel
+            self.redis_manager.publish(self.container_status_channel, {
+                'type': 'crawler_status',
+                'status': status,
+                'message': msg,
+                'data': data,
+                'timestamp': timestamp
+            })
         except Exception as e:
             logger.error(f"Error handling crawler status: {e}")
-    
+
+    def _handle_backlog_status(self, message: Dict[str, Any]) -> None:
+        """
+        Handle backlog status updates.
+        
+        Args:
+            message: Backlog status message
+        """
+        try:
+            # Log backlog status
+            logger.info(f"Backlog status: {json.dumps(message, indent=2)}")
+            
+            # Update stats
+            self.stats['backlog_size'] = message.get('size', 0)
+            self.stats['queued_urls'] = message.get('queued_urls', [])
+            self.stats['processing_urls'] = message.get('processing_urls', [])
+            
+            # Publish to container status channel
+            self.redis_manager.publish(self.container_status_channel, {
+                'type': 'backlog_status',
+                'data': message,
+                'timestamp': time.time()
+            })
+        except Exception as e:
+            logger.error(f"Error handling backlog status: {e}")
+
     def _handle_analyzer_status(self, message: Dict[str, Any]) -> None:
         """
         Handle status updates from the analyzer.
@@ -391,14 +489,14 @@ class ContainerApp:
         Args:
             message: Status message
         """
-        status = message.get('status', '')
-        msg_text = message.get('message', '')
+        status = message.get('status')
+        msg_text = message.get('message')
         
         # Log the status update
         logger.info(f"Analyzer status: {status} - {msg_text}")
         
         # Update analyzer status
-        self.analyzer_status = status
+        self.analyzer_status = message
         
         # Handle specific status updates
         if status == 'completed':
@@ -418,53 +516,6 @@ class ContainerApp:
                     'url': url,
                     'processed_count': self.stats['processed_count']
                 })
-    
-    def _handle_backlog_status(self, message: Dict[str, Any]) -> None:
-        """
-        Handle a backlog status update from the crawler.
-        
-        Args:
-            message: Backlog status message
-        """
-        try:
-            status = message.get('status')
-            urls = message.get('urls', [])
-            count = message.get('count', 0)
-            
-            logger.info(f"Received backlog status update: {status}, {count} URLs")
-            
-            if status == 'backlog_response' and urls:
-                with self.lock:
-                    # Add URLs to the backlog
-                    for url_data in urls:
-                        # Handle both string URLs and dictionary URL objects
-                        if isinstance(url_data, str):
-                            url = url_data
-                        elif isinstance(url_data, dict):
-                            url = url_data.get('url')
-                        else:
-                            logger.warning(f"Unexpected URL data format: {type(url_data)}")
-                            continue
-                            
-                        if not url:
-                            continue
-                            
-                        # Check if URL is already in backlog or processing
-                        processing_urls = [item.get('url') for item in self.processing]
-                        if url not in self.backlog and url not in processing_urls:
-                            self.backlog.append(url)
-                            logger.info(f"Added URL to backlog: {url}")
-                
-                    # Update stats
-                    self.stats['backlog_size'] = len(self.backlog)
-                
-                    # Publish status update
-                    self._publish_status('backlog_updated', f"Added {len(urls)} URLs to backlog")
-                    logger.info(f"Backlog size after update: {len(self.backlog)}")
-        except Exception as e:
-            logger.error(f"Error handling backlog status: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
     
     def _handle_analyzer_result(self, message: Dict[str, Any]) -> None:
         """
@@ -600,14 +651,14 @@ class ContainerApp:
     def pause(self) -> None:
         """Pause the container application."""
         self.paused = True
-        self._publish_status('paused', 'Container app paused')
-        logger.info("Container app paused")
+        self._publish_status('paused', 'Container application paused')
+        logger.info("Container application paused")
     
     def resume(self) -> None:
         """Resume the container application."""
         self.paused = False
-        self._publish_status('resumed', 'Container app resumed')
-        logger.info("Container app resumed")
+        self._publish_status('resumed', 'Container application resumed')
+        logger.info("Container application resumed")
     
     def start_crawler(self) -> bool:
         """
@@ -789,6 +840,32 @@ class ContainerApp:
             logger.error(f"Error starting crawl job: {e}")
             return False
     
+    def _start_crawler(self) -> None:
+        """Send explicit command to start the crawler worker."""
+        try:
+            command = {
+                'command': 'start',
+                'params': {
+                    'target_website': self.config.get('web_crawler', {}).get('target_website', 'manualslib.com')
+                }
+            }
+            logger.info(f"Sending start command to crawler: {command}")
+            self.redis_manager.publish(self.crawler_commands_channel, command)
+        except Exception as e:
+            logger.error(f"Error sending start command to crawler: {e}")
+
+    def _start_analyzer(self) -> None:
+        """Send explicit command to start the analyzer worker."""
+        try:
+            command = {
+                'command': 'start',
+                'params': {}
+            }
+            logger.info(f"Sending start command to analyzer: {command}")
+            self.redis_manager.publish(self.analyzer_commands_channel, command)
+        except Exception as e:
+            logger.error(f"Error sending start command to analyzer: {e}")
+
     def _process_next_url(self) -> None:
         """
         Process the next URL in the backlog.

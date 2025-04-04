@@ -81,7 +81,7 @@ class AnalyzerWorker:
             self.worker_thread.start()
             
             # Publish status update
-            self._publish_status('idle', 'Analyzer worker started')
+            self._publish_status('running', 'Analyzer worker started and ready')
             
             logger.info("Analyzer worker started successfully")
             return True
@@ -95,17 +95,32 @@ class AnalyzerWorker:
         if not self.running:
             return
         
+        logger.info("Stopping analyzer worker...")
+        
+        # Set flags to stop all processing
         self.running = False
         
         # Wait for worker thread to terminate
-        if self.worker_thread:
-            self.worker_thread.join(timeout=1.0)
+        if self.worker_thread and self.worker_thread.is_alive():
+            logger.info("Waiting for analyzer worker thread to terminate...")
+            try:
+                self.worker_thread.join(timeout=2.0)
+                if self.worker_thread.is_alive():
+                    logger.warning("Analyzer worker thread did not terminate within timeout, proceeding anyway")
+            except Exception as e:
+                logger.error(f"Error joining analyzer worker thread: {e}")
         
         # Unsubscribe from command channel
-        self.redis_manager.unsubscribe(self.command_channel)
+        try:
+            self.redis_manager.unsubscribe(self.command_channel)
+        except Exception as e:
+            logger.error(f"Error unsubscribing from command channel: {e}")
         
         # Publish status update
-        self._publish_status('stopped', 'Analyzer worker stopped')
+        try:
+            self._publish_status('stopped', 'Analyzer worker stopped')
+        except Exception as e:
+            logger.error(f"Error publishing stop status: {e}")
         
         logger.info("Analyzer worker stopped")
     

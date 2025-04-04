@@ -515,229 +515,92 @@ class NDaiviCLI(cmd.Cmd):
         """
         super().__init__()
         self.app = app
-    
+        
     def do_start(self, arg):
         """
-        Start the NDAIVI system in modular mode.
+        Start the NDAIVI system.
         
-        This command starts the container app, crawler, and analyzer components
-        as a cohesive system.
+        Usage: start [--target URL]
         """
-        print("Starting NDAIVI in modular mode...")
-        if self.app.start_modular():
-            print("NDAIVI started successfully in modular mode.")
-        else:
-            print("Failed to start NDAIVI in modular mode.")
-    
+        try:
+            # Parse arguments
+            parser = argparse.ArgumentParser(prog='start')
+            parser.add_argument('--target', help='Target website URL', default=None)
+            args = parser.parse_args(arg.split())
+            
+            if args.target:
+                self.app.config['web_crawler']['target_website'] = args.target
+            
+            # Start the system
+            if self.app.start_modular():
+                print("NDAIVI system started successfully")
+            else:
+                print("Failed to start NDAIVI system")
+        except Exception as e:
+            print(f"Error starting system: {e}")
+            
     def do_stop(self, arg):
         """
         Stop the NDAIVI system.
         
-        This command stops all running components of the NDAIVI system.
+        Usage: stop
         """
-        print("Stopping NDAIVI...")
-        self.app.stop()
-        print("NDAIVI stopped.")
-    
-    def do_status(self, arg):
-        """
-        Check the status of the NDAIVI system.
-        
-        This command displays the current status of all components of the NDAIVI system.
-        """
-        status = self.app.get_status()
-        
-        print("\nNDAIVI System Status:")
-        print("=====================")
-        
-        # Container app status
-        container_status = status.get('container_app', {})
-        print(f"Container App: {container_status.get('status', 'Unknown')}")
-        
-        # Crawler status
-        crawler_status = status.get('crawler', {})
-        print(f"Crawler: {crawler_status.get('status', 'Unknown')}")
-        
-        # Analyzer status
-        analyzer_status = status.get('analyzer', {})
-        print(f"Analyzer: {analyzer_status.get('status', 'Unknown')}")
-        
-        # Background process status
-        background_status = status.get('background', {})
-        print(f"Background Process: {background_status.get('status', 'Unknown')}")
-        
-        # Backlog status
-        backlog_status = status.get('backlog', {})
-        print(f"\nBacklog Status:")
-        print(f"  Size: {backlog_status.get('size', 0)}")
-        print(f"  Min Threshold: {backlog_status.get('min_threshold', 0)}")
-        print(f"  Target Size: {backlog_status.get('target_size', 0)}")
-        
-        # Stats
-        stats = status.get('stats', {})
-        print("\nStats:")
-        for key, value in stats.items():
-            print(f"  {key}: {value}")
-    
-    def do_pause(self, arg):
-        """
-        Pause the NDAIVI system.
-        
-        This command pauses all components of the NDAIVI system.
-        """
-        print("Pausing NDAIVI...")
-        self.app.pause()
-        print("NDAIVI paused.")
-    
-    def do_resume(self, arg):
-        """
-        Resume the NDAIVI system.
-        
-        This command resumes all components of the NDAIVI system.
-        """
-        print("Resuming NDAIVI...")
-        self.app.resume()
-        print("NDAIVI resumed.")
-    
-    def do_backlog(self, arg):
-        """
-        Display backlog status and optionally request more URLs.
-        
-        Usage:
-          backlog          - Display current backlog status
-          backlog request  - Request more URLs from the crawler
-        """
-        args = arg.strip().split()
-        
-        if not args:
-            # Display backlog status
-            status = self.app.get_status()
-            backlog_status = status.get('backlog', {})
+        try:
+            if self.app.stop():
+                print("NDAIVI system stopped successfully")
+            else:
+                print("Failed to stop NDAIVI system")
+        except Exception as e:
+            print(f"Error stopping system: {e}")
             
-            print("\nBacklog Status:")
-            print(f"  Size: {backlog_status.get('size', 0)}")
-            print(f"  Min Threshold: {backlog_status.get('min_threshold', 0)}")
-            print(f"  Target Size: {backlog_status.get('target_size', 0)}")
-        elif args[0] == 'request':
-            # Request more URLs
-            count = int(args[1]) if len(args) > 1 else 100
-            print(f"Requesting {count} more URLs...")
-            self.app.request_more_urls(count)
-            print("Request sent.")
-        else:
-            print("Invalid backlog command. Use 'backlog' or 'backlog request [count]'.")
-    
     def do_monitor(self, arg):
         """
-        Monitor the NDAIVI system.
+        Monitor the NDAIVI system in real-time.
+        Press Ctrl+C to stop monitoring.
         
         Usage: monitor
         """
-        print("Monitoring NDAIVI system. Press Ctrl+C to exit.")
-        
-        # Store original signal handler
-        original_sigint_handler = signal.getsignal(signal.SIGINT)
-        
-        # Flag to track if we're exiting
-        exiting = False
-        
-        # Define our own signal handler
-        def sigint_handler(sig, frame):
-            nonlocal exiting
-            if not exiting:
-                exiting = True
-                print("\nStopping monitor...")
-                # Restore original handler for next Ctrl+C
-                signal.signal(signal.SIGINT, original_sigint_handler)
-        
         try:
-            # Set our custom signal handler
-            signal.signal(signal.SIGINT, sigint_handler)
-            
-            # Get Redis manager
-            redis_manager = get_redis_manager(self.app.config)
-            
-            # Define callback for status updates
-            def status_callback(message):
-                if exiting:
-                    return
-                
-                component = message.get('component', 'unknown')
-                status = message.get('status', 'unknown')
-                details = message.get('message', '')
-                timestamp = message.get('timestamp', time.time())
-                time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
-                print(f"[{time_str}] {component}: {status} - {details}")
-            
-            # Subscribe to status channels
-            channels_config = self.app.config.get('application', {}).get('channels', {})
-            status_channels = [
-                channels_config.get('crawler_status', 'ndaivi:crawler:status'),
-                channels_config.get('analyzer_status', 'ndaivi:analyzer:status'),
-                channels_config.get('container_status', 'ndaivi:container:status')
-            ]
-            
-            for channel in status_channels:
-                redis_manager.subscribe(channel, status_callback)
-            
-            print(f"Subscribed to status channels: {', '.join(status_channels)}")
-            
-            # Keep running until interrupted
-            while not exiting:
-                time.sleep(0.1)
-                
+            print("Starting system monitor... Press Ctrl+C to stop.")
+            self.app.start_monitor()
+        except KeyboardInterrupt:
+            print("\nStopping monitor...")
+            self.app.stop_monitor()
         except Exception as e:
-            print(f"Error monitoring system: {e}")
-        finally:
-            # Restore original signal handler
-            signal.signal(signal.SIGINT, original_sigint_handler)
+            print(f"Error in monitor: {e}")
             
-            # Unsubscribe from all channels
-            if 'redis_manager' in locals() and 'status_channels' in locals():
-                for channel in status_channels:
-                    redis_manager.unsubscribe(channel)
-                print("Unsubscribed from status channels")
-    
+    def do_status(self, arg):
+        """
+        Show current system status.
+        
+        Usage: status
+        """
+        try:
+            status = self.app.get_status()
+            print("\nSystem Status:")
+            print(f"Crawler: {status['crawler']['status']} - {status['crawler']['message']}")
+            print(f"Analyzer: {status['analyzer']['status']} - {status['analyzer']['message']}")
+            print(f"\nBacklog size: {status.get('backlog_size', 0)}")
+        except Exception as e:
+            print(f"Error getting status: {e}")
+            
     def do_exit(self, arg):
         """Exit the CLI."""
-        print("Exiting NDAIVI...")
-        return True
-    
+        try:
+            print("Stopping NDAIVI system...")
+            # Stop monitoring if active
+            self.app.stop_monitor()
+            # Stop the application
+            self.app.stop()
+            print("Goodbye!")
+            return True
+        except Exception as e:
+            print(f"Error during exit: {e}")
+            return True
+        
     def do_quit(self, arg):
         """Exit the CLI."""
         return self.do_exit(arg)
-    
-    def do_help(self, arg):
-        """
-        List available commands with "help" or detailed help with "help cmd".
-        """
-        if arg:
-            # Show help for specific command
-            super().do_help(arg)
-        else:
-            # Show general help
-            print("\nNDAIVI Command Line Interface")
-            print("===========================")
-            print("\nAvailable commands:")
-            
-            # Group commands by category
-            system_commands = ['start', 'stop', 'pause', 'resume', 'status']
-            monitoring_commands = ['monitor', 'backlog']
-            general_commands = ['help', 'exit', 'quit']
-            
-            print("\nSystem Control:")
-            for command in system_commands:
-                print(f"  {command:15}")
-            
-            print("\nMonitoring:")
-            for command in monitoring_commands:
-                print(f"  {command:15}")
-            
-            print("\nGeneral:")
-            for command in general_commands:
-                print(f"  {command:15}")
-            
-            print("\nType 'help <command>' for more information about a specific command.")
 
 class NDaiviApp:
     """
@@ -804,6 +667,19 @@ class NDaiviApp:
             bool: True if started successfully
         """
         try:
+            # Initialize container app first (it will coordinate the other components)
+            logger.info("Starting container app...")
+            from container_app import ContainerApp
+            self.container_app = ContainerApp()
+            container_started = self.container_app.start()
+            
+            if not container_started:
+                logger.error("Failed to start container app")
+                return False
+                
+            # Start the monitor
+            self.container_app.start_monitor()
+                
             # Initialize crawler and analyzer workers
             logger.info("Initializing crawler and analyzer workers...")
             from scraper.crawler_worker import CrawlerWorker
@@ -819,35 +695,30 @@ class NDaiviApp:
             
             if not crawler_started:
                 logger.error("Failed to start crawler worker")
+                self.container_app.stop()
+                return False
             
             if not analyzer_started:
                 logger.error("Failed to start analyzer worker")
+                self.crawler_worker.stop()
+                self.container_app.stop()
+                return False
             
-            # Create and start container app
-            logger.info("Starting container app...")
-            from container_app import ContainerApp
-            self.container_app = ContainerApp()
-            success = self.container_app.start()
+            logger.info("NDAIVI started successfully in modular mode")
             
-            if success:
-                logger.info("NDAIVI started successfully in modular mode")
-                
-                # Start a crawl job with the target website from config
-                target_website = self.config.get('web_crawler', {}).get('target_website')
-                if target_website:
-                    logger.info(f"Starting initial crawl job with target website: {target_website}")
-                    self.container_app.start_crawl_job(target_website)
-                else:
-                    logger.warning("No target website configured, no initial crawl job started")
+            # Start a crawl job with the target website from config
+            target_website = self.config.get('web_crawler', {}).get('target_website')
+            if target_website:
+                logger.info(f"Starting initial crawl job with target website: {target_website}")
+                time.sleep(1)  # Brief pause to ensure everything is ready
+                self.container_app.start_crawl_job(target_website)
             else:
-                logger.error("Failed to start NDAIVI in modular mode")
-                # Clean up if container app failed to start
-                if crawler_started:
-                    self.crawler_worker.stop()
-                if analyzer_started:
-                    self.analyzer_worker.stop()
+                logger.warning("No target website configured, no initial crawl job started")
             
-            return success
+            # Set background process as running
+            self.background_process = True  # Just a flag to indicate it's running
+            
+            return True
         except Exception as e:
             logger.error(f"Error starting NDAIVI in modular mode: {e}")
             import traceback
@@ -898,12 +769,11 @@ class NDaiviApp:
         try:
             # Pause container app if running
             if hasattr(self, 'container_app'):
+                logger.info("Pausing container app...")
                 self.container_app.pause()
-                logger.info("NDAIVI paused")
-                return True
-            else:
-                logger.warning("No container app running to pause")
-                return False
+            
+            logger.info("NDAIVI paused")
+            return True
         except Exception as e:
             logger.error(f"Error pausing NDAIVI: {e}")
             return False
@@ -918,25 +788,23 @@ class NDaiviApp:
         try:
             # Resume container app if running
             if hasattr(self, 'container_app'):
+                logger.info("Resuming container app...")
                 self.container_app.resume()
-                logger.info("NDAIVI resumed")
-                return True
-            else:
-                logger.warning("No container app running to resume")
-                return False
+            
+            logger.info("NDAIVI resumed")
+            return True
         except Exception as e:
             logger.error(f"Error resuming NDAIVI: {e}")
             return False
     
     def get_status(self) -> Dict[str, Any]:
         """
-        Get the status of the NDAIVI system.
+        Get the current status of the NDAIVI system.
         
         Returns:
-            Dict[str, Any]: Status dictionary
+            Dict[str, Any]: Status information
         """
         status = {
-            'container_app': {'status': 'not_running'},
             'crawler': {'status': 'not_running'},
             'analyzer': {'status': 'not_running'},
             'background': {'status': 'not_running'},
@@ -952,24 +820,48 @@ class NDaiviApp:
                 
                 # Get crawler and analyzer status from container app
                 if container_status:
-                    status['crawler'] = {'status': container_status.get('crawler_status', 'unknown')}
-                    status['analyzer'] = {'status': container_status.get('analyzer_status', 'unknown')}
+                    crawler_data = container_status.get('crawler', {})
+                    analyzer_data = container_status.get('analyzer', {})
+                    
+                    # If we have the components initialized but no status yet, show as running
+                    if hasattr(self, 'crawler_worker') and self.crawler_worker.running:
+                        status['crawler'] = {
+                            'status': crawler_data.get('status', 'running'),
+                            'message': crawler_data.get('message', 'Running')
+                        }
+                    else:
+                        status['crawler'] = {
+                            'status': crawler_data.get('status', 'unknown'),
+                            'message': crawler_data.get('message', '')
+                        }
+                    
+                    if hasattr(self, 'analyzer_worker') and self.analyzer_worker.running:
+                        status['analyzer'] = {
+                            'status': analyzer_data.get('status', 'running'),
+                            'message': analyzer_data.get('message', 'Running')
+                        }
+                    else:
+                        status['analyzer'] = {
+                            'status': analyzer_data.get('status', 'unknown'),
+                            'message': analyzer_data.get('message', '')
+                        }
                     
                     # Get backlog status
+                    backlog_data = container_status.get('backlog', {})
                     status['backlog'] = {
-                        'size': container_status.get('backlog_size', 0),
-                        'min_threshold': container_status.get('backlog_min_threshold', 0),
-                        'target_size': container_status.get('backlog_target_size', 0)
+                        'size': backlog_data.get('size', 0),
+                        'min_threshold': backlog_data.get('min_threshold', 0),
+                        'target_size': backlog_data.get('target_size', 0)
                     }
                     
                     # Get stats
                     status['stats'] = container_status.get('stats', {})
             
             # Get background process status
-            if self.background_process:
+            if hasattr(self, 'background_process') and self.background_process:
                 status['background'] = {
-                    'status': 'running' if self.background_process.is_alive() else 'stopped',
-                    'pid': self.background_process.pid if hasattr(self.background_process, 'pid') else None
+                    'status': 'running',
+                    'pid': 'N/A'  # We're not using an actual process, so no PID
                 }
             
             return status
@@ -999,6 +891,22 @@ class NDaiviApp:
             return True
         except Exception as e:
             logger.error(f"Error requesting more URLs: {e}")
+            return False
+
+    def stop_background_process(self) -> bool:
+        """
+        Stop the background process.
+        
+        Returns:
+            bool: True if stopped successfully
+        """
+        try:
+            # Just set the flag to False since we're not actually spawning a separate process
+            self.background_process = False
+            logger.info("Background process stopped")
+            return True
+        except Exception as e:
+            logger.error(f"Error stopping background process: {e}")
             return False
 
 def main():

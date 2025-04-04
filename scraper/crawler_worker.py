@@ -19,6 +19,14 @@ from utils.redis_manager import get_redis_manager
 
 # Configure logging
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Set to DEBUG for more detailed logging
+
+# Add a file handler to log crawler output to a separate file
+file_handler = logging.FileHandler('/var/ndaivi/logs/crawler_debug.log', mode='w')
+file_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 class CrawlerWorker:
     """
@@ -123,7 +131,7 @@ class CrawlerWorker:
                 self._resume_from_database()
             
             # Publish status update
-            self._publish_status('idle', 'Crawler worker started')
+            self._publish_status('running', 'Crawler worker started and ready')
             
             logger.info("Crawler worker started successfully")
             return True
@@ -140,20 +148,41 @@ class CrawlerWorker:
         if not self.running:
             return
         
+        logger.info("Stopping crawler worker...")
+        
+        # Set flags to stop all processing
         self.running = False
         self.active = False
+        self.paused = False
         
         # Wait for worker thread to terminate
-        if self.worker_thread:
-            self.worker_thread.join(timeout=1.0)
+        if self.worker_thread and self.worker_thread.is_alive():
+            logger.info("Waiting for worker thread to terminate...")
+            try:
+                self.worker_thread.join(timeout=2.0)
+                if self.worker_thread.is_alive():
+                    logger.warning("Worker thread did not terminate within timeout, proceeding anyway")
+            except Exception as e:
+                logger.error(f"Error joining worker thread: {e}")
         
         # Unsubscribe from channels
-        self.redis_manager.unsubscribe(self.command_channel)
-        self.redis_manager.unsubscribe(self.analyzer_results_channel)
-        self.redis_manager.unsubscribe(self.backlog_request_channel)
+        try:
+            self.redis_manager.unsubscribe(self.command_channel)
+            self.redis_manager.unsubscribe(self.analyzer_results_channel)
+            self.redis_manager.unsubscribe(self.backlog_request_channel)
+            
+            # Also unsubscribe from the direct channel if it was different
+            direct_channel = 'ndaivi:crawler:commands'
+            if self.command_channel != direct_channel:
+                self.redis_manager.unsubscribe(direct_channel)
+        except Exception as e:
+            logger.error(f"Error unsubscribing from channels: {e}")
         
         # Publish status update
-        self._publish_status('stopped', 'Crawler worker stopped')
+        try:
+            self._publish_status('stopped', 'Crawler worker stopped')
+        except Exception as e:
+            logger.error(f"Error publishing stop status: {e}")
         
         logger.info("Crawler worker stopped")
     
@@ -327,6 +356,7 @@ class CrawlerWorker:
             if not self.active:
                 logger.info("Activating crawler to fulfill backlog request")
                 self.active = True
+                self._publish_status('active', "Crawler activated to fulfill backlog request")
                 
                 # If we don't have a current job, create one with default parameters
                 if not self.current_job:
@@ -337,8 +367,28 @@ class CrawlerWorker:
                         success = self.crawler.add_url(target_website, depth=0, priority=1.0)
                         if success:
                             self._publish_status('active', f"Added start URL: {target_website}")
-                            # Process the URL to get more URLs
-                            self.crawler.process_next_url()
+                            
+                            # Process multiple URLs to ensure we discover more links - increased from 5 to 10
+                            urls_processed = 0
+                            for _ in range(min(30, count)):  # Increased from 10 to 30 to discover more URLs
+                                result = self.crawler.process_next_url()
+                                if result:
+                                    urls_processed += 1
+                                    logger.info(f"Processed URL #{urls_processed} for backlog request")
+                                else:
+                                    # If we ran out of URLs, add the start URL again
+                                    if urls_processed == 0:
+                                        self.crawler.add_url(target_website, depth=0, priority=1.0)
+                                        # Try one more time
+                                        result = self.crawler.process_next_url()
+                                        if result:
+                                            urls_processed += 1
+                                    break
+                            
+                            if urls_processed > 0:
+                                self._publish_status('active', f"Processed {urls_processed} URLs to discover more links")
+                            else:
+                                self._publish_status('warning', "No URLs processed for backlog request")
                     else:
                         logger.error("No target website configured, cannot fulfill backlog request")
                         self._publish_status('error', "No target website configured, cannot fulfill backlog request")
@@ -348,53 +398,72 @@ class CrawlerWorker:
             urls = []
             
             # First check if we have any URLs in the queue
-            if not self.crawler.url_queue.is_empty():
-                # Get URLs from the queue
-                for _ in range(min(count, self.crawler.url_queue.size())):
+            queue_size = self.crawler.url_queue.size()
+            if queue_size > 0:
+                logger.info(f"Found {queue_size} URLs in the crawler queue")
+                # Make a copy of the URLs instead of removing them from the crawler's queue
+                copied_urls = []
+                for _ in range(min(count, queue_size)):
                     url_data = self.crawler.url_queue.pop()
                     if url_data:
-                        url, depth, metadata = url_data
+                        url = url_data[0] if isinstance(url_data, tuple) and len(url_data) > 0 else url_data
+                        depth = url_data[1] if isinstance(url_data, tuple) and len(url_data) > 1 else 0
+                        metadata = url_data[2] if isinstance(url_data, tuple) and len(url_data) > 2 else None
+                        
+                        # Add to our list of URLs to return
                         urls.append({
                             'url': url,
                             'depth': depth,
                             'metadata': metadata
                         })
+                        
+                        # Add back to the crawler's queue with same priority to ensure it's processed
+                        self.crawler.add_url(url, depth, priority=1.0, metadata=metadata)
             
             # If we didn't get enough URLs, try to process more
             if len(urls) < count and self.active:
                 # Process more URLs to get more links
-                for _ in range(min(5, count - len(urls))):  # Process up to 5 URLs to get more links
+                urls_to_process = min(50, count - len(urls))  # Increased from 20 to 50
+                logger.info(f"Processing {urls_to_process} more URLs to discover links")
+                
+                urls_processed = 0
+                for _ in range(urls_to_process):
                     result = self.crawler.process_next_url()
                     if result:
-                        # Get newly discovered URLs
-                        new_urls = self.crawler.url_queue
-                        if not new_urls.is_empty():
-                            # Add these to our response
-                            for _ in range(min(count - len(urls), new_urls.size())):
-                                url_data = new_urls.pop()
-                                if url_data:
-                                    url, depth, metadata = url_data
-                                    urls.append({
-                                        'url': url,
-                                        'depth': depth,
-                                        'metadata': metadata
-                                    })
+                        urls_processed += 1
+                        # Check if new URLs were discovered (queue size increased)
+                        new_queue_size = self.crawler.url_queue.size()
+                        if new_queue_size > 0:
+                            # Get newly discovered URLs but don't remove them from the crawler's queue
+                            # Instead, make copies for the backlog
+                            new_urls_to_add = min(count - len(urls), new_queue_size)
+                            if new_urls_to_add > 0:
+                                logger.info(f"Found {new_urls_to_add} new URLs to add to backlog")
+                                # Make a copy instead of removing URLs from the original queue
+                                copied_urls = []
+                                for _ in range(new_urls_to_add):
+                                    url_data = self.crawler.url_queue.pop()
+                                    if url_data:
+                                        url = url_data[0] if isinstance(url_data, tuple) and len(url_data) > 0 else url_data
+                                        depth = url_data[1] if isinstance(url_data, tuple) and len(url_data) > 1 else 0
+                                        metadata = url_data[2] if isinstance(url_data, tuple) and len(url_data) > 2 else None
+                                        copied_urls.append((url, depth, metadata))
+                                        urls.append({
+                                            'url': url,
+                                            'depth': depth,
+                                            'metadata': metadata
+                                        })
+                                
+                                # Add the URLs back to the crawler's queue
+                                for url, depth, metadata in copied_urls:
+                                    self.crawler.add_url(url, depth, priority=1.0, metadata=metadata)
                     else:
-                        # No more URLs to process
+                        logger.warning("No more URLs to process")
                         break
+                
+                logger.info(f"Processed {urls_processed} URLs to discover more links")
             
-            # If we still don't have enough URLs and we have a start URL, add it again
-            if len(urls) == 0 and self.active:
-                target_website = self.crawler_config.get('target_website')
-                if target_website:
-                    urls.append({
-                        'url': target_website,
-                        'depth': 0,
-                        'metadata': None
-                    })
-                    logger.info(f"No URLs in queue, re-adding start URL: {target_website}")
-            
-            # Publish the URLs to the backlog status channel
+            # Prepare and publish response
             response = {
                 'status': 'backlog_response',
                 'urls': urls,
@@ -402,13 +471,16 @@ class CrawlerWorker:
                 'timestamp': time.time()
             }
             
+            logger.info(f"Sending backlog response with {len(urls)} URLs")
+            
+            # Publish response
             success = self.redis_manager.publish(self.backlog_status_channel, response)
             
             if success:
-                logger.info(f"Published {len(urls)} URLs to backlog status channel")
-                self._publish_status('backlog_response', f"Provided {len(urls)} URLs for backlog")
+                self._publish_status('backlog_response', f"Sent {len(urls)} URLs for backlog")
             else:
                 logger.error("Failed to publish backlog response")
+                
         except Exception as e:
             logger.error(f"Error handling backlog request: {e}")
             import traceback
@@ -421,68 +493,42 @@ class CrawlerWorker:
         Args:
             params: Command parameters
         """
-        start_url = params.get('start_url', self.crawler_config.get('target_website'))
-        job_id = params.get('job_id', str(int(time.time())))
-        max_urls = params.get('max_urls', self.crawler_config.get('max_urls'))
-        max_depth = params.get('max_depth', self.crawler_config.get('max_depth', 3))
-        
-        if not start_url:
-            self._publish_status('error', "No start URL provided for crawl command")
-            return
-        
-        # Reset crawler state if requested
-        if params.get('reset', False):
-            self.crawler.reset()
-        
-        # Set current job
-        self.current_job = {
-            'id': job_id,
-            'start_url': start_url,
-            'max_urls': max_urls,
-            'max_depth': max_depth,
-            'start_time': time.time()
-        }
-        
-        # Add start URL to queue if it's not already in the database
-        if not self.crawler.url_queue_manager or not self.crawler.url_queue_manager.exists(start_url):
-            self.crawler.add_url(start_url)
-            logger.info(f"Added start URL to queue: {start_url}")
-        
-        # Log the URL queue state
-        queue_size = self.crawler.url_queue.size()
-        logger.info(f"URL queue size after adding start URL: {queue_size}")
-        
-        # If the queue is empty after adding the start URL, there might be an issue
-        if queue_size == 0:
-            # Try again with a different method
-            self.crawler.url_queue.push(start_url, 0, 1.0)
-            logger.info(f"Forced adding start URL to queue: {start_url}")
-            queue_size = self.crawler.url_queue.size()
-            logger.info(f"URL queue size after forcing: {queue_size}")
-        
-        # Set crawler to active state
-        self.active = params.get('active', True)
-        
-        # Update status
-        status = 'crawling' if self.active else 'idle'
-        message = f"Starting crawl job {job_id} from {start_url}"
-        if not self.active:
-            message += " (waiting for backlog requests)"
+        try:
+            # Extract parameters
+            start_url = params.get('start_url', self.crawler_config.get('target_website'))
+            max_urls = params.get('max_urls', self.crawler_config.get('max_urls'))
+            max_depth = params.get('max_depth', self.crawler_config.get('max_depth', 3))
             
-        self._publish_status(status, message)
-        
-        # Process the start URL immediately if active
-        if self.active and queue_size > 0:
-            url_data = self.crawler.url_queue.pop()
-            if url_data:
-                # Extract URL from the tuple returned by pop()
-                url = url_data[0] if isinstance(url_data, tuple) and len(url_data) > 0 else url_data
-                depth = url_data[1] if isinstance(url_data, tuple) and len(url_data) > 1 else 0
-                
-                logger.info(f"Immediately processing start URL: {url}")
-                self._process_url(url, depth)
-        
-        logger.info(f"Started crawl job {job_id} from {start_url} (active: {self.active})")
+            if not start_url:
+                logger.error("No start URL provided for crawl command")
+                self._publish_status('error', "No start URL provided")
+                return
+            
+            # Create a new job
+            self.current_job = {
+                'id': f"crawl_{int(time.time())}",
+                'start_url': start_url,
+                'max_urls': max_urls,
+                'max_depth': max_depth,
+                'start_time': time.time()
+            }
+            
+            # Add the start URL to the crawler
+            success = self.crawler.add_url(start_url, depth=0, priority=1.0)
+            if success:
+                # Set crawler to active state
+                self.active = True
+                self.paused = False
+                self._publish_status('crawling', f"Started crawling from {start_url}")
+                logger.info(f"Started new crawl job from {start_url}")
+            else:
+                logger.error(f"Failed to add start URL: {start_url}")
+                self._publish_status('error', f"Failed to add start URL: {start_url}")
+                self.current_job = None
+        except Exception as e:
+            logger.error(f"Error handling crawl command: {e}")
+            self._publish_status('error', f"Error starting crawl: {str(e)}")
+            self.current_job = None
     
     def _handle_pause_command(self) -> None:
         """Handle a pause command."""
@@ -511,46 +557,51 @@ class CrawlerWorker:
         logger.info("Crawler stopped")
     
     def _handle_start_command(self) -> None:
-        """
-        Handle the start command.
-        """
+        """Handle the start command."""
         try:
+            # Create a default job if none exists
+            if not self.current_job:
+                target_website = self.crawler_config.get('target_website')
+                if not target_website:
+                    logger.error("No target website configured")
+                    self._publish_status('error', "No target website configured")
+                    return
+                    
+                self.current_job = {
+                    'id': f"start_{int(time.time())}",
+                    'start_url': target_website,
+                    'max_urls': self.crawler_config.get('max_urls'),
+                    'max_depth': self.crawler_config.get('max_depth', 3),
+                    'start_time': time.time()
+                }
+                
+                # Add the start URL to the crawler
+                success = self.crawler.add_url(target_website, depth=0, priority=1.0)
+                if success:
+                    logger.info(f"Added start URL: {target_website}")
+                else:
+                    logger.error(f"Failed to add start URL: {target_website}")
+                    self._publish_status('error', f"Failed to add start URL: {target_website}")
+                    return
+            
             # Set crawler to active state
             self.active = True
+            self.paused = False
+            self._publish_status('crawling', f"Started crawling from {self.current_job['start_url']}")
             
-            # Get target website from config
-            target_website = self.crawler_config.get('target_website')
-            if not target_website:
-                self._publish_status('error', "No target website configured in crawler config")
-                return
-            
-            # Initialize the crawler if not already initialized
-            if not self.crawler:
-                self.crawler = WebCrawler(self.crawler_config)
-            
-            # Add the start URL to the crawler
-            self.logger.info(f"Starting crawler with target website: {target_website}")
-            self._publish_status('starting', f"Starting crawler with target website: {target_website}")
-            
-            # Add the start URL to the crawler and begin processing
-            success = self.crawler.add_url(target_website, depth=0, priority=1.0)
-            
-            if success:
-                self._publish_status('active', f"Added start URL: {target_website}")
-                
-                # Process the first URL immediately to kickstart the crawling
-                result = self.crawler.process_next_url()
-                if result:
-                    self._publish_status('active', f"Processed start URL: {target_website}")
-                else:
-                    self._publish_status('warning', f"Failed to process start URL: {target_website}")
-            else:
-                self._publish_status('error', f"Failed to add start URL: {target_website}")
+            # Process the start URL immediately
+            if not self.crawler.url_queue.is_empty():
+                url_data = self.crawler.url_queue.pop()
+                if url_data:
+                    url = url_data[0] if isinstance(url_data, tuple) and len(url_data) > 0 else url_data
+                    depth = url_data[1] if isinstance(url_data, tuple) and len(url_data) > 1 else 0
+                    self._process_url(url, depth)
+                    
+            logger.info("Crawler started successfully")
         except Exception as e:
-            self.logger.error(f"Error handling start command: {e}")
-            self._publish_status('error', f"Error starting crawler: {str(e)}")
+            logger.error(f"Error handling start command: {e}")
             import traceback
-            self.logger.error(traceback.format_exc())
+            logger.error(traceback.format_exc())
     
     def _handle_status_command(self) -> None:
         """Handle a status command."""
@@ -687,36 +738,31 @@ class CrawlerWorker:
             Dict: Processing result
         """
         try:
-            logger.info(f"Processing URL: {url} (depth: {depth})")
+            if not url:
+                logger.warning("Empty URL provided")
+                return {'error': 'Empty URL provided'}
+                
+            # Update status
+            self._publish_status('crawling', f"Processing URL: {url}")
+            logger.info(f"Processing URL: {url} at depth {depth}")
             
-            # Process the URL with the crawler
+            # Process the URL
             result = self.crawler.process_url(url, depth)
             
             if result:
-                # Extract relevant information
-                status_code = result.get('status_code')
-                content_type = result.get('content_type')
-                title = result.get('title')
-                links = result.get('links', [])
+                # Update status
+                self._publish_status('active', f"Processed URL: {url}")
+                logger.info(f"Successfully processed URL: {url}")
                 
-                # Publish status update
-                self._publish_status('url_processed', f"Processed URL: {url}", {
-                    'url': url,
-                    'status_code': status_code,
-                    'content_type': content_type,
-                    'title': title,
-                    'links_count': len(links)
-                })
-                
-                # Publish URL processed message for the analyzer
+                # Publish URL processed message
                 self._publish_url_processed(url, result)
                 
-                # Return the result
                 return result
             else:
                 logger.warning(f"Failed to process URL: {url}")
                 self._publish_status('warning', f"Failed to process URL: {url}")
                 return {'error': 'Failed to process URL', 'url': url}
+                
         except Exception as e:
             logger.error(f"Error processing URL {url}: {e}")
             self._publish_status('error', f"Error processing URL {url}: {str(e)}")

@@ -9,6 +9,31 @@ import yaml
 import logging
 from typing import Dict, Any, Optional
 
+logger = logging.getLogger(__name__)
+
+def get_config(config_path: str = None) -> Dict[str, Any]:
+    """
+    Get configuration from the config file.
+    
+    Args:
+        config_path: Path to the config file. If None, uses default path.
+        
+    Returns:
+        Dict containing the configuration
+    """
+    if config_path is None:
+        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.yaml')
+    
+    try:
+        logger.info(f"Loading configuration from {config_path}")
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        logger.info("Configuration manager initialized")
+        return config
+    except Exception as e:
+        logger.error(f"Error loading configuration: {e}")
+        return {}
+
 class ConfigManager:
     """
     Configuration manager for NDAIVI project.
@@ -50,7 +75,7 @@ class ConfigManager:
         
         # Load configuration
         self._config_path = config_path
-        self._config = self._load_config()
+        self._config = get_config(self._config_path)
         
         # Mark as initialized
         self._initialized = True
