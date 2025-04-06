@@ -228,27 +228,31 @@ class ContainerApp:
             logger.info("Monitor stopped")
             
     def _monitor_loop(self) -> None:
-        """Monitor loop that displays system status."""
-        while self.monitor_running:
+        """
+        Monitor loop for the container application.
+        Periodically checks the status of the container app and its components.
+        """
+        logger.info("Starting container monitor loop")
+        
+        while self.running:
             try:
+                # Get current status
                 status = self.get_status()
                 
-                # Clear screen and print status
-                print("\033[2J\033[H", end="")  # Clear screen and move cursor to top
-                print("\nNDAIVI System Monitor")
-                print("===================")
-                print(f"\nCrawler: {status['crawler']['status']} - {status['crawler']['message']}")
-                print(f"Analyzer: {status['analyzer']['status']} - {status['analyzer']['message']}")
-                print(f"\nBacklog size: {status.get('backlog_size', 0)}")
-                print(f"URLs processed: {status.get('processed_count', 0)}")
-                print(f"URLs queued: {status.get('backlog_size', 0)}")
-                print("\nPress Ctrl+C to stop monitoring...")
+                # Log status if verbose
+                if self.config.get('application', {}).get('verbose', False):
+                    logger.info(f"Container status: {json.dumps(status, indent=2)}")
                 
-                time.sleep(1.0)  # Update every second
+                # Publish status update
+                self._publish_status('status_update', 'Container status update', status)
                 
+                # Sleep for a short time
+                time.sleep(1.0)
             except Exception as e:
                 logger.error(f"Error in monitor loop: {e}")
-                time.sleep(1.0)  # Wait before retrying
+                import traceback
+                logger.error(traceback.format_exc())
+                time.sleep(1.0)  # Sleep longer on error
     
     def stop(self) -> bool:
         """
@@ -325,6 +329,8 @@ class ContainerApp:
         """
         stats_interval = self.config.get('application', {}).get('components', {}).get('stats', {}).get('update_interval', 5)
         last_stats_time = 0
+        last_ping_time = 0
+        ping_interval = 30  # Send ping every 30 seconds
         
         while self.running and not SHUTDOWN_FLAG:
             try:
@@ -344,6 +350,11 @@ class ContainerApp:
                 if current_time - last_stats_time >= stats_interval:
                     self._publish_stats()
                     last_stats_time = current_time
+                
+                # Send ping to crawler periodically
+                if current_time - last_ping_time >= ping_interval:
+                    self._send_ping_to_crawler()
+                    last_ping_time = current_time
                 
                 # Process next URL in backlog
                 self._process_next_url()
@@ -402,22 +413,81 @@ class ContainerApp:
             
             logger.info(f"Requesting {count} more URLs from crawler")
             
+            # Generate a unique request ID for tracking
+            request_id = f"req_{int(time.time())}_{id(self)}"
+            
             # Prepare request
             request = {
                 'command': 'backlog_request',
                 'count': count,
+                'request_id': request_id,
                 'timestamp': time.time()
+            }
+            
+            # Track this request for potential retry
+            self.stats['last_backlog_request'] = {
+                'id': request_id,
+                'count': count,
+                'timestamp': time.time(),
+                'retries': 0
             }
             
             # Publish request
             success = self.redis_manager.publish(self.backlog_request_channel, request)
             
             if success:
-                self._publish_status('backlog_request', f"Requested {count} URLs from crawler")
+                self._publish_status('backlog_request', f"Requested {count} URLs from crawler (ID: {request_id})")
             else:
-                logger.error("Failed to publish backlog request")
+                logger.error(f"Failed to publish backlog request (ID: {request_id})")
+                # Schedule a retry after a short delay
+                threading.Timer(2.0, self._retry_backlog_request, args=[request_id, count, 1]).start()
         except Exception as e:
             logger.error(f"Error requesting more URLs: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _retry_backlog_request(self, request_id: str, count: int, retry_count: int) -> None:
+        """
+        Retry a failed backlog request.
+        
+        Args:
+            request_id: Original request ID
+            count: Number of URLs to request
+            retry_count: Current retry attempt
+        """
+        max_retries = 3
+        if retry_count > max_retries:
+            logger.error(f"Maximum retries ({max_retries}) reached for backlog request {request_id}")
+            return
+            
+        logger.info(f"Retrying backlog request {request_id} (attempt {retry_count}/{max_retries})")
+        
+        # Prepare retry request
+        retry_request = {
+            'command': 'backlog_request',
+            'count': count,
+            'request_id': request_id,
+            'timestamp': time.time(),
+            'retry': retry_count
+        }
+        
+        # Update stats
+        with self.lock:
+            if 'last_backlog_request' in self.stats and self.stats['last_backlog_request'].get('id') == request_id:
+                self.stats['last_backlog_request']['retries'] = retry_count
+                self.stats['last_backlog_request']['timestamp'] = time.time()
+        
+        # Publish retry request
+        success = self.redis_manager.publish(self.backlog_request_channel, retry_request)
+        
+        if success:
+            self._publish_status('backlog_request_retry', f"Retry {retry_count}/{max_retries} for backlog request {request_id}")
+        else:
+            logger.error(f"Failed to publish backlog request retry {retry_count}/{max_retries}")
+            # Schedule another retry with exponential backoff
+            if retry_count < max_retries:
+                backoff_time = 2.0 * (2 ** retry_count)  # Exponential backoff
+                threading.Timer(backoff_time, self._retry_backlog_request, args=[request_id, count, retry_count + 1]).start()
     
     def _handle_crawler_status(self, message: Dict[str, Any]) -> None:
         """
@@ -456,7 +526,7 @@ class ContainerApp:
             })
         except Exception as e:
             logger.error(f"Error handling crawler status: {e}")
-
+    
     def _handle_backlog_status(self, message: Dict[str, Any]) -> None:
         """
         Handle backlog status updates.
@@ -465,13 +535,74 @@ class ContainerApp:
             message: Backlog status message
         """
         try:
-            # Log backlog status
-            logger.info(f"Backlog status: {json.dumps(message, indent=2)}")
+            status = message.get('status')
             
-            # Update stats
-            self.stats['backlog_size'] = message.get('size', 0)
-            self.stats['queued_urls'] = message.get('queued_urls', [])
-            self.stats['processing_urls'] = message.get('processing_urls', [])
+            # Handle different status types
+            if status == 'backlog_response':
+                # Handle backlog response with URLs
+                urls = message.get('urls', [])
+                count = message.get('count', 0)
+                request_id = message.get('request_id', 'unknown')
+                
+                logger.info(f"Received backlog response with {count} URLs for request {request_id}")
+                
+                # Add URLs to backlog
+                with self.lock:
+                    for url_data in urls:
+                        url = url_data.get('url')
+                        if url and url not in [item.get('url') for item in self.backlog]:
+                            self.backlog.append(url_data)
+                    
+                    # Update stats
+                    self.stats['backlog_size'] = len(self.backlog)
+                    self.stats['last_backlog_response'] = {
+                        'request_id': request_id,
+                        'urls_received': count,
+                        'timestamp': time.time()
+                    }
+                
+                # Publish status update
+                self._publish_status('backlog_updated', f"Added {count} URLs to backlog from request {request_id}")
+                
+            elif status == 'backlog_ack':
+                # Handle acknowledgment of backlog request
+                request_id = message.get('request_id', 'unknown')
+                urls_sent = message.get('urls_sent', 0)
+                
+                logger.info(f"Received acknowledgment for backlog request {request_id} with {urls_sent} URLs sent")
+                
+                # Update stats
+                with self.lock:
+                    if 'last_backlog_request' in self.stats and self.stats['last_backlog_request'].get('id') == request_id:
+                        self.stats['last_backlog_request']['acknowledged'] = True
+                        self.stats['last_backlog_request']['urls_sent'] = urls_sent
+                
+            elif status == 'pong':
+                # Handle pong response from crawler
+                timestamp = message.get('timestamp', 0)
+                crawler_id = message.get('crawler_id', 'unknown')
+                
+                # Calculate latency
+                latency = time.time() - timestamp
+                
+                logger.debug(f"Received pong from crawler {crawler_id} with latency {latency:.3f}s")
+                
+                # Update stats
+                with self.lock:
+                    self.stats['last_crawler_ping'] = {
+                        'crawler_id': crawler_id,
+                        'timestamp': time.time(),
+                        'latency': latency
+                    }
+                
+            else:
+                # General backlog status update
+                logger.info(f"Backlog status update: {json.dumps(message, indent=2)}")
+                
+                # Update stats
+                self.stats['backlog_size'] = message.get('size', 0)
+                self.stats['queued_urls'] = message.get('queued_urls', [])
+                self.stats['processing_urls'] = message.get('processing_urls', [])
             
             # Publish to container status channel
             self.redis_manager.publish(self.container_status_channel, {
@@ -481,7 +612,53 @@ class ContainerApp:
             })
         except Exception as e:
             logger.error(f"Error handling backlog status: {e}")
-
+            import traceback
+            logger.error(traceback.format_exc())
+            
+    def _send_ping_to_crawler(self) -> None:
+        """
+        Send a ping message to the crawler to check if it's still responsive.
+        """
+        try:
+            ping_message = {
+                'command': 'ping',
+                'timestamp': time.time(),
+                'container_id': id(self)
+            }
+            
+            success = self.redis_manager.publish(self.crawler_commands_channel, ping_message)
+            
+            if success:
+                logger.debug("Sent ping to crawler")
+                
+                # Schedule a check for the pong response
+                threading.Timer(5.0, self._check_pong_response).start()
+            else:
+                logger.error("Failed to send ping to crawler")
+        except Exception as e:
+            logger.error(f"Error sending ping to crawler: {e}")
+            
+    def _check_pong_response(self) -> None:
+        """
+        Check if we received a pong response from the crawler.
+        If not, the crawler might be disconnected.
+        """
+        try:
+            current_time = time.time()
+            
+            # If we haven't received a pong response within 5 seconds, consider the crawler disconnected
+            if not hasattr(self, 'last_pong_time') or current_time - self.last_pong_time > 5:
+                logger.warning("No pong response received from crawler, it might be disconnected")
+                
+                # Try to restart the crawler if it's been more than 30 seconds since the last pong
+                if not hasattr(self, 'last_pong_time') or current_time - self.last_pong_time > 30:
+                    logger.warning("Crawler appears to be disconnected for too long, attempting to restart")
+                    self._start_crawler()
+        except Exception as e:
+            logger.error(f"Error checking pong response: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
     def _handle_analyzer_status(self, message: Dict[str, Any]) -> None:
         """
         Handle status updates from the analyzer.
@@ -585,45 +762,172 @@ class ContainerApp:
             message: Status message
             details: Optional details dictionary
         """
-        if details is None:
-            details = {}
-            
-        status_update = {
-            'timestamp': time.time(),
-            'status': status,
-            'message': message,
-            'backlog_size': len(self.backlog),
-            'backlog_min_threshold': self.backlog_min_threshold,
-            'backlog_target_size': self.backlog_target_size,
-            'details': details
-        }
-        
-        # Log the status update
-        logger.info(f"Status update: {status} - {message}")
-        
-        # Publish to the status channel
-        self.redis_manager.publish(self.backlog_status_channel, status_update)
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Get current statistics.
-        
-        Returns:
-            Dict[str, Any]: Current statistics
-        """
-        with self.lock:
-            return {
-                'uptime': time.time() - self.stats['start_time'] if self.stats['start_time'] else 0,
-                'backlog_size': self.stats['backlog_size'],
-                'backlog_requests': self.stats['backlog_requests'],
-                'processed_count': self.stats['processed_count'],
-                'processing_count': self.stats['processing_count'],
-                'crawler_status': self.stats['crawler_status'],
-                'analyzer_status': self.stats['analyzer_status'],
-                'running': self.running,
-                'paused': self.paused
+        try:
+            if details is None:
+                details = {}
+                
+            status_data = {
+                'component': 'container',
+                'status': status,
+                'message': message,
+                'details': details,
+                'timestamp': time.time()
             }
+            
+            # Add current backlog size to status
+            with self.lock:
+                status_data['backlog_size'] = len(self.backlog)
+                status_data['processing_count'] = len(self.processing)
+            
+            # Publish status update
+            success = self.redis_manager.publish(self.container_status_channel, status_data)
+            
+            if not success:
+                logger.error(f"Failed to publish status update: {status} - {message}")
+                # Retry the publication after a short delay
+                self._retry_publish(self.container_status_channel, status_data, 1)
+        except Exception as e:
+            logger.error(f"Error publishing status update: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
+    def _retry_publish(self, channel: str, message: Dict[str, Any], retry_count: int, max_retries: int = 3) -> None:
+        """
+        Retry publishing a message to a Redis channel.
+        
+        Args:
+            channel: Channel to publish to
+            message: Message to publish
+            retry_count: Current retry count
+            max_retries: Maximum number of retries
+        """
+        if retry_count > max_retries:
+            logger.error(f"Maximum retries ({max_retries}) reached for publishing to {channel}")
+            return
+            
+        # Add retry information to the message
+        message['retry_count'] = retry_count
+        message['retry_timestamp'] = time.time()
+        
+        # Exponential backoff
+        backoff_time = 0.5 * (2 ** retry_count)
+        
+        # Use threading.Timer to retry after the backoff time
+        def retry_task():
+            try:
+                logger.info(f"Retrying publish to {channel} (attempt {retry_count}/{max_retries})")
+                success = self.redis_manager.publish(channel, message)
+                
+                if not success and retry_count < max_retries:
+                    logger.warning(f"Retry {retry_count} failed, scheduling another retry")
+                    self._retry_publish(channel, message, retry_count + 1, max_retries)
+            except Exception as e:
+                logger.error(f"Error in retry_publish task: {e}")
+                
+        # Schedule the retry
+        threading.Timer(backoff_time, retry_task).start()
+    
+    def _process_next_url(self) -> None:
+        """
+        Process the next URL in the backlog.
+        """
+        try:
+            # Check if we're at the maximum concurrent processing limit
+            with self.lock:
+                if len(self.processing) >= self.max_concurrent_processing:
+                    return
+                
+                # Check if we have any URLs in the backlog
+                if not self.backlog:
+                    return
+                
+                # Get the next URL from the backlog
+                url_data = self.backlog.pop(0)
+                
+                # Add to processing list
+                self.processing.append(url_data)
+                
+                # Update stats
+                self.stats['processing_count'] = len(self.processing)
+                self.stats['backlog_size'] = len(self.backlog)
+            
+            # Get the URL from the data
+            url = url_data.get('url')
+            if not url:
+                logger.warning("URL data missing URL field")
+                return
+                
+            # Send URL to analyzer
+            self._send_to_analyzer(url_data)
+            
+            # Log processing
+            logger.info(f"Processing URL: {url}")
+            
+        except Exception as e:
+            logger.error(f"Error processing next URL: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            # If there was an error, check if we need to request more URLs
+            current_time = time.time()
+            if current_time - self.last_backlog_check >= 5:  # Check more frequently on error
+                self._check_backlog_size()
+                self.last_backlog_check = current_time
+    
+    def _send_to_analyzer(self, url_data: Dict[str, Any]) -> None:
+        """
+        Send a URL to the analyzer.
+        
+        Args:
+            url_data: URL data dictionary containing url, depth, and metadata
+        """
+        try:
+            # Extract URL from the data
+            url = url_data.get('url')
+            if not url:
+                logger.warning("URL data missing URL field")
+                return
+                
+            # Prepare command
+            command = {
+                'command': 'analyze',
+                'url': url,
+                'depth': url_data.get('depth', 0),
+                'metadata': url_data.get('metadata', {}),
+                'timestamp': time.time(),
+                'request_id': f"analyze_{int(time.time())}_{id(self)}"
+            }
+            
+            # Publish command
+            success = self.redis_manager.publish(self.analyzer_commands_channel, command)
+            
+            if success:
+                logger.info(f"Sent URL to analyzer: {url}")
+                self._publish_status('url_sent', f"Sent URL to analyzer: {url}")
+            else:
+                logger.error(f"Failed to send URL to analyzer: {url}")
+                
+                # Remove from processing list if failed
+                with self.lock:
+                    for i, item in enumerate(self.processing):
+                        if item.get('url') == url:
+                            self.processing.pop(i)
+                            break
+                    
+                    # Add back to backlog for retry
+                    self.backlog.insert(0, url_data)
+                    
+                    # Update stats
+                    self.stats['processing_count'] = len(self.processing)
+                    self.stats['backlog_size'] = len(self.backlog)
+                
+                # Try again after a delay
+                threading.Timer(5.0, lambda: self._send_to_analyzer(url_data)).start()
+        except Exception as e:
+            logger.error(f"Error sending URL to analyzer: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
     def get_status(self) -> Dict[str, Any]:
         """
         Get the current status of the container app and its components.
@@ -647,149 +951,6 @@ class ContainerApp:
         }
         
         return status
-    
-    def pause(self) -> None:
-        """Pause the container application."""
-        self.paused = True
-        self._publish_status('paused', 'Container application paused')
-        logger.info("Container application paused")
-    
-    def resume(self) -> None:
-        """Resume the container application."""
-        self.paused = False
-        self._publish_status('resumed', 'Container application resumed')
-        logger.info("Container application resumed")
-    
-    def start_crawler(self) -> bool:
-        """
-        Send a command to start the crawler.
-        
-        Returns:
-            bool: True if command was sent successfully, False otherwise
-        """
-        try:
-            # Prepare command
-            command = {
-                'command': 'start',
-                'params': {
-                    'active': True  # Ensure the crawler is set to active
-                }
-            }
-            
-            # Publish command
-            success = self.redis_manager.publish(self.crawler_commands_channel, command)
-            
-            if success:
-                logger.info("Sent start command to crawler")
-                return True
-            else:
-                logger.error("Failed to send start command to crawler")
-                return False
-        except Exception as e:
-            logger.error(f"Error starting crawler: {e}")
-            return False
-    
-    def stop_crawler(self) -> bool:
-        """
-        Send a command to stop the crawler.
-        
-        Returns:
-            bool: True if command was sent successfully, False otherwise
-        """
-        try:
-            command = {
-                'command': 'stop',
-                'params': {}
-            }
-            
-            success = self.redis_manager.publish(self.crawler_commands_channel, command)
-            
-            if success:
-                logger.info("Sent stop command to crawler")
-                return True
-            else:
-                logger.error("Failed to send stop command to crawler")
-                return False
-        except Exception as e:
-            logger.error(f"Error stopping crawler: {e}")
-            return False
-    
-    def pause_crawler(self) -> bool:
-        """
-        Send a command to pause the crawler.
-        
-        Returns:
-            bool: True if command was sent successfully, False otherwise
-        """
-        try:
-            command = {
-                'command': 'pause',
-                'params': {}
-            }
-            
-            success = self.redis_manager.publish(self.crawler_commands_channel, command)
-            
-            if success:
-                logger.info("Sent pause command to crawler")
-                return True
-            else:
-                logger.error("Failed to send pause command to crawler")
-                return False
-        except Exception as e:
-            logger.error(f"Error pausing crawler: {e}")
-            return False
-    
-    def resume_crawler(self) -> bool:
-        """
-        Send a command to resume the crawler.
-        
-        Returns:
-            bool: True if command was sent successfully, False otherwise
-        """
-        try:
-            command = {
-                'command': 'resume',
-                'params': {}
-            }
-            
-            success = self.redis_manager.publish(self.crawler_commands_channel, command)
-            
-            if success:
-                logger.info("Sent resume command to crawler")
-                return True
-            else:
-                logger.error("Failed to send resume command to crawler")
-                return False
-        except Exception as e:
-            logger.error(f"Error resuming crawler: {e}")
-            return False
-    
-    def start_analyzer(self) -> bool:
-        """
-        Send a command to start the analyzer.
-        
-        Returns:
-            bool: True if command was sent successfully, False otherwise
-        """
-        try:
-            # Prepare command
-            command = {
-                'command': 'start',
-                'params': {}
-            }
-            
-            # Publish command
-            success = self.redis_manager.publish(self.analyzer_commands_channel, command)
-            
-            if success:
-                logger.info("Sent start command to analyzer")
-                return True
-            else:
-                logger.error("Failed to send start command to analyzer")
-                return False
-        except Exception as e:
-            logger.error(f"Error starting analyzer: {e}")
-            return False
     
     def start_crawl_job(self, start_url: str = None, max_urls: int = None, max_depth: int = None) -> bool:
         """
@@ -839,102 +1000,6 @@ class ContainerApp:
         except Exception as e:
             logger.error(f"Error starting crawl job: {e}")
             return False
-    
-    def _start_crawler(self) -> None:
-        """Send explicit command to start the crawler worker."""
-        try:
-            command = {
-                'command': 'start',
-                'params': {
-                    'target_website': self.config.get('web_crawler', {}).get('target_website', 'manualslib.com')
-                }
-            }
-            logger.info(f"Sending start command to crawler: {command}")
-            self.redis_manager.publish(self.crawler_commands_channel, command)
-        except Exception as e:
-            logger.error(f"Error sending start command to crawler: {e}")
-
-    def _start_analyzer(self) -> None:
-        """Send explicit command to start the analyzer worker."""
-        try:
-            command = {
-                'command': 'start',
-                'params': {}
-            }
-            logger.info(f"Sending start command to analyzer: {command}")
-            self.redis_manager.publish(self.analyzer_commands_channel, command)
-        except Exception as e:
-            logger.error(f"Error sending start command to analyzer: {e}")
-
-    def _process_next_url(self) -> None:
-        """
-        Process the next URL in the backlog.
-        """
-        try:
-            # Check if we can process more URLs
-            with self.lock:
-                if len(self.processing) >= self.max_concurrent_processing:
-                    logger.debug(f"Max concurrent processing reached ({len(self.processing)}/{self.max_concurrent_processing}). Waiting...")
-                    return
-                    
-                # Get the next URL from the backlog
-                if not self.backlog:
-                    logger.debug("Backlog is empty. Waiting for more URLs...")
-                    return
-                    
-                url = self.backlog.pop(0)
-                
-                # Skip if already processing
-                processed_urls = [item.get('url') for item in self.processing]
-                if url in processed_urls:
-                    logger.debug(f"Skipping already processing URL: {url}")
-                    return
-                    
-                # Add to processing list
-                self.processing.append({
-                    'url': url,
-                    'timestamp': time.time(),
-                    'component': 'container'
-                })
-                
-                # Update stats
-                self.stats['processing_count'] = len(self.processing)
-                self.stats['backlog_size'] = len(self.backlog)
-            
-            # Log the processing
-            logger.info(f"Processing URL: {url}")
-            self._publish_status('processing_url', f"Processing URL: {url}")
-            
-            # Send to analyzer
-            self._send_to_analyzer(url)
-        except Exception as e:
-            logger.error(f"Error processing next URL: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-    
-    def _send_to_analyzer(self, url: str) -> None:
-        """
-        Send a URL to the analyzer.
-        
-        Args:
-            url: URL to send
-        """
-        try:
-            # Create analyzer command
-            command = {
-                'command': 'analyze',
-                'params': {
-                    'url': url
-                }
-            }
-            
-            # Publish to analyzer commands channel
-            self.redis_manager.publish(self.analyzer_commands_channel, command)
-            
-            logger.info(f"Sent URL to analyzer: {url}")
-        except Exception as e:
-            logger.error(f"Error sending URL to analyzer: {e}")
-
 
 def main():
     """Main entry point for the container application."""

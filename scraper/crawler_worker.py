@@ -60,6 +60,7 @@ class CrawlerWorker:
         self.current_job = None
         self.paused = False
         self.active = False  # Whether the crawler is actively crawling or waiting for requests
+        self.continuous_crawling = True  # Flag to indicate the crawler should stay active after backlog responses
         
         # Backlog management
         self.backlog_min_threshold = self.crawler_config.get('backlog_min_threshold', 128)
@@ -75,6 +76,15 @@ class CrawlerWorker:
         self.analyzer_results_channel = channels_config.get('analyzer_results', 'ndaivi:analyzer:results')
         self.backlog_status_channel = channels_config.get('backlog_status', 'ndaivi:backlog:status')
         self.backlog_request_channel = channels_config.get('backlog_request', 'ndaivi:backlog:request')
+        
+        # Ensure we're using consistent channel names
+        logger.info("Initializing crawler worker with the following channels:")
+        logger.info(f"Command channel: {self.command_channel}")
+        logger.info(f"Status channel: {self.status_channel}")
+        logger.info(f"Stats channel: {self.stats_channel}")
+        logger.info(f"Analyzer results channel: {self.analyzer_results_channel}")
+        logger.info(f"Backlog status channel: {self.backlog_status_channel}")
+        logger.info(f"Backlog request channel: {self.backlog_request_channel}")
     
     def start(self) -> bool:
         """
@@ -113,12 +123,6 @@ class CrawlerWorker:
             if not success:
                 logger.error(f"Failed to subscribe to backlog request channel: {self.backlog_request_channel}")
                 return False
-                
-            # Also subscribe to the direct channel as a fallback
-            direct_channel = 'ndaivi:crawler:commands'
-            if self.command_channel != direct_channel:
-                logger.info(f"Also subscribing to direct channel: {direct_channel}")
-                self.redis_manager.subscribe(direct_channel, self._handle_command)
             
             # Start worker thread
             self.running = True
@@ -310,6 +314,8 @@ class CrawlerWorker:
                 self._handle_status_command()
             elif command == 'start':
                 self._handle_start_command()
+            elif command == 'ping':
+                self._handle_ping_command(message)
             else:
                 logger.warning(f"Unknown command: {command}")
         except Exception as e:
@@ -350,7 +356,8 @@ class CrawlerWorker:
         try:
             # Log the request
             count = message.get('count', self.backlog_target_size)
-            logger.info(f"Received backlog request for {count} URLs")
+            request_id = message.get('request_id', f"req_{int(time.time())}")
+            logger.info(f"Received backlog request (ID: {request_id}) for {count} URLs")
             
             # If we're not active, start crawling
             if not self.active:
@@ -468,6 +475,7 @@ class CrawlerWorker:
                 'status': 'backlog_response',
                 'urls': urls,
                 'count': len(urls),
+                'request_id': request_id,
                 'timestamp': time.time()
             }
             
@@ -480,6 +488,31 @@ class CrawlerWorker:
                 self._publish_status('backlog_response', f"Sent {len(urls)} URLs for backlog")
             else:
                 logger.error("Failed to publish backlog response")
+            
+            # Keep the crawler active if continuous_crawling is enabled
+            if self.continuous_crawling:
+                logger.info("Keeping crawler active after backlog response (continuous crawling mode)")
+                # Ensure we have a current job
+                if not self.current_job:
+                    self.current_job = {
+                        'id': f"continuous_{int(time.time())}",
+                        'start_url': self.crawler_config.get('target_website', 'manualslib.com'),
+                        'max_urls': self.crawler_config.get('max_urls'),
+                        'max_depth': self.crawler_config.get('max_depth', 3),
+                        'start_time': time.time()
+                    }
+                # Keep the active flag set
+                self.active = True
+                self._publish_status('active', "Crawler remains active in continuous crawling mode")
+            
+            # Send acknowledgment of backlog request completion
+            ack_message = {
+                'status': 'backlog_ack',
+                'request_id': request_id,
+                'urls_sent': len(urls),
+                'timestamp': time.time()
+            }
+            self.redis_manager.publish(self.backlog_status_channel, ack_message)
                 
         except Exception as e:
             logger.error(f"Error handling backlog request: {e}")
@@ -621,28 +654,175 @@ class CrawlerWorker:
         
         self._publish_status(status, message)
     
-    def _publish_status(self, status: str, message: str, data: Dict[str, Any] = {}) -> None:
+    def _handle_ping_command(self, message: Dict[str, Any]) -> None:
         """
-        Publish a status update to the status channel.
+        Handle a ping command from the container app.
+        Responds with a pong message to indicate the crawler is alive.
         
         Args:
-            status: Status string (idle, crawling, paused, error, etc.)
-            message: Status message
-            data: Additional data to include in the status update
+            message: Ping message dictionary
         """
-        status_data = {
-            'component': 'crawler',
-            'status': status,
-            'message': message,
-            'timestamp': time.time()
-        }
+        try:
+            timestamp = message.get('timestamp', time.time())
+            container_id = message.get('container_id', 'unknown')
+            
+            logger.debug(f"Received ping from container {container_id}")
+            
+            # Prepare pong response
+            pong_message = {
+                'status': 'pong',
+                'timestamp': timestamp,  # Echo back the original timestamp for latency calculation
+                'crawler_id': id(self),
+                'response_time': time.time()
+            }
+            
+            # Publish pong response
+            success = self.redis_manager.publish(self.backlog_status_channel, pong_message)
+            
+            if success:
+                logger.debug(f"Sent pong response to container {container_id}")
+            else:
+                logger.error(f"Failed to send pong response to container {container_id}")
+                
+            # This is a good opportunity to publish our current status
+            self._publish_status(
+                'active' if self.active else 'idle',
+                f"Crawler status update in response to ping from container {container_id}",
+                {
+                    'queue_size': self.crawler.url_queue.size() if self.crawler and self.crawler.url_queue else 0,
+                    'continuous_crawling': self.continuous_crawling
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error handling ping command: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _publish_status(self, status: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Publish status update to the status channel.
         
-        if self.current_job:
-            status_data['job_id'] = self.current_job.get('id')
+        Args:
+            status: Status code (e.g., 'starting', 'running', 'error')
+            message: Status message
+            details: Optional details dictionary
+        """
+        try:
+            if details is None:
+                details = {}
+                
+            status_data = {
+                'component': 'crawler',
+                'status': status,
+                'message': message,
+                'details': details,
+                'timestamp': time.time()
+            }
+            
+            # Add current crawler state to status
+            status_data['active'] = self.active
+            status_data['paused'] = self.paused
+            status_data['continuous_crawling'] = self.continuous_crawling
+            
+            if self.current_job:
+                status_data['current_job'] = {
+                    'job_id': self.current_job.get('job_id', 'unknown'),
+                    'start_url': self.current_job.get('start_url', 'unknown'),
+                    'start_time': self.current_job.get('start_time', 0),
+                    'urls_crawled': self.crawler.stats.get('urls_crawled', 0),
+                    'urls_queued': self.crawler.stats.get('urls_queued', 0)
+                }
+            
+            # Publish status update
+            success = self.redis_manager.publish(self.status_channel, status_data)
+            
+            if not success:
+                logger.error(f"Failed to publish status update: {status} - {message}")
+                # Retry the publication after a short delay
+                self._retry_publish(self.status_channel, status_data, 1)
+        except Exception as e:
+            logger.error(f"Error publishing status update: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _retry_publish(self, channel: str, message: Dict[str, Any], retry_count: int, max_retries: int = 3) -> None:
+        """
+        Retry publishing a message to a Redis channel.
         
-        status_data.update(data)
+        Args:
+            channel: Channel to publish to
+            message: Message to publish
+            retry_count: Current retry count
+            max_retries: Maximum number of retries
+        """
+        if retry_count > max_retries:
+            logger.error(f"Maximum retries ({max_retries}) reached for publishing to {channel}")
+            return
+            
+        # Add retry information to the message
+        message['retry_count'] = retry_count
+        message['retry_timestamp'] = time.time()
         
-        self.redis_manager.publish(self.status_channel, status_data)
+        # Exponential backoff
+        backoff_time = 0.5 * (2 ** retry_count)
+        
+        # Use threading.Timer to retry after the backoff time
+        def retry_task():
+            try:
+                logger.info(f"Retrying publish to {channel} (attempt {retry_count}/{max_retries})")
+                success = self.redis_manager.publish(channel, message)
+                
+                if not success and retry_count < max_retries:
+                    logger.warning(f"Retry {retry_count} failed, scheduling another retry")
+                    self._retry_publish(channel, message, retry_count + 1, max_retries)
+            except Exception as e:
+                logger.error(f"Error in retry_publish task: {e}")
+                
+        # Schedule the retry
+        threading.Timer(backoff_time, retry_task).start()
+    
+    def _publish_backlog_status(self) -> None:
+        """Publish backlog status to the backlog status channel."""
+        try:
+            # Get queue size
+            queue_size = self.crawler.url_queue.size() if self.crawler and self.crawler.url_queue else 0
+            
+            # Get a sample of queued URLs (up to 10)
+            queued_urls = []
+            if self.crawler and self.crawler.url_queue and queue_size > 0:
+                # Get a copy of the queue items without removing them
+                items = self.crawler.url_queue.peek(10)
+                for item in items:
+                    if isinstance(item, tuple) and len(item) > 0:
+                        url = item[0]
+                        depth = item[1] if len(item) > 1 else 0
+                        queued_urls.append({'url': url, 'depth': depth})
+                    else:
+                        queued_urls.append({'url': item, 'depth': 0})
+            
+            # Prepare status update
+            status_update = {
+                'status': 'backlog_status',
+                'size': queue_size,
+                'queued_urls': queued_urls,
+                'active': self.active,
+                'continuous_crawling': self.continuous_crawling,
+                'timestamp': time.time()
+            }
+            
+            # Publish status update
+            success = self.redis_manager.publish(self.backlog_status_channel, status_update)
+            
+            if not success:
+                logger.error("Failed to publish backlog status")
+                # Retry the publication
+                self._retry_publish(self.backlog_status_channel, status_update, 1)
+                
+            logger.info(f"Published backlog status: {queue_size} URLs in queue")
+        except Exception as e:
+            logger.error(f"Error publishing backlog status: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def _publish_stats(self) -> None:
         """Publish crawler statistics to the stats channel."""
@@ -667,39 +847,6 @@ class CrawlerWorker:
             stats_data['job_runtime'] = time.time() - self.current_job.get('start_time', 0)
         
         self.redis_manager.publish(self.stats_channel, stats_data)
-    
-    def _publish_backlog_status(self) -> None:
-        """Publish backlog status to the backlog status channel."""
-        backlog_size = self.crawler.url_queue.size()
-        
-        # Get additional backlog stats from database if available
-        db_stats = {}
-        if self.db_manager:
-            try:
-                db_stats = self.db_manager.get_stats()
-            except Exception as e:
-                logger.error(f"Error getting database stats: {e}")
-        
-        status_data = {
-            'component': 'crawler',
-            'backlog_size': backlog_size,
-            'backlog_min_threshold': self.backlog_min_threshold,
-            'backlog_target_size': self.backlog_target_size,
-            'db_stats': db_stats,
-            'timestamp': time.time()
-        }
-        
-        self.redis_manager.publish(self.backlog_status_channel, status_data)
-        
-        # If backlog is below threshold, publish a notification
-        if backlog_size < self.backlog_min_threshold and self.current_job:
-            logger.info(f"Backlog size ({backlog_size}) is below threshold ({self.backlog_min_threshold})")
-            
-            # Only activate crawler if it's not already active
-            if not self.active and not self.paused:
-                self.active = True
-                self._publish_status('crawling', f"Filling backlog (current size: {backlog_size})")
-                logger.info("Activated crawler to fill backlog")
     
     def _publish_url_processed(self, url: str, result: Dict[str, Any]) -> None:
         """
