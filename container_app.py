@@ -153,6 +153,42 @@ class ContainerApp:
         
         logger.info(f"Container app initialized with backlog thresholds: min={self.backlog_min_threshold}, target={self.backlog_target_size}")
     
+    def _start_crawler(self) -> None:
+        """Start the crawler component."""
+        try:
+            start_command = {
+                'command': 'start',
+                'params': {
+                    'active': True
+                }
+            }
+            success = self.redis_manager.publish(self.crawler_commands_channel, start_command)
+            if success:
+                logger.info("Sent start command to crawler")
+                self._publish_status('starting_crawler', "Sent start command to crawler")
+            else:
+                logger.error("Failed to send start command to crawler")
+        except Exception as e:
+            logger.error(f"Error starting crawler: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _start_analyzer(self) -> None:
+        """Start the analyzer component."""
+        try:
+            start_command = {
+                'command': 'start',
+                'params': {}
+            }
+            success = self.redis_manager.publish(self.analyzer_commands_channel, start_command)
+            if success:
+                logger.info("Sent start command to analyzer")
+                self._publish_status('starting_analyzer', "Sent start command to analyzer")
+            else:
+                logger.error("Failed to send start command to analyzer")
+        except Exception as e:
+            logger.error(f"Error starting analyzer: {e}")
+    
     def start(self) -> bool:
         """
         Start the container application and its components.
