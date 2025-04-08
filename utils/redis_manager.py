@@ -1,477 +1,445 @@
-#!/usr/bin/env python3
-"""
-Redis Manager for NDAIVI
-
-This module provides a Redis-based message broker for component communication
-in the NDAIVI system. It handles pub/sub messaging, command distribution,
-and status reporting between the crawler, analyzer, and other components.
-"""
-
-import json
 import logging
+import json
 import threading
 import time
 import redis
-from typing import Dict, List, Any, Optional, Union, Callable, Set
+from typing import Dict, Any, Callable, Optional, List
 
-# Configure logging
 logger = logging.getLogger(__name__)
+
+# Singleton Redis manager instance to ensure shared connection
+_REDIS_INSTANCE = None
+
+def get_redis_manager(config=None):
+    """
+    Get a Redis manager instance (singleton).
+    
+    Args:
+        config: Redis configuration
+        
+    Returns:
+        RedisManager: Redis manager instance
+    """
+    global _REDIS_INSTANCE
+    if _REDIS_INSTANCE is None:
+        _REDIS_INSTANCE = RedisManager(config)
+    return _REDIS_INSTANCE
 
 class RedisManager:
     """
-    Redis-based message broker for NDAIVI components.
+    Redis manager for pub/sub communication.
     
-    This class provides a centralized interface for component communication
-    using Redis pub/sub channels. It handles message serialization,
-    subscription management, and callback routing.
+    This class handles Redis connections and provides methods for
+    publishing and subscribing to channels.
     """
     
-    # Define required channel sets for different components
-    REQUIRED_CHANNELS = {
-        'crawler': {'crawler_commands', 'crawler_status', 'backlog_request', 'backlog_status', 'analyzer_results'},
-        'analyzer': {'analyzer_commands', 'analyzer_status', 'analyzer_results'},
-        'container': {'crawler_commands', 'crawler_status', 'analyzer_commands', 'analyzer_status', 
-                     'backlog_status', 'backlog_request', 'container_status'}
-    }
-    
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config=None):
         """
-        Initialize the Redis manager with configuration.
+        Initialize the Redis manager.
         
         Args:
-            config: Redis configuration dictionary with host, port, etc.
+            config: Redis configuration
         """
-        self.config = config
-        self.redis_client = self._create_redis_client()
-        self.pubsub = self.redis_client.pubsub(ignore_subscribe_messages=True)
-        self.subscribers = {}  # Channel -> list of callbacks
+        self.config = config or {}
+        self.redis_config = self.config.get('redis', {})
+        self.channels_config = self.config.get('application', {}).get('channels', {})
+        
+        # Redis connection
+        self.redis = None
+        self.pubsub = None
+        self.connected = False
+        
+        # Subscription handlers
+        self.handlers = {}
+        self.subscribed_channels = set()
+        
+        # Background thread for handling subscription messages
+        self.subscription_thread = None
         self.running = False
-        self.listener_thread = None
         
-        # Get all channels from config
-        channels_config = config.get('application', {}).get('channels', {})
-        self.channels = channels_config
-        
-        # Validate channel configuration
-        self._validate_channels()
+        # Connect to Redis
+        self.connect()
     
-    def _validate_channels(self) -> None:
+    def connect(self) -> bool:
         """
-        Validate that all required channels are defined in the configuration.
-        Raises a ValueError if any required channels are missing.
-        """
-        if not self.channels:
-            logger.error("No channel configuration found in config")
-            raise ValueError("No channel configuration found in config")
+        Connect to Redis.
         
-        # Check that all defined component types have their required channels
-        for component, required_channels in self.REQUIRED_CHANNELS.items():
-            missing_channels = []
-            for channel_name in required_channels:
-                if channel_name not in self.channels:
-                    missing_channels.append(channel_name)
+        Returns:
+            bool: True if connected successfully
+        """
+        try:
+            # Close existing connection if exists
+            if self.redis:
+                try:
+                    self.redis.close()
+                except:
+                    pass
             
-            if missing_channels:
-                error_msg = f"Missing required channels for {component}: {', '.join(missing_channels)}"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
+            # Redis connection parameters
+            host = self.redis_config.get('host', 'localhost')
+            port = self.redis_config.get('port', 6379)
+            db = self.redis_config.get('db', 0)
+            password = self.redis_config.get('password')
+            socket_timeout = self.redis_config.get('socket_timeout', 5)
+            socket_connect_timeout = self.redis_config.get('socket_connect_timeout', 5)
+            retry_on_timeout = self.redis_config.get('retry_on_timeout', True)
+            
+            # Log connection details
+            logger.info(f"Connecting to Redis at {host}:{port} (db: {db})")
+            
+            # Create Redis connection
+            self.redis = redis.Redis(
+                host=host,
+                port=port,
+                db=db,
+                password=password,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_connect_timeout,
+                retry_on_timeout=retry_on_timeout,
+                decode_responses=True
+            )
+            
+            # Create PubSub object
+            self.pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
+            
+            # Test connection
+            self.redis.ping()
+            
+            # Set connected flag
+            self.connected = True
+            
+            # Start subscription thread if necessary
+            if not self.running and self.handlers:
+                self._start_subscription_thread()
+            
+            logger.info("Connected to Redis successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error connecting to Redis: {str(e)}")
+            self.connected = False
+            return False
+    
+    def is_connected(self) -> bool:
+        """
+        Check if connected to Redis.
         
-        logger.info("All required Redis channels validated successfully")
+        Returns:
+            bool: True if connected
+        """
+        if not self.connected or not self.redis:
+            return False
+            
+        try:
+            self.redis.ping()
+            return True
+        except:
+            self.connected = False
+            return False
     
     def get_channel(self, channel_key: str) -> str:
         """
-        Get a channel name from the configuration by its key.
+        Get the channel name from the configuration.
         
         Args:
-            channel_key: Key of the channel in the configuration
+            channel_key: Channel key in the configuration
             
         Returns:
             str: Channel name
+        """
+        if not self.channels_config:
+            # Default channel names if not configured
+            default_channels = {
+                'crawler_commands': 'ndaivi:crawler:commands',
+                'crawler_status': 'ndaivi:crawler:status',
+                'analyzer_commands': 'ndaivi:analyzer:commands',
+                'analyzer_status': 'ndaivi:analyzer:status',
+                'analyzer_results': 'ndaivi:analyzer:results',
+                'backlog_status': 'ndaivi:backlog:status',
+                'backlog_request': 'ndaivi:backlog:request',
+                'container_status': 'ndaivi:container:status',
+                'stats': 'ndaivi:stats',
+                'system': 'ndaivi:system'
+            }
             
-        Raises:
-            ValueError: If the channel key is not found in the configuration
-        """
-        if channel_key not in self.channels:
-            error_msg = f"Channel key '{channel_key}' not found in configuration"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            if channel_key in default_channels:
+                return default_channels[channel_key]
+            else:
+                raise ValueError(f"Unknown channel key: {channel_key}")
         
-        return self.channels[channel_key]
+        if channel_key in self.channels_config:
+            return self.channels_config[channel_key]
+        else:
+            raise ValueError(f"Channel key '{channel_key}' not found in configuration")
     
-    def _create_redis_client(self) -> redis.Redis:
+    def publish(self, channel: str, message: Any) -> bool:
         """
-        Create a Redis client with the provided configuration.
-        
-        Returns:
-            redis.Redis: Configured Redis client
-        """
-        redis_config = self.config.get('redis', {})
-        
-        return redis.Redis(
-            host=redis_config.get('host', 'localhost'),
-            port=redis_config.get('port', 6379),
-            db=redis_config.get('db', 0),
-            password=redis_config.get('password'),
-            socket_timeout=redis_config.get('socket_timeout', 5),
-            socket_connect_timeout=redis_config.get('socket_connect_timeout', 5),
-            health_check_interval=redis_config.get('health_check_interval', 30),
-            retry_on_timeout=redis_config.get('retry_on_timeout', True),
-            decode_responses=False
-        )
-    
-    def start(self) -> bool:
-        """
-        Start the Redis manager and listener thread.
-        
-        Returns:
-            bool: True if started successfully, False otherwise
-        """
-        if self.running:
-            logger.warning("Redis manager already running")
-            return True
-        
-        try:
-            # Test Redis connection
-            self.redis_client.ping()
-            
-            # Start listener thread
-            self.running = True
-            self.listener_thread = threading.Thread(target=self._listener_loop)
-            self.listener_thread.daemon = True
-            self.listener_thread.start()
-            
-            logger.info("Redis manager started successfully")
-            return True
-        except redis.exceptions.ConnectionError as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            self.running = False
-            return False
-        except Exception as e:
-            logger.error(f"Error starting Redis manager: {e}")
-            self.running = False
-            return False
-    
-    def stop(self) -> None:
-        """Stop the Redis manager and listener thread."""
-        if not self.running:
-            return
-        
-        self.running = False
-        
-        # Wait for listener thread to terminate
-        if self.listener_thread:
-            self.listener_thread.join(timeout=1.0)
-        
-        # Unsubscribe from all channels
-        try:
-            self.pubsub.unsubscribe()
-            self.pubsub.close()
-        except Exception as e:
-            logger.error(f"Error closing Redis pubsub: {e}")
-        
-        logger.info("Redis manager stopped")
-    
-    def _listener_loop(self) -> None:
-        """
-        Main listener loop that processes incoming messages.
-        This runs in a separate thread.
-        """
-        while self.running:
-            try:
-                # Get message with a timeout to allow for clean shutdown
-                message = self.pubsub.get_message(timeout=0.1)
-                
-                if message:
-                    self._process_message(message)
-                
-                # Small sleep to prevent CPU hogging
-                time.sleep(0.001)
-            except redis.exceptions.ConnectionError as e:
-                logger.error(f"Redis connection error in listener: {e}")
-                time.sleep(1)  # Back off on connection error
-            except Exception as e:
-                logger.error(f"Error in Redis listener loop: {e}")
-                time.sleep(0.1)  # Small delay on other errors
-    
-    def _process_message(self, message: Dict[str, Any]) -> None:
-        """
-        Process a message from Redis pubsub.
+        Publish a message to a channel.
         
         Args:
-            message: Redis pubsub message
-        """
-        try:
-            # Extract channel and data
-            channel = message.get('channel', b'').decode('utf-8')
-            data = message.get('data', b'')
-            
-            # Skip if not a proper message
-            if not channel or not data:
-                return
-            
-            # Deserialize JSON data
-            try:
-                payload = json.loads(data.decode('utf-8'))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                logger.warning(f"Received non-JSON message on channel {channel}")
-                return
-            
-            # Call subscribers for this channel
-            if channel in self.subscribers:
-                for callback in self.subscribers[channel]:
-                    try:
-                        callback(payload)
-                    except Exception as e:
-                        logger.error(f"Error in subscriber callback for channel {channel}: {e}")
-        except Exception as e:
-            logger.error(f"Error processing Redis message: {e}")
-    
-    def subscribe(self, channel: str, callback: Callable[[Dict[str, Any]], None]) -> bool:
-        """
-        Subscribe to a Redis channel with a callback function.
-        
-        Args:
-            channel: Channel name to subscribe to
-            callback: Function to call when a message is received
+            channel: Channel name
+            message: Message to publish
             
         Returns:
-            bool: True if subscribed successfully, False otherwise
+            bool: True if published successfully
         """
+        # Ensure we're connected
+        if not self.is_connected():
+            if not self.connect():
+                logger.error(f"Failed to publish to {channel}: not connected to Redis")
+                return False
+        
         try:
-            # Add to subscribers dict
-            if channel not in self.subscribers:
-                self.subscribers[channel] = []
+            # Serialize message to JSON
+            if isinstance(message, (dict, list)):
+                message_str = json.dumps(message)
+            else:
+                message_str = str(message)
             
-            self.subscribers[channel].append(callback)
+            # Publish message
+            result = self.redis.publish(channel, message_str)
+            
+            # Log successful publication
+            logger.debug(f"Published message to {channel}: {message_str[:100]}...")
+            
+            return result > 0
+            
+        except Exception as e:
+            logger.error(f"Error publishing to {channel}: {str(e)}")
+            # Try to reconnect
+            self.connect()
+            return False
+    
+    def subscribe(self, channel: str, handler: Callable[[Dict[str, Any]], None]) -> bool:
+        """
+        Subscribe to a channel.
+        
+        Args:
+            channel: Channel name
+            handler: Handler function to call when a message is received
+            
+        Returns:
+            bool: True if subscribed successfully
+        """
+        # Ensure we're connected
+        if not self.is_connected():
+            if not self.connect():
+                logger.error(f"Failed to subscribe to {channel}: not connected to Redis")
+                return False
+        
+        try:
+            # Store the handler
+            self.handlers[channel] = handler
             
             # Subscribe to the channel
             self.pubsub.subscribe(channel)
+            self.subscribed_channels.add(channel)
+            
+            # Start the subscription thread if it's not already running
+            if not self.running:
+                self._start_subscription_thread()
             
             logger.info(f"Subscribed to channel: {channel}")
             return True
+            
         except Exception as e:
-            logger.error(f"Error subscribing to channel {channel}: {e}")
+            logger.error(f"Error subscribing to {channel}: {str(e)}")
             return False
     
-    def unsubscribe(self, channel: str, callback: Optional[Callable] = None) -> bool:
+    def unsubscribe(self, channel: str) -> bool:
         """
-        Unsubscribe from a Redis channel.
+        Unsubscribe from a channel.
         
         Args:
-            channel: Channel name to unsubscribe from
-            callback: Specific callback to remove (or all if None)
+            channel: Channel name
             
         Returns:
-            bool: True if unsubscribed successfully, False otherwise
+            bool: True if unsubscribed successfully
         """
+        if not self.is_connected():
+            return False
+        
         try:
-            # Remove specific callback or all callbacks
-            if channel in self.subscribers:
-                if callback:
-                    self.subscribers[channel] = [cb for cb in self.subscribers[channel] if cb != callback]
-                else:
-                    self.subscribers[channel] = []
+            # Unsubscribe from the channel
+            self.pubsub.unsubscribe(channel)
             
-            # If no more subscribers, unsubscribe from the channel
-            if channel not in self.subscribers or not self.subscribers[channel]:
-                self.pubsub.unsubscribe(channel)
+            # Remove the handler
+            if channel in self.handlers:
+                del self.handlers[channel]
+            
+            # Remove from subscribed channels
+            if channel in self.subscribed_channels:
+                self.subscribed_channels.remove(channel)
             
             logger.info(f"Unsubscribed from channel: {channel}")
             return True
+            
         except Exception as e:
-            logger.error(f"Error unsubscribing from channel {channel}: {e}")
+            logger.error(f"Error unsubscribing from {channel}: {str(e)}")
             return False
     
-    def publish(self, channel: str, message: Dict[str, Any]) -> bool:
+    def _start_subscription_thread(self) -> None:
         """
-        Publish a message to a Redis channel.
+        Start the subscription thread.
+        """
+        if self.running:
+            return
+            
+        self.running = True
+        self.subscription_thread = threading.Thread(target=self._subscription_loop, daemon=True)
+        self.subscription_thread.start()
         
-        Args:
-            channel: Channel name to publish to
-            message: Message dictionary to publish
-            
-        Returns:
-            bool: True if published successfully, False otherwise
-        """
-        try:
-            # Serialize message to JSON with custom handling for sets
-            message_json = json.dumps(message, default=self._json_serializer)
-            
-            # Publish to channel
-            self.redis_client.publish(channel, message_json)
-            
-            return True
-        except Exception as e:
-            logger.error(f"Error publishing to channel {channel}: {e}")
-            return False
+        logger.info("Started Redis subscription thread")
     
-    def store_data(self, key: str, data: Dict[str, Any], expiry: Optional[int] = None) -> bool:
+    def _subscription_loop(self) -> None:
+        """
+        Main loop for handling subscription messages.
+        """
+        while self.running:
+            try:
+                # Check if we're still connected
+                if not self.is_connected():
+                    logger.warning("Redis connection lost in subscription thread, reconnecting...")
+                    if self.connect():
+                        # Resubscribe to channels
+                        for channel in list(self.subscribed_channels):
+                            self.pubsub.subscribe(channel)
+                    else:
+                        # If reconnection failed, sleep and try again
+                        time.sleep(1)
+                        continue
+                
+                # Get a message with timeout
+                message = self.pubsub.get_message(timeout=0.1)
+                
+                if message:
+                    channel = message.get('channel')
+                    data = message.get('data')
+                    
+                    # Skip control messages
+                    if isinstance(channel, (int, type(None))):
+                        continue
+                    
+                    # Handle the message
+                    if channel in self.handlers:
+                        try:
+                            # Parse the data
+                            if isinstance(data, str):
+                                try:
+                                    parsed_data = json.loads(data)
+                                except json.JSONDecodeError:
+                                    parsed_data = data
+                            else:
+                                parsed_data = data
+                            
+                            # Call the handler
+                            handler = self.handlers[channel]
+                            handler(parsed_data)
+                            
+                        except Exception as e:
+                            logger.error(f"Error handling message on {channel}: {str(e)}")
+                
+                # Short sleep to prevent CPU hogging
+                time.sleep(0.01)
+                
+            except Exception as e:
+                logger.error(f"Error in subscription loop: {str(e)}")
+                time.sleep(1)  # Longer sleep on error
+    
+    def close(self) -> None:
+        """
+        Close the Redis connection.
+        """
+        self.running = False
+        
+        # Wait for subscription thread to terminate
+        if self.subscription_thread and self.subscription_thread.is_alive():
+            try:
+                self.subscription_thread.join(timeout=2.0)
+            except:
+                pass
+        
+        # Close pubsub connection
+        if self.pubsub:
+            try:
+                self.pubsub.close()
+            except:
+                pass
+        
+        # Close Redis connection
+        if self.redis:
+            try:
+                self.redis.close()
+            except:
+                pass
+        
+        self.connected = False
+        logger.info("Redis connection closed")
+    
+    def store_data(self, key: str, data: Any, expire: int = None) -> bool:
         """
         Store data in Redis.
         
         Args:
             key: Redis key
-            data: Data dictionary to store
-            expiry: Optional expiry time in seconds
+            data: Data to store
+            expire: Time to live in seconds
             
         Returns:
-            bool: True if stored successfully, False otherwise
+            bool: True if stored successfully
         """
+        if not self.is_connected():
+            if not self.connect():
+                return False
+        
         try:
-            # Serialize data to JSON with custom handling for sets
-            data_json = json.dumps(data, default=self._json_serializer)
-            
-            # Store in Redis
-            if expiry:
-                self.redis_client.setex(key, expiry, data_json)
+            # Serialize data to JSON
+            if isinstance(data, (dict, list)):
+                data_str = json.dumps(data)
             else:
-                self.redis_client.set(key, data_json)
+                data_str = str(data)
+            
+            # Store data
+            self.redis.set(key, data_str)
+            
+            # Set expiration if specified
+            if expire:
+                self.redis.expire(key, expire)
             
             return True
+            
         except Exception as e:
-            logger.error(f"Error storing data with key {key}: {e}")
+            logger.error(f"Error storing data for key {key}: {str(e)}")
             return False
     
-    def get_data(self, key: str) -> Optional[Dict[str, Any]]:
+    def get_data(self, key: str, default: Any = None) -> Any:
         """
         Get data from Redis.
         
         Args:
             key: Redis key
+            default: Default value if key doesn't exist
             
         Returns:
-            Optional[Dict[str, Any]]: Data dictionary or None if not found
+            Any: Retrieved data or default
         """
+        if not self.is_connected():
+            if not self.connect():
+                return default
+        
         try:
-            # Get data from Redis
-            data = self.redis_client.get(key)
+            # Get data
+            data = self.redis.get(key)
             
-            if not data:
-                return None
+            if data is None:
+                return default
             
-            # Deserialize JSON data
-            return json.loads(data.decode('utf-8'))
+            # Try to parse as JSON
+            try:
+                return json.loads(data)
+            except json.JSONDecodeError:
+                return data
+                
         except Exception as e:
-            logger.error(f"Error getting data with key {key}: {e}")
-            return None
-    
-    def delete_data(self, key: str) -> bool:
-        """
-        Delete data from Redis.
-        
-        Args:
-            key: Redis key
-            
-        Returns:
-            bool: True if deleted successfully, False otherwise
-        """
-        try:
-            # Delete data from Redis
-            self.redis_client.delete(key)
-            
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting data with key {key}: {e}")
-            return False
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        Get Redis server statistics.
-        
-        Returns:
-            Dict[str, Any]: Redis server statistics
-        """
-        try:
-            # Get Redis info
-            info = self.redis_client.info()
-            
-            # Extract relevant stats
-            stats = {
-                'connected_clients': info.get('connected_clients', 0),
-                'used_memory_human': info.get('used_memory_human', '0B'),
-                'total_commands_processed': info.get('total_commands_processed', 0),
-                'uptime_in_seconds': info.get('uptime_in_seconds', 0),
-                'uptime_in_days': info.get('uptime_in_days', 0),
-                'redis_version': info.get('redis_version', 'unknown')
-            }
-            
-            return stats
-        except Exception as e:
-            logger.error(f"Error getting Redis stats: {e}")
-            return {
-                'error': str(e),
-                'status': 'disconnected'
-            }
-    
-    def is_connected(self) -> bool:
-        """
-        Check if Redis is connected.
-        
-        Returns:
-            bool: True if connected, False otherwise
-        """
-        try:
-            # Try to ping Redis
-            return self.redis_client.ping()
-        except Exception as e:
-            logger.error(f"Redis connection check failed: {e}")
-            return False
-    
-    def connect(self) -> bool:
-        """
-        Attempt to connect or reconnect to Redis.
-        
-        Returns:
-            bool: True if connected successfully, False otherwise
-        """
-        try:
-            # Create a new Redis client
-            self.redis_client = self._create_redis_client()
-            
-            # Test the connection
-            if self.redis_client.ping():
-                logger.info("Successfully connected to Redis")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            return False
-            
-    def _json_serializer(self, obj):
-        """
-        Custom JSON serializer to handle non-serializable types.
-        
-        Args:
-            obj: Object to serialize
-            
-        Returns:
-            Serializable representation of the object
-        """
-        # Handle sets by converting to lists
-        if isinstance(obj, set):
-            return list(obj)
-        # Handle other non-serializable types as needed
-        try:
-            return str(obj)
-        except:
-            return None
-
-# Singleton instance
-_redis_manager_instance = None
-
-def get_redis_manager(config: Optional[Dict[str, Any]] = None) -> RedisManager:
-    """
-    Get the singleton Redis manager instance.
-    
-    Args:
-        config: Optional configuration dictionary
-        
-    Returns:
-        RedisManager: Redis manager instance
-    """
-    global _redis_manager_instance
-    
-    if _redis_manager_instance is None and config is not None:
-        _redis_manager_instance = RedisManager(config)
-    
-    return _redis_manager_instance
+            logger.error(f"Error retrieving data for key {key}: {str(e)}")
+            return default
