@@ -295,6 +295,10 @@ class CrawlerWorker:
         Args:
             message: Command message dictionary
         """
+        if not message:
+            logger.warning("Received empty command message")
+            return
+            
         try:
             # Log the received message for debugging
             logger.info(f"Crawler worker received command: {message}")
@@ -302,27 +306,65 @@ class CrawlerWorker:
             command = message.get('command')
             params = message.get('params', {})
             
-            if command == 'crawl':
-                self._handle_crawl_command(params)
-            elif command == 'pause':
-                self._handle_pause_command()
-            elif command == 'resume':
-                self._handle_resume_command()
-            elif command == 'stop':
-                self._handle_stop_command()
-            elif command == 'status':
-                self._handle_status_command()
-            elif command == 'start':
-                self._handle_start_command()
-            elif command == 'ping':
-                self._handle_ping_command(message)
-            else:
-                logger.warning(f"Unknown command: {command}")
+            if not command:
+                logger.warning(f"Received message without command: {message}")
+                return
+                
+            # Handle ping command separately to ensure it always responds
+            if command == 'ping':
+                try:
+                    self._handle_ping_command(message)
+                except Exception as e:
+                    logger.error(f"Error handling ping command: {e}")
+                    # Still try to respond to ping even if there's an error
+                    self._publish_status('error', f"Error in ping handler: {str(e)}")
+                    try:
+                        # Attempt to send a direct pong response even if the normal handler failed
+                        response = {
+                            'type': 'pong',
+                            'timestamp': time.time(),
+                            'request_id': message.get('request_id', ''),
+                            'status': 'error',
+                            'message': f"Error in ping handler: {str(e)}"
+                        }
+                        self.redis_manager.publish(self.status_channel, response)
+                    except Exception as inner_e:
+                        logger.critical(f"Critical: Failed to respond to ping after handler error: {inner_e}")
+                return
+                
+            # Handle other commands
+            try:
+                if command == 'crawl':
+                    self._handle_crawl_command(params)
+                elif command == 'pause':
+                    self._handle_pause_command()
+                elif command == 'resume':
+                    self._handle_resume_command()
+                elif command == 'stop':
+                    self._handle_stop_command()
+                elif command == 'status':
+                    self._handle_status_command()
+                elif command == 'start':
+                    self._handle_start_command()
+                else:
+                    logger.warning(f"Unknown command: {command}")
+            except Exception as cmd_e:
+                logger.error(f"Error handling command '{command}': {cmd_e}")
+                # Log the full traceback for better debugging
+                import traceback
+                logger.error(traceback.format_exc())
+                # Publish an error status for this command
+                self._publish_status('error', f"Error processing command '{command}': {str(cmd_e)}")
         except Exception as e:
-            logger.error(f"Error handling command: {e}")
+            logger.error(f"Critical error in command handler: {e}")
             # Log the full traceback for better debugging
             import traceback
             logger.error(traceback.format_exc())
+            # Try to publish an error status
+            try:
+                self._publish_status('error', f"Critical error in command handler: {str(e)}")
+            except:
+                logger.critical("Failed to publish error status after critical error")
     
     def _handle_analyzer_result(self, message: Dict[str, Any]) -> None:
         """
@@ -665,24 +707,29 @@ class CrawlerWorker:
         try:
             timestamp = message.get('timestamp', time.time())
             container_id = message.get('container_id', 'unknown')
+            request_id = message.get('request_id', '')
             
-            logger.debug(f"Received ping from container {container_id}")
+            logger.debug(f"Received ping from container {container_id}, request_id: {request_id}")
             
             # Prepare pong response
             pong_message = {
-                'status': 'pong',
+                'type': 'pong',
+                'status': 'ok',
                 'timestamp': timestamp,  # Echo back the original timestamp for latency calculation
+                'response_time': time.time(),
                 'crawler_id': id(self),
-                'response_time': time.time()
+                'request_id': request_id  # Echo back the request_id for correlation
             }
             
-            # Publish pong response
-            success = self.redis_manager.publish(self.backlog_status_channel, pong_message)
+            # Publish pong response to the status channel (not backlog_status_channel)
+            success = self.redis_manager.publish(self.status_channel, pong_message)
             
             if success:
-                logger.debug(f"Sent pong response to container {container_id}")
+                logger.debug(f"Sent pong response to container {container_id}, request_id: {request_id}")
             else:
-                logger.error(f"Failed to send pong response to container {container_id}")
+                logger.error(f"Failed to send pong response to container {container_id}, request_id: {request_id}")
+                # Try to republish with retry mechanism
+                self._retry_publish(self.status_channel, pong_message, 0, 3)
                 
             # This is a good opportunity to publish our current status
             self._publish_status(
@@ -690,13 +737,29 @@ class CrawlerWorker:
                 f"Crawler status update in response to ping from container {container_id}",
                 {
                     'queue_size': self.crawler.url_queue.size() if self.crawler and self.crawler.url_queue else 0,
-                    'continuous_crawling': self.continuous_crawling
+                    'continuous_crawling': self.continuous_crawling,
+                    'request_id': request_id
                 }
             )
         except Exception as e:
             logger.error(f"Error handling ping command: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            
+            # Even if there's an error, try to send a basic pong response
+            try:
+                basic_pong = {
+                    'type': 'pong',
+                    'status': 'error',
+                    'error': str(e),
+                    'timestamp': message.get('timestamp', time.time()),
+                    'response_time': time.time(),
+                    'request_id': message.get('request_id', '')
+                }
+                self.redis_manager.publish(self.status_channel, basic_pong)
+                logger.info("Sent error pong response despite exception")
+            except Exception as inner_e:
+                logger.critical(f"Critical: Failed to send error pong response: {inner_e}")
     
     def _publish_status(self, status: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
         """
