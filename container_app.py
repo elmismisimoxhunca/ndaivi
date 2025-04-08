@@ -88,18 +88,34 @@ class ContainerApp:
         # Initialize Redis manager
         self.redis_manager = get_redis_manager(self.config)
         
-        # Get channel names from config
-        channels_config = self.config.get('application', {}).get('channels', {})
-        self.crawler_commands_channel = channels_config.get('crawler_commands', 'ndaivi:crawler:commands')
-        self.crawler_status_channel = channels_config.get('crawler_status', 'ndaivi:crawler:status')
-        self.analyzer_commands_channel = channels_config.get('analyzer_commands', 'ndaivi:analyzer:commands')
-        self.analyzer_status_channel = channels_config.get('analyzer_status', 'ndaivi:analyzer:status')
-        self.analyzer_results_channel = channels_config.get('analyzer_results', 'ndaivi:analyzer:results')
-        self.container_status_channel = channels_config.get('container_status', 'ndaivi:container:status')
-        self.backlog_status_channel = channels_config.get('backlog_status', 'ndaivi:backlog:status')
-        self.backlog_request_channel = channels_config.get('backlog_request', 'ndaivi:backlog:request')
-        self.stats_channel = channels_config.get('stats', 'ndaivi:stats')
-        self.system_channel = channels_config.get('system', 'ndaivi:system')
+        # Get channel names from Redis manager
+        try:
+            self.crawler_commands_channel = self.redis_manager.get_channel('crawler_commands')
+            self.crawler_status_channel = self.redis_manager.get_channel('crawler_status')
+            self.analyzer_commands_channel = self.redis_manager.get_channel('analyzer_commands')
+            self.analyzer_status_channel = self.redis_manager.get_channel('analyzer_status')
+            self.analyzer_results_channel = self.redis_manager.get_channel('analyzer_results')
+            self.container_status_channel = self.redis_manager.get_channel('container_status')
+            self.backlog_status_channel = self.redis_manager.get_channel('backlog_status')
+            self.backlog_request_channel = self.redis_manager.get_channel('backlog_request')
+            self.stats_channel = self.redis_manager.get_channel('stats')
+            self.system_channel = self.redis_manager.get_channel('system')
+            
+            # Log channel names for debugging
+            logger.info(f"Container app initialized with the following channels:")
+            logger.info(f"Crawler commands channel: {self.crawler_commands_channel}")
+            logger.info(f"Crawler status channel: {self.crawler_status_channel}")
+            logger.info(f"Analyzer commands channel: {self.analyzer_commands_channel}")
+            logger.info(f"Analyzer status channel: {self.analyzer_status_channel}")
+            logger.info(f"Analyzer results channel: {self.analyzer_results_channel}")
+            logger.info(f"Container status channel: {self.container_status_channel}")
+            logger.info(f"Backlog status channel: {self.backlog_status_channel}")
+            logger.info(f"Backlog request channel: {self.backlog_request_channel}")
+            logger.info(f"Stats channel: {self.stats_channel}")
+            logger.info(f"System channel: {self.system_channel}")
+        except ValueError as e:
+            logger.critical(f"Failed to initialize container app: {e}")
+            raise ValueError(f"Container app initialization failed: {e}")
         
         # Initialize component status
         self.crawler_status = {
@@ -533,6 +549,32 @@ class ContainerApp:
             message: Status message dictionary
         """
         try:
+            # Handle pong messages specifically
+            if message.get('type') == 'pong':
+                # Handle pong response from crawler
+                timestamp = message.get('timestamp', 0)
+                crawler_id = message.get('crawler_id', 'unknown')
+                request_id = message.get('request_id', '')
+                
+                # Calculate latency
+                latency = time.time() - timestamp
+                
+                # Update the last pong time to prevent unnecessary crawler restarts
+                self.last_pong_time = time.time()
+                
+                logger.info(f"Received pong from crawler {crawler_id} with latency {latency:.3f}s for request {request_id}")
+                
+                # Update stats
+                with self.lock:
+                    self.stats['last_crawler_ping'] = {
+                        'crawler_id': crawler_id,
+                        'timestamp': time.time(),
+                        'latency': latency,
+                        'request_id': request_id
+                    }
+                return  # We've handled the pong message, so exit early
+            
+            # Handle regular status updates
             status = message.get('status')
             msg = message.get('message')
             data = message.get('data', {})
@@ -550,7 +592,7 @@ class ContainerApp:
             # Log status update
             logger.info(f"Crawler status: {status} - {msg}")
             if data:
-                logger.info(f"Crawler data: {json.dumps(data, indent=2)}")
+                logger.debug(f"Crawler data: {json.dumps(data, indent=2)}")
             
             # Publish to container status channel
             self.redis_manager.publish(self.container_status_channel, {
@@ -612,33 +654,15 @@ class ContainerApp:
                     if 'last_backlog_request' in self.stats and self.stats['last_backlog_request'].get('id') == request_id:
                         self.stats['last_backlog_request']['acknowledged'] = True
                         self.stats['last_backlog_request']['urls_sent'] = urls_sent
-                
-            elif status == 'pong':
-                # Handle pong response from crawler
-                timestamp = message.get('timestamp', 0)
-                crawler_id = message.get('crawler_id', 'unknown')
-                
-                # Calculate latency
-                latency = time.time() - timestamp
-                
-                logger.debug(f"Received pong from crawler {crawler_id} with latency {latency:.3f}s")
-                
-                # Update stats
-                with self.lock:
-                    self.stats['last_crawler_ping'] = {
-                        'crawler_id': crawler_id,
-                        'timestamp': time.time(),
-                        'latency': latency
-                    }
-                
             else:
                 # General backlog status update
-                logger.info(f"Backlog status update: {json.dumps(message, indent=2)}")
+                logger.info(f"Backlog status update: {status}")
                 
-                # Update stats
-                self.stats['backlog_size'] = message.get('size', 0)
-                self.stats['queued_urls'] = message.get('queued_urls', [])
-                self.stats['processing_urls'] = message.get('processing_urls', [])
+                if 'size' in message:
+                    # Update stats
+                    self.stats['backlog_size'] = message.get('size', 0)
+                    self.stats['queued_urls'] = message.get('queued_urls', [])
+                    self.stats['processing_urls'] = message.get('processing_urls', [])
             
             # Publish to container status channel
             self.redis_manager.publish(self.container_status_channel, {
@@ -656,38 +680,52 @@ class ContainerApp:
         Send a ping message to the crawler to check if it's still responsive.
         """
         try:
+            # Generate a unique request ID for this ping
+            request_id = f"ping_{int(time.time())}_{id(self)}"
+            
             ping_message = {
                 'command': 'ping',
                 'timestamp': time.time(),
-                'container_id': id(self)
+                'container_id': id(self),
+                'request_id': request_id  
             }
             
             success = self.redis_manager.publish(self.crawler_commands_channel, ping_message)
             
             if success:
-                logger.debug("Sent ping to crawler")
+                logger.info(f"Sent ping to crawler (request_id: {request_id})")
+                
+                # Store the request ID for verification when we get the pong
+                self.last_ping_request_id = request_id
                 
                 # Schedule a check for the pong response
-                threading.Timer(5.0, self._check_pong_response).start()
+                threading.Timer(5.0, self._check_pong_response, args=[request_id]).start()
             else:
                 logger.error("Failed to send ping to crawler")
         except Exception as e:
             logger.error(f"Error sending ping to crawler: {e}")
             
-    def _check_pong_response(self) -> None:
+    def _check_pong_response(self, request_id: str) -> None:
         """
-        Check if we received a pong response from the crawler.
+        Check if we received a pong response from the crawler for a specific ping request.
         If not, the crawler might be disconnected.
+        
+        Args:
+            request_id: The ID of the ping request to check
         """
         try:
             current_time = time.time()
             
-            # If we haven't received a pong response within 5 seconds, consider the crawler disconnected
-            if not hasattr(self, 'last_pong_time') or current_time - self.last_pong_time > 5:
-                logger.warning("No pong response received from crawler, it might be disconnected")
+            # Initialize the last_pong_time if it doesn't exist
+            if not hasattr(self, 'last_pong_time'):
+                self.last_pong_time = 0
+                
+            # If we haven't received a pong response within 5 seconds, consider the crawler potentially disconnected
+            if current_time - self.last_pong_time > 5:
+                logger.warning(f"No pong response received from crawler for request {request_id}, it might be disconnected")
                 
                 # Try to restart the crawler if it's been more than 30 seconds since the last pong
-                if not hasattr(self, 'last_pong_time') or current_time - self.last_pong_time > 30:
+                if current_time - self.last_pong_time > 30:
                     logger.warning("Crawler appears to be disconnected for too long, attempting to restart")
                     self._start_crawler()
         except Exception as e:

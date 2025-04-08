@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 import redis
-from typing import Dict, List, Any, Optional, Union, Callable
+from typing import Dict, List, Any, Optional, Union, Callable, Set
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -25,6 +25,14 @@ class RedisManager:
     using Redis pub/sub channels. It handles message serialization,
     subscription management, and callback routing.
     """
+    
+    # Define required channel sets for different components
+    REQUIRED_CHANNELS = {
+        'crawler': {'crawler_commands', 'crawler_status', 'backlog_request', 'backlog_status', 'analyzer_results'},
+        'analyzer': {'analyzer_commands', 'analyzer_status', 'analyzer_results'},
+        'container': {'crawler_commands', 'crawler_status', 'analyzer_commands', 'analyzer_status', 
+                     'backlog_status', 'backlog_request', 'container_status'}
+    }
     
     def __init__(self, config: Dict[str, Any]):
         """
@@ -40,17 +48,55 @@ class RedisManager:
         self.running = False
         self.listener_thread = None
         
-        # Default channels from config or use defaults
+        # Get all channels from config
         channels_config = config.get('application', {}).get('channels', {})
-        self.channels = {
-            'crawler_commands': channels_config.get('crawler_commands', 'ndaivi:crawler:commands'),
-            'crawler_status': channels_config.get('crawler_status', 'ndaivi:crawler:status'),
-            'analyzer_commands': channels_config.get('analyzer_commands', 'ndaivi:analyzer:commands'),
-            'analyzer_status': channels_config.get('analyzer_status', 'ndaivi:analyzer:status'),
-            'stats': channels_config.get('stats', 'ndaivi:stats'),
-            'system': channels_config.get('system', 'ndaivi:system'),
-            'database': channels_config.get('database', 'ndaivi:database')
-        }
+        self.channels = channels_config
+        
+        # Validate channel configuration
+        self._validate_channels()
+    
+    def _validate_channels(self) -> None:
+        """
+        Validate that all required channels are defined in the configuration.
+        Raises a ValueError if any required channels are missing.
+        """
+        if not self.channels:
+            logger.error("No channel configuration found in config")
+            raise ValueError("No channel configuration found in config")
+        
+        # Check that all defined component types have their required channels
+        for component, required_channels in self.REQUIRED_CHANNELS.items():
+            missing_channels = []
+            for channel_name in required_channels:
+                if channel_name not in self.channels:
+                    missing_channels.append(channel_name)
+            
+            if missing_channels:
+                error_msg = f"Missing required channels for {component}: {', '.join(missing_channels)}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+        
+        logger.info("All required Redis channels validated successfully")
+    
+    def get_channel(self, channel_key: str) -> str:
+        """
+        Get a channel name from the configuration by its key.
+        
+        Args:
+            channel_key: Key of the channel in the configuration
+            
+        Returns:
+            str: Channel name
+            
+        Raises:
+            ValueError: If the channel key is not found in the configuration
+        """
+        if channel_key not in self.channels:
+            error_msg = f"Channel key '{channel_key}' not found in configuration"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        return self.channels[channel_key]
     
     def _create_redis_client(self) -> redis.Redis:
         """
@@ -258,18 +304,6 @@ class RedisManager:
         except Exception as e:
             logger.error(f"Error publishing to channel {channel}: {e}")
             return False
-    
-    def get_channel(self, channel_key: str) -> str:
-        """
-        Get a channel name by its key.
-        
-        Args:
-            channel_key: Key of the channel (e.g., 'crawler_commands')
-            
-        Returns:
-            str: Channel name
-        """
-        return self.channels.get(channel_key, f"ndaivi:{channel_key}")
     
     def store_data(self, key: str, data: Dict[str, Any], expiry: Optional[int] = None) -> bool:
         """

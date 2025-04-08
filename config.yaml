@@ -190,14 +190,24 @@ application:
       enabled: true
       update_interval: 5  # Update stats every 5 seconds
   
-  # Redis channels
+  # Redis channels - Single source of truth for all channel names
   channels:
+    # Crawler channels
     crawler_commands: 'ndaivi:crawler:commands'
     crawler_status: 'ndaivi:crawler:status'
+    
+    # Analyzer channels
     analyzer_commands: 'ndaivi:analyzer:commands'
     analyzer_status: 'ndaivi:analyzer:status'
     analyzer_results: 'ndaivi:analyzer:results'  # Channel for analyzer to report completed URLs
+    
+    # Backlog channels
     backlog_status: 'ndaivi:backlog:status'      # Channel for backlog status updates
     backlog_request: 'ndaivi:backlog:request'    # Channel for requesting more URLs
-    stats: 'ndaivi:stats'
-    system: 'ndaivi:system'
+    
+    # Container app channels
+    container_status: 'ndaivi:container:status'  # Channel for container app status updates
+    
+    # System-wide channels
+    stats: 'ndaivi:stats'                        # Channel for statistics
+    system: 'ndaivi:system'                      # Channel for system-wide messages

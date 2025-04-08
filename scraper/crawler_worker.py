@@ -68,23 +68,26 @@ class CrawlerWorker:
         self.backlog_check_interval = self.crawler_config.get('backlog_check_interval', 30)
         self.last_backlog_check = 0
         
-        # Get channel names from config
-        channels_config = config.get('application', {}).get('channels', {})
-        self.command_channel = channels_config.get('crawler_commands', 'ndaivi:crawler:commands')
-        self.status_channel = channels_config.get('crawler_status', 'ndaivi:crawler:status')
-        self.stats_channel = channels_config.get('stats', 'ndaivi:stats')
-        self.analyzer_results_channel = channels_config.get('analyzer_results', 'ndaivi:analyzer:results')
-        self.backlog_status_channel = channels_config.get('backlog_status', 'ndaivi:backlog:status')
-        self.backlog_request_channel = channels_config.get('backlog_request', 'ndaivi:backlog:request')
-        
-        # Ensure we're using consistent channel names
-        logger.info("Initializing crawler worker with the following channels:")
-        logger.info(f"Command channel: {self.command_channel}")
-        logger.info(f"Status channel: {self.status_channel}")
-        logger.info(f"Stats channel: {self.stats_channel}")
-        logger.info(f"Analyzer results channel: {self.analyzer_results_channel}")
-        logger.info(f"Backlog status channel: {self.backlog_status_channel}")
-        logger.info(f"Backlog request channel: {self.backlog_request_channel}")
+        # Get channel names from Redis manager
+        try:
+            self.command_channel = self.redis_manager.get_channel('crawler_commands')
+            self.status_channel = self.redis_manager.get_channel('crawler_status')
+            self.stats_channel = self.redis_manager.get_channel('stats')
+            self.analyzer_results_channel = self.redis_manager.get_channel('analyzer_results')
+            self.backlog_status_channel = self.redis_manager.get_channel('backlog_status')
+            self.backlog_request_channel = self.redis_manager.get_channel('backlog_request')
+            
+            # Ensure we're using consistent channel names
+            logger.info("Initializing crawler worker with the following channels:")
+            logger.info(f"Command channel: {self.command_channel}")
+            logger.info(f"Status channel: {self.status_channel}")
+            logger.info(f"Stats channel: {self.stats_channel}")
+            logger.info(f"Analyzer results channel: {self.analyzer_results_channel}")
+            logger.info(f"Backlog status channel: {self.backlog_status_channel}")
+            logger.info(f"Backlog request channel: {self.backlog_request_channel}")
+        except ValueError as e:
+            logger.critical(f"Failed to initialize crawler worker: {e}")
+            raise ValueError(f"Crawler worker initialization failed: {e}")
     
     def start(self) -> bool:
         """
@@ -709,7 +712,7 @@ class CrawlerWorker:
             container_id = message.get('container_id', 'unknown')
             request_id = message.get('request_id', '')
             
-            logger.debug(f"Received ping from container {container_id}, request_id: {request_id}")
+            logger.info(f"Received ping from container {container_id}, request_id: {request_id}")
             
             # Prepare pong response
             pong_message = {
@@ -721,11 +724,11 @@ class CrawlerWorker:
                 'request_id': request_id  # Echo back the request_id for correlation
             }
             
-            # Publish pong response to the status channel (not backlog_status_channel)
+            # Always respond on the status channel that the container app is listening to
             success = self.redis_manager.publish(self.status_channel, pong_message)
             
             if success:
-                logger.debug(f"Sent pong response to container {container_id}, request_id: {request_id}")
+                logger.info(f"Sent pong response to container {container_id}, request_id: {request_id}")
             else:
                 logger.error(f"Failed to send pong response to container {container_id}, request_id: {request_id}")
                 # Try to republish with retry mechanism
@@ -756,8 +759,9 @@ class CrawlerWorker:
                     'response_time': time.time(),
                     'request_id': message.get('request_id', '')
                 }
+                # Ensure we're responding on the correct channel
                 self.redis_manager.publish(self.status_channel, basic_pong)
-                logger.info("Sent error pong response despite exception")
+                logger.info(f"Sent error pong response despite exception, request_id: {message.get('request_id', '')}")
             except Exception as inner_e:
                 logger.critical(f"Critical: Failed to send error pong response: {inner_e}")
     
@@ -803,6 +807,8 @@ class CrawlerWorker:
                 logger.error(f"Failed to publish status update: {status} - {message}")
                 # Retry the publication after a short delay
                 self._retry_publish(self.status_channel, status_data, 1)
+                
+            logger.info(f"Published status update: {status} - {message}")
         except Exception as e:
             logger.error(f"Error publishing status update: {e}")
             import traceback
