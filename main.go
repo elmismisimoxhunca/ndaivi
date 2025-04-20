@@ -27,6 +27,8 @@ type Config struct {
 	MaxBatchSize   int
 	MaxUnanalyzedURLs int
 	SpeedCheckInterval int
+	TargetWebsite  string
+	MaxUrls        int
 	CrawlerScript  string
 	AnalyzerScript string
 	StatusFile     string
@@ -42,6 +44,10 @@ type Stats struct {
 	AnalyzerStatus  string `json:"analyzer_status"`
 	BatchSize       int    `json:"batch_size"`
 	LastUpdated     string `json:"last_updated"`
+	Progress        int    `json:"progress"`
+	TargetUrls      int    `json:"target_urls"`
+	CrawlerPid      int    `json:"crawler_pid"`
+	AnalyzerPid     int    `json:"analyzer_pid"`
 }
 
 type NDAIVI struct {
@@ -147,23 +153,56 @@ func (n *NDAIVI) Stop() {
 }
 
 func (n *NDAIVI) startCrawler() error {
+	// Pass target website and other config via environment variables
+	env := os.Environ()
+	env = append(env, fmt.Sprintf("NDAIVI_TARGET_WEBSITE=%s", n.config.TargetWebsite))
+	env = append(env, fmt.Sprintf("NDAIVI_MAX_URLS=%d", n.config.MaxUrls))
+	env = append(env, fmt.Sprintf("NDAIVI_DB_PATH=%s", n.config.SQLiteDBPath))
+	env = append(env, fmt.Sprintf("NDAIVI_LOG_FILE=%s", n.config.LogFile))
+	
+	// Create log directory if it doesn't exist
+	logDir := filepath.Dir(n.config.LogFile)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Printf("Warning: Failed to create log directory: %v", err)
+	}
+	
 	n.crawlerCmd = exec.Command("python3", n.config.CrawlerScript)
+	n.crawlerCmd.Env = env
 	n.crawlerCmd.Stdout = os.Stdout
 	n.crawlerCmd.Stderr = os.Stderr
 	
+	// Log the command we're about to run
+	log.Printf("Starting crawler: %s %s", "python3", n.config.CrawlerScript)
+	log.Printf("Environment: NDAIVI_TARGET_WEBSITE=%s, NDAIVI_MAX_URLS=%d", 
+		n.config.TargetWebsite, n.config.MaxUrls)
+	
 	if err := n.crawlerCmd.Start(); err != nil {
 		return err
+	}
+	
+	// Store the crawler PID for status reporting
+	if n.crawlerCmd.Process != nil {
+		n.stats.CrawlerPid = n.crawlerCmd.Process.Pid
+		n.stats.CrawlerStatus = "running"
+		n.updateStats() // Update status file immediately
 	}
 
 	// Monitor crawler process
 	go func() {
 		if err := n.crawlerCmd.Wait(); err != nil {
 			log.Printf("Crawler process exited with error: %v", err)
+			// Update status
+			n.stats.CrawlerStatus = "stopped"
+			n.updateStats()
 			// Attempt to restart crawler after brief delay
 			time.Sleep(5 * time.Second)
 			if err := n.startCrawler(); err != nil {
 				log.Printf("Failed to restart crawler: %v", err)
 			}
+		} else {
+			log.Printf("Crawler process exited normally")
+			n.stats.CrawlerStatus = "stopped"
+			n.updateStats()
 		}
 	}()
 
@@ -291,80 +330,146 @@ func (n *NDAIVI) updateStats() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// Check if the table exists before querying
-	var tableName string
-	err := n.sqliteDB.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'").Scan(&tableName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// Table doesn't exist yet
-			n.stats.TotalURLs = 0
-			n.stats.AnalyzedURLs = 0
-			n.stats.UnanalyzedURLs = 0
+	// Update timestamp
+	n.stats.LastUpdated = time.Now().Format(time.RFC3339)
+
+	// Get URL counts from SQLite database
+	if n.sqliteDB != nil {
+		// Check if the table exists before querying
+		var tableName string
+		err := n.sqliteDB.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'").Scan(&tableName)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				// Table doesn't exist yet
+				n.stats.TotalURLs = 0
+				n.stats.AnalyzedURLs = 0
+				n.stats.UnanalyzedURLs = 0
+			} else {
+				log.Printf("Error checking for pages table: %v", err)
+			}
 		} else {
-			log.Printf("Error checking for pages table: %v", err)
+			// Table exists, get URL counts
+			n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages").Scan(&n.stats.TotalURLs)
+			
+			// Check if analyzed column exists
+			rows, err := n.sqliteDB.Query("PRAGMA table_info(pages)")
+			if err != nil {
+				log.Printf("Error querying table schema: %v", err)
+			} else {
+				hasAnalyzedColumn := false
+				defer rows.Close()
+				
+				for rows.Next() {
+					var cid, notnull, pk int
+					var name, ctype, dfltValue string
+					if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
+						log.Printf("Error scanning column info: %v", err)
+						continue
+					}
+					if name == "analyzed" {
+						hasAnalyzedColumn = true
+						break
+					}
+				}
+				
+				if hasAnalyzedColumn {
+					n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE analyzed = 1").Scan(&n.stats.AnalyzedURLs)
+					n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE status_code = 200 AND analyzed = 0").Scan(&n.stats.UnanalyzedURLs)
+				} else {
+					// No analyzed column, assume all unanalyzed
+					n.stats.AnalyzedURLs = 0
+					n.stats.UnanalyzedURLs = n.stats.TotalURLs
+				}
+			}
+		}
+		
+		// Update progress percentage
+		n.stats.TargetUrls = n.config.MaxUrls
+		if n.stats.TargetUrls > 0 && n.stats.TotalURLs > 0 {
+			progressPercent := (n.stats.TotalURLs * 100) / n.stats.TargetUrls
+			if progressPercent > 100 {
+				progressPercent = 100
+			}
+			n.stats.Progress = progressPercent
+		} else {
+			n.stats.Progress = 0
 		}
 	} else {
-		// Table exists, get URL counts
-		n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages").Scan(&n.stats.TotalURLs)
-		
-		// Check if analyzed column exists
-		rows, err := n.sqliteDB.Query("PRAGMA table_info(pages)")
-		if err != nil {
-			log.Printf("Error querying table schema: %v", err)
-		} else {
-			hasAnalyzedColumn := false
-			defer rows.Close()
-			
-			for rows.Next() {
-				var cid, notnull, pk int
-				var name, ctype, dfltValue string
-				if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
-					log.Printf("Error scanning column info: %v", err)
-					continue
-				}
-				if name == "analyzed" {
-					hasAnalyzedColumn = true
-					break
-				}
-			}
-			
-			if hasAnalyzedColumn {
-				n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE analyzed = 1").Scan(&n.stats.AnalyzedURLs)
-				n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE analyzed = 0").Scan(&n.stats.UnanalyzedURLs)
-			} else {
-				// No analyzed column, assume all unanalyzed
-				n.stats.AnalyzedURLs = 0
-				n.stats.UnanalyzedURLs = n.stats.TotalURLs
-			}
-		}
+		log.Printf("Warning: SQLite database connection is nil")
 	}
 
-	// Update process status
-	n.stats.CrawlerStatus = "running"
-	if n.crawlerCmd == nil || n.crawlerCmd.Process == nil {
+	// Update process status and PIDs
+	if n.crawlerCmd != nil && n.crawlerCmd.Process != nil {
+		// Check if process exists
+		if err := n.crawlerCmd.Process.Signal(syscall.Signal(0)); err != nil {
+			log.Printf("Crawler process signal check failed: %v", err)
+			n.stats.CrawlerStatus = "stopped"
+		} else {
+			n.stats.CrawlerStatus = "running"
+		}
+		n.stats.CrawlerPid = n.crawlerCmd.Process.Pid
+	} else {
 		n.stats.CrawlerStatus = "stopped"
+		n.stats.CrawlerPid = 0
 	}
-	n.stats.AnalyzerStatus = "running"
-	if n.analyzerCmd == nil || n.analyzerCmd.Process == nil {
+
+	if n.analyzerCmd != nil && n.analyzerCmd.Process != nil {
+		// Check if process exists
+		if err := n.analyzerCmd.Process.Signal(syscall.Signal(0)); err != nil {
+			n.stats.AnalyzerStatus = "stopped"
+		} else {
+			n.stats.AnalyzerStatus = "running"
+		}
+		n.stats.AnalyzerPid = n.analyzerCmd.Process.Pid
+	} else {
 		n.stats.AnalyzerStatus = "stopped"
+		n.stats.AnalyzerPid = 0
 	}
 
 	n.stats.BatchSize = len(n.analyzerBatch)
-	n.stats.LastUpdated = time.Now().Format(time.RFC3339)
 
 	// Write stats to file
 	statsJSON, _ := json.MarshalIndent(n.stats, "", "  ")
 	os.WriteFile(n.config.StatusFile, statsJSON, 0644)
-}
-
-func (n *NDAIVI) processBatch() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if len(n.analyzerBatch) < n.config.MaxBatchSize {
-		return
+} else {
+		log.Printf("Warning: SQLite database connection is nil")
 	}
-
+	
+	// Update crawler status if not running
+	if n.crawlerCmd != nil && n.crawlerCmd.Process != nil {
+		// Check if process exists
+		if err := n.crawlerCmd.Process.Signal(syscall.Signal(0)); err != nil {
+			log.Printf("Crawler process signal check failed: %v", err)
+			n.stats.CrawlerStatus = "stopped"
+		} else {
+			n.stats.CrawlerStatus = "running"
+		}
+		n.stats.CrawlerPid = n.crawlerCmd.Process.Pid
+	} else {
+		n.stats.CrawlerStatus = "stopped"
+		n.stats.CrawlerPid = 0
+	}
+	
+	// Update analyzer status
+	if n.analyzerCmd != nil && n.analyzerCmd.Process != nil {
+		// Check if process exists
+		if err := n.analyzerCmd.Process.Signal(syscall.Signal(0)); err != nil {
+			n.stats.AnalyzerStatus = "stopped"
+		} else {
+			n.stats.AnalyzerStatus = "running"
+		}
+		n.stats.AnalyzerPid = n.analyzerCmd.Process.Pid
+	} else {
+		n.stats.AnalyzerStatus = "stopped"
+		n.stats.AnalyzerPid = 0
+	}
+	
+	// Update batch size
+	n.stats.BatchSize = len(n.analyzerBatch)
+	
+	// Write stats to file
+	if n.config.StatusFile != "" {
+		data, err := json.MarshalIndent(n.stats, "", "  ")
 	// Check if the table exists before updating
 	var tableName string
 	err := n.sqliteDB.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'").Scan(&tableName)
@@ -452,11 +557,13 @@ func readConfig(configPath string) (Config, error) {
 		MaxBatchSize:   32,
 		MaxUnanalyzedURLs: 1024,
 		SpeedCheckInterval: 5,
+		TargetWebsite:  "manualslib.com", // Default target website
+		MaxUrls:        1000, // Default max URLs
 		CrawlerScript: "/var/ndaivimanuales/scraper/web_crawler.py",
-		AnalyzerScript: "/var/ndaivimanuales/analyzer/analyzer.py",
+		AnalyzerScript: "/var/ndaivimanuales/scraper/claude_analyzer.py", // Fixed analyzer path
 		StatusFile:    "/var/ndaivimanuales/logs/ndaivi_status.json",
 		LogFile:       "/var/ndaivimanuales/logs/ndaivi.log",
-		PidFile:       "/var/run/ndaivi.pid",
+		PidFile:       "/var/ndaivimanuales/logs/ndaivi.pid", // Changed to logs directory for permissions
 	}
 
 	// Read config file
@@ -491,6 +598,8 @@ func readConfig(configPath string) (Config, error) {
 		config.SQLiteDBPath = getStringOrDefault(wc, "db_path", config.SQLiteDBPath)
 		config.MaxUnanalyzedURLs = getIntOrDefault(wc, "max_unanalyzed_urls", config.MaxUnanalyzedURLs)
 		config.SpeedCheckInterval = getIntOrDefault(wc, "crawl_speed_check_interval", config.SpeedCheckInterval)
+		config.TargetWebsite = getStringOrDefault(wc, "target_website", "")
+		config.MaxUrls = getIntOrDefault(wc, "max_urls", 1000) // Default to 1000 if not specified
 	}
 
 	return config, nil
@@ -519,7 +628,13 @@ func main() {
 	// Parse command line arguments
 	configPath := flag.String("config", "/var/ndaivimanuales/config.yaml", "Path to config file")
 	daemonize := flag.Bool("daemon", false, "Run as daemon")
+	startDaemon := flag.Bool("start-daemon", false, "Start in daemon mode") // Added for direct daemon start
 	flag.Parse()
+	
+	// If start-daemon is provided, set daemonize to true
+	if *startDaemon {
+		*daemonize = true
+	}
 
 	// Read configuration
 	config, err := readConfig(*configPath)
@@ -547,12 +662,13 @@ func main() {
 			os.Stderr = os.NewFile(logFile.Fd(), stdout.Name())
 		}
 		
-		// Detach from terminal
-		if os.Getppid() != 1 {
-			// Re-run the same command as background process
-			cmd := exec.Command(os.Args[0], "--daemon", "--config", *configPath)
+		// Detach from terminal if not already a daemon (ppid != 1)
+		// and not explicitly started with --start-daemon
+		if os.Getppid() != 1 && !*startDaemon {
+			// Re-run the same command as background process with nohup
+			cmd := exec.Command("nohup", os.Args[0], "--start-daemon", "--config", *configPath)
 			cmd.Start()
-			log.Printf("NDAIVI daemon started with PID %d", cmd.Process.Pid)
+			fmt.Printf("NDAIVI daemon started with PID %d\n", cmd.Process.Pid)
 			os.Exit(0)
 		}
 		

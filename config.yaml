@@ -127,7 +127,7 @@ web_crawler:
   # Crawler behavior
   max_depth: 3
   max_urls: null  # null means no limit (for production), set a number for testing
-  max_urls_per_domain: 100
+  max_urls_per_domain: 100000
   max_concurrent_requests: 5
   request_delay: 1.0
   timeout: 30

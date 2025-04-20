@@ -1,4 +1,125 @@
-#!/usr/bin/env python3
+# Example usage
+if __name__ == "__main__":
+    # Set up logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Create crawler
+    crawler = WebCrawler()
+    
+    # Define callbacks
+    def on_content_extracted(url, depth, title, content, metadata):
+        print(f"Processed: {url} (depth {depth}) - {title}")
+        
+    # Set callbacks
+    crawler.callbacks['on_content_extracted'] = [on_content_extracted]
+    
+    # Configure logging to file
+    log_file = os.environ.get('NDAIVI_LOG_FILE', '/var/ndaivimanuales/logs/ndaivi.log')
+    log_dir = os.path.dirname(log_file)
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(file_handler)
+    
+    # Get target website from environment variable or use default
+    target_website = os.environ.get('NDAIVI_TARGET_WEBSITE', 'manualslib.com')
+    max_urls = int(os.environ.get('NDAIVI_MAX_URLS', '1000'))
+    
+    # Set more verbose logging
+    logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Start crawling with https protocol
+    start_url = f"https://{target_website}"
+    logging.info(f"Starting crawl of {start_url} with max_urls={max_urls}")
+    print(f"Starting crawl of {start_url} with max_urls={max_urls}")
+    
+    # Initialize database and crawler state
+    db_path = os.environ.get('NDAIVI_DB_PATH', '/var/ndaivimanuales/scraper/data/crawler.db')
+    db_dir = os.path.dirname(db_path)
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir)
+    
+    # Add direct request testing for the target website
+    try:
+        print(f"Testing direct HTTP connection to {start_url}...")
+        logging.info(f"Testing direct HTTP connection to {start_url}...")
+        test_response = requests.get(start_url, timeout=30, 
+                                   headers={'User-Agent': 'Mozilla/5.0 (compatible; NDaiviBot/1.0; +https://ndaivi.com/bot)'})
+        logging.info(f"Direct connection test result: Status {test_response.status_code}, Content-Type: {test_response.headers.get('Content-Type')}")
+        print(f"Connection successful! Status: {test_response.status_code}, Length: {len(test_response.text)} bytes")
+        
+        # Save sample of the content for debugging
+        content_preview = test_response.text[:500] + '...' if len(test_response.text) > 500 else test_response.text
+        logging.debug(f"Content preview: {content_preview}")
+        
+        # Extract sample links for debugging
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(test_response.text, 'html.parser')
+        sample_links = []
+        for link in soup.find_all('a', href=True)[:10]:
+            full_url = urljoin(start_url, link['href'])
+            sample_links.append(full_url)
+            print(f"Found link: {full_url}")
+            
+        logging.info(f"Sample links: {sample_links}")
+    except Exception as e:
+        logging.error(f"Failed to connect to {start_url}: {str(e)}")
+        print(f"Error connecting to {start_url}: {str(e)}")
+    
+    # Setup callbacks for detailed logging
+    def on_url_added(url, priority, depth):
+        logging.info(f"Added URL to queue: {url} (priority: {priority}, depth: {depth})")
+        print(f"Queue: Added {url}")
+    
+    def on_url_fetched(url, status_code, content_type):
+        logging.info(f"Fetched URL: {url} (status: {status_code}, type: {content_type})")
+        print(f"Fetched: {url} - Status {status_code}")
+    
+    def on_content_extracted(url, depth, title, content, metadata):
+        logging.info(f"Extracted content from: {url} (depth: {depth}, title: {title})")
+        print(f"Processed: {url} - {title}")
+    
+    def on_error(url, error):
+        logging.error(f"Error processing {url}: {error}")
+        print(f"Error: {url} - {error}")
+    
+    # Set all callbacks
+    crawler.callbacks['on_url_added'] = [on_url_added]
+    crawler.callbacks['on_url_fetched'] = [on_url_fetched]
+    crawler.callbacks['on_content_extracted'] = [on_content_extracted]
+    crawler.callbacks['on_error'] = [on_error]
+    
+    # Force single domain mode for manualslib.com
+    crawler.config['single_domain_mode'] = True
+    crawler.config['allowed_domains'] = [target_website]
+    crawler.config['max_urls'] = max_urls
+    crawler.config['max_depth'] = 5
+    crawler.config['request_delay'] = 1.0
+    crawler.config['user_agent'] = 'Mozilla/5.0 (compatible; NDaiviBot/1.0; +https://ndaivi.com/bot)'
+    
+    # Initialize with sample links (if we found them in our test)
+    if 'sample_links' in locals() and sample_links:
+        for link in sample_links:
+            crawler.add_url(link, depth=1, priority=0.8)
+            
+    # Add original start URL
+    crawler.add_url(start_url, depth=0, priority=1.0)
+    
+    # Start crawling with increased limits
+    crawler.crawl(start_url=None, max_urls=max_urls)  # Don't pass start_url again - we already added it
+    
+    # Print stats
+    print("Crawl complete!")
+    stats = crawler.get_stats()
+    print(f"URLs processed: {stats['urls_processed']}")
+    print(f"URLs failed: {stats['urls_failed']}")
+    print(f"Domains visited: {stats['domains_discovered']}")
+    print(f"Duration: {stats['elapsed_time']:.2f} seconds")#!/usr/bin/env python3
 """
 Web Crawler for NDAIVI
 
@@ -34,7 +155,7 @@ import sys
 import traceback
 
 # Import the new modules
-from db_manager import CrawlDatabase, UrlQueueManager, DomainManager
+from db_manager import CrawlDatabase, DomainManager
 try:
     from stats_manager import StatsManager
 except ImportError:
@@ -187,7 +308,7 @@ class VisitedUrlManager:
             self.db.execute('''
                 SELECT url, domain, status_code, content_type, content_length, title, content, headers, crawled_at
                 FROM pages
-                WHERE status_code = 200
+                WHERE status_code = 200 AND analyzed = 0
                 ORDER BY crawled_at ASC
                 LIMIT ?
             ''', (limit,))
@@ -211,6 +332,23 @@ class VisitedUrlManager:
             self.logger.error(f"Failed to get unanalyzed URLs: {e}")
             return []
     
+    def mark_as_analyzed(self, url: str) -> bool:
+        """
+        Mark a URL as analyzed.
+        
+        Args:
+            url: URL to mark as analyzed
+            
+        Returns:
+            bool: True if URL was marked as analyzed, False otherwise
+        """
+        try:
+            self.db.execute('UPDATE pages SET analyzed = 1 WHERE url = ?', (url,))
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to mark URL {url} as analyzed: {e}")
+            return False
+    
     def get_stats(self) -> Dict:
         """
         Get statistics about visited URLs.
@@ -221,7 +359,9 @@ class VisitedUrlManager:
         stats = {
             'total': 0,
             'success': 0,
-            'error': 0
+            'error': 0,
+            'analyzed': 0,
+            'unanalyzed': 0
         }
         
         try:
@@ -233,6 +373,12 @@ class VisitedUrlManager:
             
             self.db.execute('SELECT COUNT(*) FROM pages WHERE status_code >= 400 OR status_code = 0')
             stats['error'] = self.db.fetchone()[0]
+            
+            self.db.execute('SELECT COUNT(*) FROM pages WHERE analyzed = 1')
+            stats['analyzed'] = self.db.fetchone()[0]
+            
+            self.db.execute('SELECT COUNT(*) FROM pages WHERE analyzed = 0 AND status_code = 200')
+            stats['unanalyzed'] = self.db.fetchone()[0]
             
             return stats
         except Exception as e:
@@ -766,7 +912,11 @@ class WebCrawler:
         self.visited_urls = set() if not self.use_database or not self.db else VisitedUrlManager(self.db, self.logger)
         
         # Initialize robots.txt cache
-        self.robots_cache = {}
+        self.robots_parsers = {}
+        
+        # Initialize backlog and lock
+        self.backlog = []
+        self.backlog_lock = threading.Lock()
         
         # Initialize session
         self.session = requests.Session()
@@ -816,76 +966,7 @@ class WebCrawler:
         # Store the stats callback
         self.stats_callback = stats_callback
         
-    def _sync_queue_from_db(self):
-        """
-        Synchronize the in-memory queue with the database queue.
-        This ensures that any URLs already in the database queue
-        are also available in the in-memory queue for faster processing.
-        """
-        try:
-            # Get all queued URLs from the database
-            queued_urls = self.url_queue_manager.get_all_queued() if self.url_queue_manager else []
-            
-            if not queued_urls:
-                self.logger.info("No URLs in database queue to sync")
-                return
-                
-            self.logger.info(f"Syncing {len(queued_urls)} URLs from database to in-memory queue")
-            
-            # Add each URL to the in-memory queue
-            for url_data in queued_urls:
-                url = url_data.get('url')
-                depth = url_data.get('depth', 0)
-                priority = url_data.get('priority', 0.0)
-                domain = url_data.get('domain', '')
-                
-                metadata = {
-                    'domain': domain,
-                    'id': url_data.get('id')  # Store the database ID for later reference
-                }
-                
-                # Add to in-memory queue
-                self.url_queue.add(url, depth, priority, metadata)
-                
-            # Update stats
-            self.stats['urls_queued'] = len(queued_urls)
-            self.logger.info(f"Successfully synced {len(queued_urls)} URLs to in-memory queue")
-            
-        except Exception as e:
-            self.logger.error(f"Error syncing queue from database: {str(e)}")
-    
-    def _get_default_config(self):
-        """
-        Get default configuration for the crawler.
-        
-        Returns:
-            dict: Default configuration
-        """
-        return {
-            'max_depth': 3,
-            'max_urls': 100,
-            'max_urls_per_domain': 100,
-            'request_delay': 1.0,
-            'timeout': 30,
-            'user_agent': 'Mozilla/5.0 (compatible; NDaiviBot/1.0; +https://ndaivi.com/bot)',
-            'respect_robots_txt': True,
-            'follow_redirects': True,
-            'allowed_domains': [],
-            'disallowed_domains': [],
-            'allowed_url_patterns': [],
-            'disallowed_url_patterns': [],
-            'max_content_size': 5 * 1024 * 1024,  # 5MB
-            'extract_links': True,
-            'db_path': 'crawler.db',
-            'restrict_to_start_domain': True,
-            'allow_subdomains': False,
-            'stats_update_interval': 10,
-            'max_retries': 3,
-            'backlog_size': 1000,
-            'backlog_threshold': 0.1
-        }
-    
-    def add_url(self, url: str, depth: int = 0, priority: float = 0.0, metadata: Dict = None) -> bool:
+    def add_url(self, url, depth=0, priority=0.0, metadata=None):
         """
         Add a URL to the crawl queue.
         
@@ -910,7 +991,7 @@ class WebCrawler:
         domain = parsed_url.netloc
         
         # Set start domain on first URL if we don't have one
-        if not hasattr(self, 'start_domain') and depth == 0:
+        if self.start_domain is None and depth == 0:
             self.start_domain = domain
             self.logger.info(f"Setting start domain to: {domain}")
             
@@ -951,7 +1032,8 @@ class WebCrawler:
             
         # Calculate priority if not provided
         if priority == 0.0:
-            priority = self.calculate_priority(url, depth)
+            priority = self.calculate_priority(url, depth, metadata.get('anchor_text') if metadata else None, 
+                                              metadata.get('source_url') if metadata else None)
             
         # Add to in-memory queue
         self.url_queue.add(url, depth, priority, metadata)
@@ -1170,7 +1252,11 @@ class WebCrawler:
                             
                         # Add link to queue with try/except
                         try:
-                            if self.add_url(link_url, depth + 1):
+                            link_metadata = {
+                                'source_url': url,
+                                'anchor_text': ''  # We could extract this from the HTML if needed
+                            }
+                            if self.add_url(link_url, depth + 1, metadata=link_metadata):
                                 links_added += 1
                         except Exception as e:
                             self.logger.error(f"Error adding URL {link_url} to queue: {str(e)}")
@@ -1288,29 +1374,29 @@ class WebCrawler:
         try:
             result = self.process_url(url_data['url'], url_data.get('depth', 0))
             result['url_id'] = url_id
+            
+            # Mark URL as complete in the queue
+            if url_id and self.url_queue_manager:
+                try:
+                    if result['status'] == 'success':
+                        self.url_queue_manager.mark_complete(url_id)
+                    else:
+                        self.url_queue_manager.mark_failed(url_id)
+                except Exception as e:
+                    self.logger.error(f"Error marking URL status: {str(e)}")
+            
             return result
         except Exception as e:
             self.logger.error(f"Error processing URL {url_data['url']}: {str(e)}")
+            # Mark as failed in queue
+            if url_id and self.url_queue_manager:
+                try:
+                    self.url_queue_manager.mark_failed(url_id)
+                except Exception as mark_e:
+                    self.logger.error(f"Error marking URL as failed: {str(mark_e)}")
+                    
             return {'status': 'error', 'url_id': url_id, 'error': str(e)}
-
-    def process_url(self, url: str) -> dict:
-        """
-        Process a single URL and return the result.
-        
-        Args:
-            url: URL to process
             
-        Returns:
-            dict: Result of URL processing
-        """
-        try:
-            # Process the URL and return result
-            result = {'status': 'success', 'url': url}
-            return result
-        except Exception as e:
-            self.logger.error(f"Error processing URL {url}: {str(e)}")
-            return {'status': 'error', 'url': url, 'error': str(e)}
-
     def handle_command(self, command: str) -> None:
         """
         Handle commands received from the coordinator.
@@ -1329,7 +1415,7 @@ class WebCrawler:
                 self.logger.info(f"Set request delay override to {delay} seconds")
         except Exception as e:
             self.logger.error(f"Error handling command '{command}': {str(e)}")
-
+            
     def check_stdin_commands(self) -> None:
         """
         Check stdin for any pending commands from the coordinator.
@@ -1342,20 +1428,6 @@ class WebCrawler:
                     self.handle_command(command)
         except Exception as e:
             self.logger.error(f"Error handling command: {str(e)}")
-    
-    def check_stdin_commands(self) -> None:
-        """
-        Check stdin for any pending commands from the coordinator.
-        """
-        # Check if there's data available on stdin
-        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-            try:
-                # Read line from stdin (non-blocking)
-                command = sys.stdin.readline().strip()
-                if command:
-                    self.handle_command(command)
-            except Exception as e:
-                self.logger.error(f"Error reading from stdin: {str(e)}")
     
     def crawl(self, start_url=None, max_urls=None, max_depth=None):
         """
@@ -1508,7 +1580,7 @@ class WebCrawler:
             'urls_processed': self.stats.get('urls_processed', 0),
             'urls_queued': queue_stats.get('total', 0),
             'urls_failed': self.stats.get('urls_failed', 0),
-            'domains_discovered': self.stats.get('domains_discovered', set()),
+            'domains_discovered': len(self.stats.get('domains_discovered', set())),
             'avg_processing_time': avg_time,
             'elapsed_time': self.stats.get('elapsed_time', 0),
             'analyzed_urls': visited_stats.get('analyzed', 0),
@@ -1596,7 +1668,7 @@ class WebCrawler:
         self.logger.info(f"Restrict to start domain: {self.config.get('restrict_to_start_domain', False)}")
         
         # If there's a start domain and we're restricting to it, check against it
-        if self.config.get('restrict_to_start_domain', False) and hasattr(self, 'start_domain'):
+        if self.config.get('restrict_to_start_domain', False) and hasattr(self, 'start_domain') and self.start_domain:
             # Check for exact domain match
             exact_match = domain == self.start_domain
             
@@ -1793,9 +1865,9 @@ class WebCrawler:
         """
         with self.backlog_lock:
             # Get unanalyzed URLs to fill the backlog if needed
-            if len(self.backlog) < self.config.get('backlog_size'):
+            if len(self.backlog) < self.config.get('backlog_size', 100):
                 unanalyzed = self.get_unanalyzed_urls(
-                    limit=self.config.get('backlog_size') - len(self.backlog)
+                    limit=self.config.get('backlog_size', 100) - len(self.backlog)
                 )
                 
                 # Add to backlog
@@ -1834,10 +1906,10 @@ class WebCrawler:
             
             # Check backlog threshold
             backlog_size = len(self.backlog)
-            threshold = self.config.get('backlog_size') * self.config.get('backlog_threshold')
+            threshold = self.config.get('backlog_size', 100) * self.config.get('backlog_threshold', 0.5)
             
             if backlog_size <= threshold:
-                self.logger.info(f"Backlog below threshold ({backlog_size}/{self.config.get('backlog_size')}), triggering crawl")
+                self.logger.info(f"Backlog below threshold ({backlog_size}/{self.config.get('backlog_size', 100)}), triggering crawl")
                 # Trigger crawling more URLs in a separate thread
                 threading.Thread(target=self._fill_backlog).start()
             
@@ -1869,12 +1941,14 @@ class WebCrawler:
             Dict: Backlog statistics
         """
         with self.backlog_lock:
+            backlog_size = self.config.get('backlog_size', 100)
+            backlog_threshold = self.config.get('backlog_threshold', 0.5)
             return {
                 'backlog_size': len(self.backlog),
-                'backlog_capacity': self.config.get('backlog_size'),
-                'backlog_threshold': self.config.get('backlog_threshold'),
-                'backlog_threshold_count': int(self.config.get('backlog_size') * self.config.get('backlog_threshold')),
-                'backlog_usage': len(self.backlog) / self.config.get('backlog_size') if self.config.get('backlog_size') > 0 else 0
+                'backlog_capacity': backlog_size,
+                'backlog_threshold': backlog_threshold,
+                'backlog_threshold_count': int(backlog_size * backlog_threshold),
+                'backlog_usage': len(self.backlog) / backlog_size if backlog_size > 0 else 0
             }
     
     def update_config(self, new_config: Dict) -> None:
@@ -1911,107 +1985,13 @@ class WebCrawler:
                 return True
                 
         # Check if we've reached the max queued URLs limit
-        if self.config.get('max_queued_urls') is not None:
-            if self.stats['urls_queued'] >= self.config.get('max_queued_urls'):
-                self.logger.info(f"Reached max queued URLs limit of {self.config.get('max_queued_urls')}")
+        max_queued_urls = self.config.get('max_queued_urls')
+        if max_queued_urls is not None and max_queued_urls > 0:
+            if self.stats['urls_queued'] >= max_queued_urls:
+                self.logger.info(f"Reached max queued URLs limit of {max_queued_urls}")
                 return True
                 
         return False
-
-    def _process_url(self, url, depth):
-        """
-        Process a single URL: fetch content, extract links, and update database.
-        
-        Args:
-            url: URL to process
-            depth: Current depth in the crawl
-            
-        Returns:
-            bool: True if URL was processed successfully, False otherwise
-        """
-        try:
-            # Check if we've reached the max URLs limit
-            max_urls = self.config.get('max_urls')
-            if max_urls is not None and max_urls > 0 and self.stats['urls_processed'] >= max_urls:
-                self.logger.info(f"Skipping URL processing for {url} - reached max URLs limit of {max_urls}")
-                return False
-                
-            # Get robots.txt parser for this domain
-            parsed_url = urlparse(url)
-            domain = parsed_url.netloc
-            
-            # Mark URL as visited in database
-            if isinstance(self.visited_urls, VisitedUrlManager):
-                self.visited_urls.add(
-                    url=url,
-                    domain=domain,
-                    depth=depth,
-                    status_code=None,
-                    content_type=None,
-                    content_length=0
-                )
-            else:
-                self.visited_urls.add(url)
-            
-            # Fetch content
-            self.logger.info(f"Fetching content for URL: {url}")
-            response = self.content_extractor.fetch(url)
-            
-            if not response:
-                self.logger.warning(f"Failed to fetch content for URL: {url}")
-                self.stats['urls_failed'] += 1
-                return False
-                
-            status_code = response.get('status_code')
-            content_type = response.get('content_type', '')
-            content = response.get('content', '')
-            
-            # Ensure content is not None before trying to get its length
-            content_length = len(content) if content else 0
-            
-            # Record visit in database
-            if isinstance(self.visited_urls, VisitedUrlManager):
-                self.visited_urls.add(
-                    url=url,
-                    domain=domain,
-                    depth=depth,
-                    status_code=status_code,
-                    content_type=content_type,
-                    content_length=content_length
-                )
-            
-            # Extract links if this is HTML content
-            if content_type and 'text/html' in content_type.lower() and content:
-                self.logger.info(f"Extracting links from URL: {url}")
-                links = self.content_extractor.extract_links(content, url)
-                
-                # Ensure links is not None and filter out None values
-                if links is not None:
-                    # Filter out None values
-                    links = [link for link in links if link is not None]
-                    # Add links to queue
-                    for link_url in links:
-                        if not link_url:
-                            continue
-                            
-                        # Calculate priority for the URL using the UrlPriority class
-                        try:
-                            priority = self.url_priority.calculate_priority(
-                                url=link_url,
-                                depth=depth + 1,
-                                anchor_text='',
-                                source_url=url
-                            )
-                            self.logger.info(f"Calculated priority {priority} for URL: {link_url}")
-                            self.add_url(link_url, depth + 1, priority)
-                        except Exception as link_error:
-                            self.logger.warning(f"Error calculating priority for URL {link_url}: {str(link_error)}")
-            
-            return True
-        except Exception as e:
-            self.logger.error(f"Error processing URL {url}: {str(e)}")
-            self.stats['urls_failed'] += 1
-            return False
 
     def calculate_priority(self, url, depth=0, anchor_text=None, source_url=None):
         """
@@ -2061,20 +2041,6 @@ class WebCrawler:
         except Exception as e:
             self.logger.error(f"Error normalizing URL {url}: {str(e)}")
             return None
-
-class UrlQueueManager:
-    """
-    Manager for the URL queue in the database.
-    """
-    
-    def __init__(self, db: CrawlDatabase, logger=None):
-        """
-        Initialize the URL queue manager.
-        
-        Args:
-            db: Database manager instance
-            logger: Logger instance for logging activities
-        """
         self.db = db
         self.logger = logger or logging.getLogger(__name__)
         
@@ -2287,32 +2253,3 @@ class UrlQueueManager:
         except Exception as e:
             self.logger.error(f"Error getting URL queue stats: {str(e)}")
             return stats
-
-# Example usage
-if __name__ == "__main__":
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Create crawler
-    crawler = WebCrawler()
-    
-    # Define callbacks
-    def on_content_extracted(url, depth, title, content, metadata):
-        print(f"Processed: {url} (depth {depth}) - {title}")
-        
-    # Set callbacks
-    crawler.callbacks['on_content_extracted'] = on_content_extracted
-    
-    # Start crawling
-    crawler.crawl(start_url="https://example.com", max_urls=10)
-    
-    # Print stats
-    print("Crawl complete!")
-    stats = crawler.get_stats()
-    print(f"URLs processed: {stats['urls_processed']}")
-    print(f"URLs failed: {stats['urls_failed']}")
-    print(f"Domains visited: {stats['domains_discovered']}")
-    print(f"Duration: {stats['elapsed_time']:.2f} seconds")

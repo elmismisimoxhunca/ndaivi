@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"strconv"
@@ -12,122 +11,153 @@ import (
 	"time"
 )
 
+// Stats mirrors the structure from main.go
 type Stats struct {
-	TotalURLs      int    `json:"total_urls"`
+	TotalURLs       int    `json:"total_urls"`
 	AnalyzedURLs    int    `json:"analyzed_urls"`
 	UnanalyzedURLs  int    `json:"unanalyzed_urls"`
 	CrawlerStatus   string `json:"crawler_status"`
 	AnalyzerStatus  string `json:"analyzer_status"`
 	BatchSize       int    `json:"batch_size"`
 	LastUpdated     string `json:"last_updated"`
+	Progress        int    `json:"progress"`
+	TargetUrls      int    `json:"target_urls"`
+	CrawlerPid      int    `json:"crawler_pid"`
+	AnalyzerPid     int    `json:"analyzer_pid"`
 }
 
 func main() {
+	// Command line flags
 	statusFile := flag.String("status", "/var/ndaivimanuales/logs/ndaivi_status.json", "Path to status file")
-	pidFile := flag.String("pid", "/var/run/ndaivi.pid", "Path to PID file")
+	pidFile := flag.String("pid", "/var/ndaivimanuales/logs/ndaivi.pid", "Path to PID file")
 	jsonOutput := flag.Bool("json", false, "Output in JSON format")
 	verbose := flag.Bool("verbose", false, "Show verbose output")
+	logLines := flag.Int("log", 10, "Number of recent log lines to show")
 	flag.Parse()
 
-	// Check if status file exists
-	stats, err := readStats(*statusFile)
-	if err != nil {
-		fmt.Printf("Error reading status: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Check if NDAIVI process is running
+	// Check if daemon is running
 	pidRunning := false
-	var pid int
-	if pidBytes, err := ioutil.ReadFile(*pidFile); err == nil {
-		pid, err = strconv.Atoi(strings.TrimSpace(string(pidBytes)))
-		if err == nil {
-			// Check if process exists
-			cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "cmd=")
-			output, err := cmd.Output()
-			if err == nil && strings.Contains(string(output), "ndaivi") {
+	daemonPid := 0
+	crawlerPid := 0
+	analyzerPid := 0
+
+	// Try to read PID file
+	if pidData, err := os.ReadFile(*pidFile); err == nil {
+		daemonPid, _ = strconv.Atoi(strings.TrimSpace(string(pidData)))
+		if daemonPid > 0 {
+			// Check if process is running
+			cmd := exec.Command("ps", "-p", strconv.Itoa(daemonPid))
+			if err := cmd.Run(); err == nil {
 				pidRunning = true
 			}
 		}
 	}
 
-	// Format the last updated time
-	lastUpdated, _ := time.Parse(time.RFC3339, stats.LastUpdated)
-	updatedAgo := time.Since(lastUpdated).Round(time.Second)
+	// Read status file
+	var stats Stats
+	hasStats := false
+
+	if data, err := os.ReadFile(*statusFile); err == nil {
+		if json.Unmarshal(data, &stats) == nil {
+			hasStats = true
+			crawlerPid = stats.CrawlerPid
+			analyzerPid = stats.AnalyzerPid
+		}
+	}
+
+	// Last updated info
+	updatedAgo := "unknown"
+	if hasStats {
+		if lastUpdated, err := time.Parse(time.RFC3339, stats.LastUpdated); err == nil {
+			updatedAgo = fmt.Sprintf("%v ago", time.Since(lastUpdated).Round(time.Second))
+		}
+	}
 
 	// Output in JSON format if requested
 	if *jsonOutput {
 		result := map[string]interface{}{
-			"stats": stats,
-			"pid": pid,
-			"pid_running": pidRunning,
-			"updated_ago": updatedAgo.String(),
+			"running":      pidRunning,
+			"daemon_pid":   daemonPid,
+			"crawler_pid":  crawlerPid,
+			"analyzer_pid": analyzerPid,
+			"updated_ago":  updatedAgo,
 		}
+
+		if hasStats {
+			result["stats"] = stats
+		}
+
 		jsonData, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(jsonData))
 		return
 	}
 
-	// Output in human-readable format
-	fmt.Printf("NDAIVI Status\n")
-	fmt.Printf("=============\n")
-	
+	// Human readable output
+	fmt.Println("NDAIVI Status")
+	fmt.Println("=============")
+
 	if pidRunning {
-		fmt.Printf("Status: Running (PID: %d)\n", pid)
-	} else if pid > 0 {
-		fmt.Printf("Status: Not Running (Last PID: %d)\n", pid)
+		fmt.Printf("Status: Running (PID: %d)\n", daemonPid)
 	} else {
-		fmt.Printf("Status: Not Running\n")
+		fmt.Println("Status: Not running")
 	}
-	
-	fmt.Printf("Last Updated: %s (%s ago)\n", stats.LastUpdated, updatedAgo)
-	fmt.Printf("Crawler: %s, Analyzer: %s\n", stats.CrawlerStatus, stats.AnalyzerStatus)
-	fmt.Printf("URLs: %d total, %d analyzed, %d unanalyzed\n", 
-		stats.TotalURLs, stats.AnalyzedURLs, stats.UnanalyzedURLs)
-	fmt.Printf("Analyzer Batch: %d URLs\n", stats.BatchSize)
-	
-	if *verbose {
-		// Add more detailed information in verbose mode
-		fmt.Printf("\nDetailed Stats\n")
-		fmt.Printf("=============\n")
-		fmt.Printf("Progress: %.1f%%\n", getProgress(stats))
+
+	// Show stats if available
+	if hasStats {
+		fmt.Printf("Last Updated: %s (%s)\n", stats.LastUpdated, updatedAgo)
+		fmt.Printf("Crawler: %s, Analyzer: %s\n", stats.CrawlerStatus, stats.AnalyzerStatus)
+		progressPct := 0.0
 		
-		// Print crawler performance
+		// Calculate progress percentage
+		if stats.Progress > 0 {
+			progressPct = float64(stats.Progress)
+		} else if stats.TargetUrls > 0 && stats.TotalURLs > 0 {
+			progressPct = float64(stats.TotalURLs) / float64(stats.TargetUrls) * 100.0
+		} else if stats.TotalURLs > 0 {
+			progressPct = float64(stats.AnalyzedURLs) / float64(stats.TotalURLs) * 100.0
+		}
+		
+		fmt.Printf("Progress: %.1f%% (%d/%d URLs)\n", 
+			progressPct, stats.TotalURLs, stats.TargetUrls)
+		fmt.Printf("URLs: %d total, %d analyzed, %d unanalyzed\n", 
+			stats.TotalURLs, stats.AnalyzedURLs, stats.UnanalyzedURLs)
+	}
+
+	// Show process IDs if verbose
+	if *verbose {
+		fmt.Println("\nProcess Information")
+		fmt.Println("===================")
+		if crawlerPid > 0 {
+			fmt.Printf("Crawler PID: %d\n", crawlerPid)
+		}
+		if analyzerPid > 0 {
+			fmt.Printf("Analyzer PID: %d\n", analyzerPid)
+		}
+		
+		// Show process resources if running
 		if pidRunning {
-			// Get process CPU and memory usage
-			cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "%cpu,%mem")
+			cmd := exec.Command("ps", "-p", strconv.Itoa(daemonPid), "-o", "%cpu,%mem,vsz,rss,time")
 			output, err := cmd.Output()
 			if err == nil {
 				lines := strings.Split(string(output), "\n")
-				if len(lines) >= 2 {
-					fmt.Printf("Resource Usage: %s\n", strings.TrimSpace(lines[1]))
+				if len(lines) > 1 {
+					fmt.Println("\nResource Usage:")
+					fmt.Println(lines[0])
+					fmt.Println(lines[1])
 				}
 			}
 		}
+		
+		// Show recent logs if requested
+		if *logLines > 0 {
+			fmt.Println("\nRecent Logs:")
+			cmd := exec.Command("tail", "-n", strconv.Itoa(*logLines), "/var/ndaivimanuales/logs/ndaivi.log")
+			logOutput, err := cmd.Output()
+			if err == nil {
+				fmt.Println(string(logOutput))
+			} else {
+				fmt.Printf("Error reading logs: %v\n", err)
+			}
+		}
 	}
-}
-
-func readStats(path string) (Stats, error) {
-	var stats Stats
-
-	// Read the status file
-	data, err := ioutil.ReadFile(path)
-	if err != nil {
-		return stats, err
-	}
-
-	// Parse JSON
-	err = json.Unmarshal(data, &stats)
-	if err != nil {
-		return stats, err
-	}
-
-	return stats, nil
-}
-
-func getProgress(stats Stats) float64 {
-	if stats.TotalURLs == 0 {
-		return 0.0
-	}
-	return float64(stats.AnalyzedURLs) / float64(stats.TotalURLs) * 100.0
 }
