@@ -960,12 +960,13 @@ class VisitedUrlManager:
             self.logger.error(f"Error marking URL as analyzed: {str(e)}")
             return False
             
-    def get_unanalyzed_urls(self, limit: int = 10) -> list:
+    def get_unanalyzed_urls(self, limit: int = 10, priority_order: bool = True) -> list:
         """
         Get a list of URLs that have been visited but not analyzed.
         
         Args:
             limit: Maximum number of URLs to return
+            priority_order: If True, order URLs by priority (lower depth first, then by timestamp)
             
         Returns:
             list: List of URL dictionaries
@@ -973,10 +974,11 @@ class VisitedUrlManager:
         try:
             self.db.execute(
                 """
-                SELECT url, domain, status_code, content_type, content_length, crawled_at
+                -- Include URL length in priority calculation (shorter URLs get higher priority)
+                SELECT url, domain, depth, status_code, content_type, content_length, crawled_at
                 FROM pages
                 WHERE analyzed = 0
-                ORDER BY crawled_at
+                ORDER BY depth ASC, length(url) ASC, crawled_at ASC
                 LIMIT ?
                 """,
                 (limit,)
@@ -985,10 +987,11 @@ class VisitedUrlManager:
             
             urls = []
             for row in rows:
-                url, domain, status_code, content_type, content_length, crawled_at = row
+                url, domain, depth, status_code, content_type, content_length, crawled_at = row
                 urls.append({
                     'url': url,
                     'domain': domain,
+                    'depth': depth,
                     'status_code': status_code,
                     'content_type': content_type,
                     'content_length': content_length,
@@ -1150,17 +1153,18 @@ class DBManager:
         """
         return self.url_queue.mark_failed(url_id)
     
-    def get_unanalyzed_urls(self, limit: int = 10):
+    def get_unanalyzed_urls(self, limit: int = 10, priority_order: bool = True):
         """
         Get a list of URLs that have been visited but not analyzed.
         
         Args:
             limit: Maximum number of URLs to return
+            priority_order: If True, order URLs by priority (lower depth first, then by timestamp)
             
         Returns:
             list: List of URL dictionaries
         """
-        return self.visited_urls.get_unanalyzed_urls(limit)
+        return self.visited_urls.get_unanalyzed_urls(limit, priority_order)
     
     def mark_url_as_analyzed(self, url: str):
         """

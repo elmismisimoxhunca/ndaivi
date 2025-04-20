@@ -151,16 +151,16 @@ web_crawler:
   db_path: 'scraper/data/crawler.db'
   
   # Crawl mode
-  restrict_to_start_domain: true
+  restrict_to_start_domain: false
   single_domain_mode: true
   
   # Stats
   stats_update_interval: 10  # Update stats every 10 URLs
+  verbose_logging: false  # Set to true for detailed debug logs
   
-  # Backlog management
-  backlog_min_threshold: 128  # Request more URLs when backlog falls below this
-  backlog_target_size: 1024   # Fill backlog up to this many URLs
-  backlog_check_interval: 30  # Check backlog size every 30 seconds
+  # URL queue management
+  max_unanalyzed_urls: 1024   # Maximum number of non-analyzed URLs before slowing down crawler
+  crawl_speed_check_interval: 5   # Check non-analyzed URL count every 5 seconds
 
 # Redis configuration
 redis:
@@ -199,15 +199,20 @@ application:
     # Analyzer channels
     analyzer_commands: 'ndaivi:analyzer:commands'
     analyzer_status: 'ndaivi:analyzer:status'
-    analyzer_results: 'ndaivi:analyzer:results'  # Channel for analyzer to report completed URLs
     
-    # Backlog channels
-    backlog_status: 'ndaivi:backlog:status'      # Channel for backlog status updates
-    backlog_request: 'ndaivi:backlog:request'    # Channel for requesting more URLs
-    
-    # Container app channels
-    container_status: 'ndaivi:container:status'  # Channel for container app status updates
-    
-    # System-wide channels
-    stats: 'ndaivi:stats'                        # Channel for statistics
-    system: 'ndaivi:system'                      # Channel for system-wide messages
+    # Additional channels for container app
+    backlog_status: 'ndaivi:backlog:status'
+    backlog_request: 'ndaivi:backlog:request'
+    container_status: 'ndaivi:container:status'
+    analyzer_results: 'ndaivi:analyzer:results'
+    stats: 'ndaivi:stats'
+    system: 'ndaivi:system'
+
+# PostgreSQL database configuration
+database:
+  host: 'localhost'
+  port: 5432
+  user: 'postgres'
+  password: 'postgres'
+  dbname: 'ndaivi'
+  sslmode: 'disable'

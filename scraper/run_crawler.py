@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from scraper.web_crawler import WebCrawler
 from utils.config_manager import ConfigManager
+from scraper.db_manager import DBManager
 
 # Configure logging
 logging.basicConfig(
@@ -86,8 +87,12 @@ def run_crawler(
     if db_path and not os.path.isabs(db_path):
         crawler_config['db_path'] = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', db_path))
     
+    # Initialize the database
+    db_manager = DBManager(db_path=crawler_config.get('db_path'))
+    
     crawler = WebCrawler(
         config=crawler_config,
+        db=db_manager.db,
         stats_callback=stats_callback
     )
     

@@ -25,6 +25,7 @@ import threading
 import signal
 import heapq
 import requests
+import select
 from urllib.parse import urlparse, urljoin, ParseResult
 from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Optional, Any, Union, Set
@@ -777,7 +778,12 @@ class WebCrawler:
         # Initialize URL priority calculator
         self.url_priority = UrlPriority()
         
-        # Initialize statistics
+        # Initialize state variables
+        self.running = False
+        self.paused = False
+        self.request_delay_override = None  # Override for dynamic speed control
+        self.start_time = None
+        self.end_time = None
         self.stats = {
             'start_time': None,
             'end_time': None,
@@ -1248,76 +1254,114 @@ class WebCrawler:
         while attempts < max_attempts:
             attempts += 1
             
-            # Check in-memory queue first
-            if not self.url_queue.is_empty():
-                url_info = self.url_queue.pop()
-                if url_info:
-                    url = url_info[0]
-                    depth = url_info[1]
-                    metadata = url_info[2]
-                    
-                    # Skip if already visited
-                    if isinstance(self.visited_urls, VisitedUrlManager) and self.visited_urls.exists(url):
-                        self.logger.debug(f"Skipping already visited URL from in-memory queue: {url}")
-                        continue
-                        
-                    url_data = {'url': url, 'depth': depth, 'metadata': metadata}
-                    self.logger.debug(f"Got URL from in-memory queue: {url}")
-                    break
-            
-            # If in-memory queue is empty or all URLs are visited, get from database
+            # Get next URL from queue
             url_data = self.url_queue_manager.get_next() if self.url_queue_manager else None
             if not url_data:
                 self.logger.debug("URL queue is empty, no more URLs to process")
-                return None
-                
+                break
+            
             # Skip if already visited
             if isinstance(self.visited_urls, VisitedUrlManager) and self.visited_urls.exists(url_data['url']):
-                self.logger.debug(f"Skipping already visited URL from database queue: {url_data['url']}")
-                # Mark as complete in database to avoid processing again
-                if self.url_queue_manager:
-                    self.url_queue_manager.mark_complete(url_data['id'])
+                self.logger.debug(f"Skipping already visited URL: {url_data['url']}")
                 url_data = None
                 continue
-                
+            
             # Store URL ID for marking complete later
             url_id = url_data.get('id')
-            self.logger.debug(f"Got URL from database queue: {url_data['url']}")
+            self.logger.debug(f"Got URL from queue: {url_data['url']}")
             break
-            
+        
         # If we couldn't find a non-visited URL after max attempts
         if not url_data:
-            self.logger.info("No unvisited URLs found in queue after multiple attempts")
+            self.logger.debug("No unvisited URLs found in queue")
             return None
         
-        # Process URL
-        url = url_data['url']
-        depth = url_data['depth']
+        # Process the URL
+        try:
+            result = self.process_url(url_data['url'], url_data.get('depth', 0))
+            result['url_id'] = url_id
+            return result
+        except Exception as e:
+            self.logger.error(f"Error processing URL {url_data['url']}: {str(e)}")
+            return {'status': 'error', 'url_id': url_id, 'error': str(e)}
         
-        self.logger.info(f"Processing URL: {url} (depth: {depth})")
-        
-        # Apply delay if configured
-        if self.config.get('request_delay') > 0:
-            time.sleep(self.config.get('request_delay'))
-        
-        # Process URL
-        result = self.process_url(url, depth)
-        
-        # Update URL status in database if we got it from there
-        if url_id and result and result.get('status') == 'success':
-            if self.url_queue_manager:
-                self.url_queue_manager.mark_complete(url_id)
-            self.logger.debug(f"Marked URL as complete in database: {url}")
-        elif url_id and result and result.get('status') == 'error':
-            if self.url_queue_manager:
-                self.url_queue_manager.mark_failed(url_id)
-            self.logger.debug(f"Marked URL as failed in database: {url}")
-        
-        # Decrement the urls_queued counter since we've processed this URL
-        if self.stats['urls_queued'] > 0:
-            self.stats['urls_queued'] -= 1
-        
+    # If we couldn't find a non-visited URL after max attempts
+    if not url_data:
+        self.logger.debug("URL queue is empty, no more URLs to process")
+        return None
+
+    # Process the URL
+    try:
+        result = self.process_url(url_data['url'])
+        result['url_id'] = url_id
         return result
+    except Exception as e:
+        self.logger.error(f"Error processing URL {url_data['url']}: {str(e)}")
+        return {'status': 'error', 'url_id': url_id, 'error': str(e)}
+
+    def process_url(self, url: str) -> dict:
+        """
+        Process a single URL and return the result.
+        
+        Args:
+            url: URL to process
+            
+        Returns:
+            dict: Result of URL processing
+        """
+        try:
+            # Process the URL and return result
+            result = {'status': 'success', 'url': url}
+            return result
+        except Exception as e:
+            self.logger.error(f"Error processing URL {url}: {str(e)}")
+            return {'status': 'error', 'url': url, 'error': str(e)}
+
+    def handle_command(self, command: str) -> None:
+        """
+        Handle commands received from the coordinator.
+        
+        Args:
+            command: Command string to process
+        """
+        try:
+            if command.startswith('SPEED:'):
+                # Extract delay value from command
+                delay_str = command.split(':')[1].strip()
+                delay = float(delay_str)
+                
+                # Update request delay override
+                self.request_delay_override = delay
+                self.logger.info(f"Set request delay override to {delay} seconds")
+        except Exception as e:
+            self.logger.error(f"Error handling command '{command}': {str(e)}")
+
+    def check_stdin_commands(self) -> None:
+        """
+        Check stdin for any pending commands from the coordinator.
+        """
+        # Check if there's data available on stdin
+        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+            command = sys.stdin.readline().strip()
+            if command:
+                self.handle_command(command)
+                
+        except Exception as e:
+            self.logger.error(f"Error handling command '{command}': {str(e)}")
+    
+    def check_stdin_commands(self) -> None:
+        """
+        Check stdin for any pending commands from the coordinator.
+        """
+        # Check if there's data available on stdin
+        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+            try:
+                # Read line from stdin (non-blocking)
+                command = sys.stdin.readline().strip()
+                if command:
+                    self.handle_command(command)
+            except Exception as e:
+                self.logger.error(f"Error reading from stdin: {str(e)}")
     
     def crawl(self, start_url=None, max_urls=None, max_depth=None):
         """
@@ -1350,9 +1394,13 @@ class WebCrawler:
         
         # Process URLs until queue is empty or max URLs reached
         while True:
-            # Check if we've reached the max URLs limit
-            if self.config.get('max_urls') is not None and self.stats['urls_processed'] >= self.config.get('max_urls'):
-                self.logger.info(f"Reached max URLs limit of {self.config.get('max_urls')}")
+            # Check for commands from coordinator
+            self.check_stdin_commands()
+            
+            # Check if we've reached the max URLs limit (0 means unlimited)
+            max_urls = self.config.get('max_urls')
+            if max_urls is not None and max_urls > 0 and self.stats['urls_processed'] >= max_urls:
+                self.logger.info(f"Reached max URLs limit of {max_urls}")
                 break
                 
             # Process next URL
@@ -1520,17 +1568,17 @@ class WebCrawler:
     def _update_stats(self):
         """Update and store current stats."""
         stats = self.get_stats()
-        if self.stats_manager:
-            self.stats_manager.update(stats)
         if self.stats_callback:
             self.stats_callback(stats)
     
     def _should_stop(self):
         """Check if the crawler should stop."""
         # Check if we've reached the max URLs limit
-        if self.config.get('max_urls') is not None:
-            if self.stats['urls_processed'] >= self.config.get('max_urls'):
-                self.logger.info(f"Reached max URLs limit of {self.config.get('max_urls')}, stopping crawler")
+        # A max_urls of 0 means unlimited (never stop based on URL count)
+        max_urls = self.config.get('max_urls')
+        if max_urls is not None and max_urls > 0:
+            if self.stats['urls_processed'] >= max_urls:
+                self.logger.info(f"Reached max URLs limit of {max_urls}, stopping crawler")
                 return True
                 
         # This can be extended with more conditions
@@ -1861,10 +1909,11 @@ class WebCrawler:
             bool: True if the limit has been reached, False otherwise
         """
         # Check if we've reached the max URLs limit
-        if self.config.get('max_urls') is not None:
-            total_urls = self.stats['urls_processed'] + self.stats['urls_queued']
-            if total_urls >= self.config.get('max_urls'):
-                self.logger.info(f"Reached max URLs limit of {self.config.get('max_urls')}")
+        max_urls = self.config.get('max_urls')
+        if max_urls is not None and max_urls > 0:
+            total_urls = self.stats['urls_processed']
+            if total_urls >= max_urls:
+                self.logger.info(f"Reached max URLs limit of {max_urls}")
                 return True
                 
         # Check if we've reached the max queued URLs limit
@@ -1888,10 +1937,10 @@ class WebCrawler:
         """
         try:
             # Check if we've reached the max URLs limit
-            if self.config.get('max_urls') is not None:
-                if self.stats['urls_processed'] >= self.config.get('max_urls'):
-                    self.logger.info(f"Skipping URL processing for {url} - reached max URLs limit of {self.config.get('max_urls')}")
-                    return
+            max_urls = self.config.get('max_urls')
+            if max_urls is not None and max_urls > 0 and self.stats['urls_processed'] >= max_urls:
+                self.logger.info(f"Skipping URL processing for {url} - reached max URLs limit of {max_urls}")
+                return False
                 
             # Get robots.txt parser for this domain
             parsed_url = urlparse(url)
