@@ -18,3 +18,5 @@ database/__pycache__/schema.cpython-311.pyc
 scraper/__pycache__/__init__.cpython-311.pyc
 scraper/__pycache__/competitor_scraper.cpython-311.pyc
 scraper/__pycache__/claude_analyzer.cpython-311.pyc
+.env
+.windsurfrules

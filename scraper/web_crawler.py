@@ -34,8 +34,16 @@ import sys
 import traceback
 
 # Import the new modules
-from scraper.db_manager import CrawlDatabase, UrlQueueManager, DomainManager
-from scraper.stats_manager import StatsManager
+from db_manager import CrawlDatabase, UrlQueueManager, DomainManager
+try:
+    from stats_manager import StatsManager
+except ImportError:
+    # Create a simple StatsManager if not available
+    class StatsManager:
+        def __init__(self, *args, **kwargs):
+            pass
+        def record_event(self, *args, **kwargs):
+            pass
 
 # Add the parent directory to the path to import from utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1284,20 +1292,6 @@ class WebCrawler:
         except Exception as e:
             self.logger.error(f"Error processing URL {url_data['url']}: {str(e)}")
             return {'status': 'error', 'url_id': url_id, 'error': str(e)}
-        
-    # If we couldn't find a non-visited URL after max attempts
-    if not url_data:
-        self.logger.debug("URL queue is empty, no more URLs to process")
-        return None
-
-    # Process the URL
-    try:
-        result = self.process_url(url_data['url'])
-        result['url_id'] = url_id
-        return result
-    except Exception as e:
-        self.logger.error(f"Error processing URL {url_data['url']}: {str(e)}")
-        return {'status': 'error', 'url_id': url_id, 'error': str(e)}
 
     def process_url(self, url: str) -> dict:
         """
@@ -1341,13 +1335,13 @@ class WebCrawler:
         Check stdin for any pending commands from the coordinator.
         """
         # Check if there's data available on stdin
-        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-            command = sys.stdin.readline().strip()
-            if command:
-                self.handle_command(command)
-                
+        try:
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                command = sys.stdin.readline().strip()
+                if command:
+                    self.handle_command(command)
         except Exception as e:
-            self.logger.error(f"Error handling command '{command}': {str(e)}")
+            self.logger.error(f"Error handling command: {str(e)}")
     
     def check_stdin_commands(self) -> None:
         """
