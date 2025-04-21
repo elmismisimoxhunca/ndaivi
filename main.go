@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
-	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -21,50 +22,137 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Config holds all configuration data for the application
 type Config struct {
-	PostgresURL    string
-	SQLiteDBPath   string
-	MaxBatchSize   int
-	MaxUnanalyzedURLs int
-	SpeedCheckInterval int
-	TargetWebsite  string
-	MaxUrls        int
-	CrawlerScript  string
-	AnalyzerScript string
-	StatusFile     string
-	LogFile        string
-	PidFile        string
+	// Database configuration
+	PostgresURL    string `yaml:"PostgresURL"`
+	SQLiteDBPath   string `yaml:"SQLiteDBPath"`
+	
+	// System limits and settings
+	MaxBatchSize   int    `yaml:"MaxBatchSize"`
+	MaxConcurrentAnalysis int `yaml:"MaxConcurrentAnalysis"`
+	LinkCheckInterval int `yaml:"LinkCheckInterval"`
+	BatchInterval  int    `yaml:"BatchInterval"`
+	RetryInterval int     `yaml:"RetryInterval"`
+	
+	// Target website configuration
+	TargetWebsite  string `yaml:"TargetWebsite"`
+	MaxUrls        int    `yaml:"MaxUrls"`
+	
+	// Script paths
+	CrawlerScript  string `yaml:"CrawlerScript"`
+	AnalyzerScript string `yaml:"AnalyzerScript"`
+	
+	// System files
+	StatusFile     string `yaml:"StatusFile"`
+	PidFile        string `yaml:"PidFile"`
+	TempDir        string `yaml:"TempDir"`
+	
+	// Log files
+	MainLogFile    string `yaml:"MainLogFile"`
+	CrawlerLogFile string `yaml:"CrawlerLogFile"`
+	AnalyzerLogFile string `yaml:"AnalyzerLogFile"`
 }
 
+// Stats contains runtime statistics for the system
 type Stats struct {
+	// Link statistics
 	TotalURLs       int    `json:"total_urls"`
 	AnalyzedURLs    int    `json:"analyzed_urls"`
 	UnanalyzedURLs  int    `json:"unanalyzed_urls"`
+	
+	// Component status
 	CrawlerStatus   string `json:"crawler_status"`
 	AnalyzerStatus  string `json:"analyzer_status"`
 	BatchSize       int    `json:"batch_size"`
+	
+	// System information
 	LastUpdated     string `json:"last_updated"`
 	Progress        int    `json:"progress"`
 	TargetUrls      int    `json:"target_urls"`
 	CrawlerPid      int    `json:"crawler_pid"`
 	AnalyzerPid     int    `json:"analyzer_pid"`
+	
+	// Log files
+	CrawlerLogFile  string `json:"crawler_log_file"`
+	AnalyzerLogFile string `json:"analyzer_log_file"`
+	MainLogFile     string `json:"main_log_file"`
 }
 
+// LinkStatus represents the full link status tracking file
+type LinkStatus struct {
+	LastUpdated string `json:"last_updated"`
+	Links       []Link `json:"links"`
+}
+
+// Link represents a single URL with its analysis status
+type Link struct {
+	URL        string `json:"url"`
+	Priority   int    `json:"priority"`
+	Analyzed   bool   `json:"analyzed"`
+	Error      string `json:"error,omitempty"`
+	AddedAt    string `json:"added_at"`
+	AnalyzedAt string `json:"analyzed_at,omitempty"`
+}
+
+// NDAIVI is the main application structure
 type NDAIVI struct {
 	config         Config
-	pgDB          *sql.DB
-	sqliteDB      *sql.DB
-	crawlerCmd    *exec.Cmd
-	analyzerCmd   *exec.Cmd
-	analyzerBatch []string
-	stats         Stats
-	stopChan      chan struct{}
-	wg            sync.WaitGroup
-	mu            sync.Mutex
+	pgDB           *sql.DB
+	sqliteDB       *sql.DB
+	crawlerCmd     *exec.Cmd
+	analyzerCmd    *exec.Cmd
+	linkStatusPath string
+	linkStatus     *LinkStatus
+	stats          Stats
+	stopChan       chan struct{}
+	wg             sync.WaitGroup
+	mu             sync.Mutex
+	
+	// Loggers
+	mainLogger     *log.Logger
+	crawlerLogger  *log.Logger
+	analyzerLogger *log.Logger
 }
 
+// NewNDAIVI creates a new NDAIVI instance
 func NewNDAIVI(config Config) (*NDAIVI, error) {
+	// Create directory structure for logs
+	for _, dir := range []string{
+		filepath.Dir(config.MainLogFile),
+		filepath.Dir(config.CrawlerLogFile),
+		filepath.Dir(config.AnalyzerLogFile),
+		filepath.Dir(config.StatusFile),
+		filepath.Dir(config.PidFile),
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// Setup main logger
+	mainLogFile, err := os.OpenFile(config.MainLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open main log file: %w", err)
+	}
+	mainLogger := log.New(io.MultiWriter(os.Stdout, mainLogFile), "[MAIN] ", log.LstdFlags)
+	
+	// Setup crawler logger
+	crawlerLogFile, err := os.OpenFile(config.CrawlerLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open crawler log file: %w", err)
+	}
+	crawlerLogger := log.New(crawlerLogFile, "[CRAWLER] ", log.LstdFlags)
+	
+	// Setup analyzer logger
+	analyzerLogFile, err := os.OpenFile(config.AnalyzerLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open analyzer log file: %w", err)
+	}
+	analyzerLogger := log.New(analyzerLogFile, "[ANALYZER] ", log.LstdFlags)
+
 	// Connect to PostgreSQL database
+	mainLogger.Println("Connecting to PostgreSQL database...")
 	pgDB, err := sql.Open("postgres", config.PostgresURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to PostgreSQL: %w", err)
@@ -72,35 +160,95 @@ func NewNDAIVI(config Config) (*NDAIVI, error) {
 	
 	// Verify PostgreSQL connection
 	if err := pgDB.Ping(); err != nil {
-		log.Printf("Warning: PostgreSQL connection not verified: %v", err)
+		mainLogger.Printf("Warning: PostgreSQL connection not verified: %v", err)
+	} else {
+		mainLogger.Println("PostgreSQL connection verified")
 	}
 
-	// Check if SQLite database file exists
-	if _, err := os.Stat(config.SQLiteDBPath); os.IsNotExist(err) {
-		log.Printf("Warning: SQLite database file %s does not exist. Waiting for Python crawler to initialize it", config.SQLiteDBPath)
-	}
-
-	// Connect to SQLite database (don't initialize, that's the Python crawler's job)
-	sqliteDB, err := sql.Open("sqlite3", config.SQLiteDBPath)
+	// Connect to SQLite database (read-only, as per WindsurfRules)
+	mainLogger.Println("Connecting to SQLite database in read-only mode...")
+	sqliteDB, err := sql.Open("sqlite3", "file:"+config.SQLiteDBPath+"?mode=ro")
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to SQLite: %w", err)
 	}
+	
+	// Initialize runtime stats
+	stats := Stats{
+		CrawlerStatus:   "stopped",
+		AnalyzerStatus:  "stopped",
+		LastUpdated:     time.Now().Format(time.RFC3339),
+		TargetUrls:      config.MaxUrls,
+		CrawlerLogFile:  config.CrawlerLogFile,
+		AnalyzerLogFile: config.AnalyzerLogFile,
+		MainLogFile:     config.MainLogFile,
+	}
 
-	return &NDAIVI{
+	mainLogger.Println("NDAIVI instance created successfully")
+
+	// Set up link status path (default to data directory)
+	linkStatusPath := filepath.Join(filepath.Dir(config.SQLiteDBPath), "link_status.json")
+	
+	// Ensure the directory exists
+	if err := os.MkdirAll(filepath.Dir(linkStatusPath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create link status directory: %w", err)
+	}
+	
+	// Create NDAIVI instance
+	ndaivi := &NDAIVI{
 		config:         config,
-		pgDB:          pgDB,
-		sqliteDB:      sqliteDB,
-		analyzerBatch: make([]string, 0, config.MaxBatchSize),
-		stopChan:      make(chan struct{}),
-	}, nil
+		pgDB:           pgDB,
+		sqliteDB:       sqliteDB,
+		linkStatusPath: linkStatusPath,
+		linkStatus:     &LinkStatus{
+			LastUpdated: time.Now().Format(time.RFC3339),
+			Links:       []Link{},
+		},
+		stats:          stats,
+		stopChan:       make(chan struct{}),
+		mainLogger:     mainLogger,
+		crawlerLogger:  crawlerLogger,
+		analyzerLogger: analyzerLogger,
+	}
+	
+	// Load existing link status if available
+	if err := ndaivi.loadLinkStatus(); err != nil {
+		mainLogger.Printf("Warning: Failed to load link status: %v", err)
+	}
+	
+	return ndaivi, nil
 }
 
+// Start initializes and starts all components of the NDAIVI system
 func (n *NDAIVI) Start() error {
-	log.Println("Starting NDAIVI system...")
+	n.mainLogger.Println("Starting NDAIVI system...")
 
-	// Start crawler
+	// Start crawler first
+	n.mainLogger.Println("Starting web crawler to populate database...")
 	if err := n.startCrawler(); err != nil {
 		return fmt.Errorf("failed to start crawler: %w", err)
+	}
+
+	// Start monitoring routines
+	n.wg.Add(4)
+	go n.monitorLinks()          // Monitor for new links in SQLite
+	go n.processLinkBatches()    // Send batches to analyzer
+	go n.processAnalyzerOutput() // Process analyzer results
+	go n.updateStats()           // Update system statistics
+
+	// Wait for some data to be available before starting analyzer
+	n.mainLogger.Println("Waiting for crawler to populate database before starting analyzer...")
+	time.Sleep(10 * time.Second) // Give crawler time to populate some data
+
+	// Check if we have any data to analyze
+	hasData, err := n.checkForNewLinks()
+	if err != nil {
+		n.mainLogger.Printf("Warning: Error checking for crawled data: %v", err)
+	}
+
+	if !hasData {
+		n.mainLogger.Println("No data found in database yet. Will start analyzer anyway.")
+	} else {
+		n.mainLogger.Println("Found data in database. Starting analyzer...")
 	}
 
 	// Start analyzer
@@ -108,25 +256,72 @@ func (n *NDAIVI) Start() error {
 		return fmt.Errorf("failed to start analyzer: %w", err)
 	}
 
-	// Start monitoring routines
-	n.wg.Add(3)
-	go n.monitorCrawlerSpeed()
-	go n.monitorStats()
-	go n.processAnalyzerOutput()
-
 	return nil
 }
 
+// Stop gracefully shuts down all components of the NDAIVI system
 func (n *NDAIVI) Stop() {
-	log.Println("Stopping NDAIVI system...")
+	n.mainLogger.Println("Stopping NDAIVI system...")
 	close(n.stopChan)
 	
-	// Stop components
+	// Stop crawler process
 	if n.crawlerCmd != nil && n.crawlerCmd.Process != nil {
+		n.mainLogger.Println("Sending SIGTERM to crawler process...")
 		n.crawlerCmd.Process.Signal(syscall.SIGTERM)
+		
+		// Wait for process to terminate
+		go func() {
+			// Set a timeout for process termination
+			timeout := time.After(5 * time.Second)
+			done := make(chan error, 1)
+			
+			go func() {
+				done <- n.crawlerCmd.Wait()
+			}()
+			
+			select {
+			case <-timeout:
+				// Process didn't terminate in time, force kill
+				n.mainLogger.Println("Crawler process didn't terminate in time, killing...")
+				n.crawlerCmd.Process.Kill()
+			case err := <-done:
+				if err != nil {
+					n.mainLogger.Printf("Crawler process terminated with error: %v", err)
+				} else {
+					n.mainLogger.Println("Crawler process terminated successfully")
+				}
+			}
+		}()
 	}
+
+	// Stop analyzer process if running
 	if n.analyzerCmd != nil && n.analyzerCmd.Process != nil {
+		n.mainLogger.Println("Sending SIGTERM to analyzer process...")
 		n.analyzerCmd.Process.Signal(syscall.SIGTERM)
+		
+		// Wait for process to terminate
+		go func() {
+			// Set a timeout for process termination
+			timeout := time.After(5 * time.Second)
+			done := make(chan error, 1)
+			
+			go func() {
+				done <- n.analyzerCmd.Wait()
+			}()
+			
+			select {
+			case <-timeout:
+				// Process didn't terminate in time, force kill
+				n.mainLogger.Println("Analyzer process didn't terminate in time, killing...")
+				n.analyzerCmd.Process.Kill()
+			case err := <-done:
+				if err != nil {
+					n.mainLogger.Printf("Analyzer process terminated with error: %v", err)
+				} else {
+					n.mainLogger.Println("Analyzer process terminated successfully")
+				}
+			}
+		}()
 	}
 
 	// Wait for all goroutines to finish
@@ -140,568 +335,947 @@ func (n *NDAIVI) Stop() {
 		n.sqliteDB.Close()
 	}
 
+	// Kill any other child processes that might have been started
+	n.mainLogger.Println("Checking for any remaining child processes...")
+	findAndKillChildProcesses(os.Getpid())
+	
 	// Remove PID file if it exists and belongs to us
 	if n.config.PidFile != "" {
 		if data, err := os.ReadFile(n.config.PidFile); err == nil {
 			if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid == os.Getpid() {
 				os.Remove(n.config.PidFile)
+				n.mainLogger.Println("PID file removed")
 			}
 		}
 	}
 
-	log.Println("NDAIVI system stopped")
+	n.mainLogger.Println("NDAIVI system stopped")
 }
 
+// startCrawler starts the web crawler process
 func (n *NDAIVI) startCrawler() error {
+	n.mainLogger.Println("Starting web crawler...")
+
+	// Check if crawler script exists
+	n.mainLogger.Printf("Looking for crawler script at path: %s", n.config.CrawlerScript)
+	if _, err := os.Stat(n.config.CrawlerScript); os.IsNotExist(err) {
+		return fmt.Errorf("crawler script not found at %s", n.config.CrawlerScript)
+	}
+
 	// Pass target website and other config via environment variables
 	env := os.Environ()
 	env = append(env, fmt.Sprintf("NDAIVI_TARGET_WEBSITE=%s", n.config.TargetWebsite))
 	env = append(env, fmt.Sprintf("NDAIVI_MAX_URLS=%d", n.config.MaxUrls))
 	env = append(env, fmt.Sprintf("NDAIVI_DB_PATH=%s", n.config.SQLiteDBPath))
-	env = append(env, fmt.Sprintf("NDAIVI_LOG_FILE=%s", n.config.LogFile))
-	
-	// Create log directory if it doesn't exist
-	logDir := filepath.Dir(n.config.LogFile)
-	if err := os.MkdirAll(logDir, 0755); err != nil {
-		log.Printf("Warning: Failed to create log directory: %v", err)
+	env = append(env, fmt.Sprintf("NDAIVI_LOG_FILE=%s", n.config.CrawlerLogFile))
+
+	// Create command
+	n.mainLogger.Printf("Executing python3 %s", n.config.CrawlerScript)
+	cmd := exec.Command("python3", n.config.CrawlerScript)
+	cmd.Env = env
+
+	// Get pipes for stdout and stderr
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
-	
-	n.crawlerCmd = exec.Command("python3", n.config.CrawlerScript)
-	n.crawlerCmd.Env = env
-	n.crawlerCmd.Stdout = os.Stdout
-	n.crawlerCmd.Stderr = os.Stderr
-	
-	// Log the command we're about to run
-	log.Printf("Starting crawler: %s %s", "python3", n.config.CrawlerScript)
-	log.Printf("Environment: NDAIVI_TARGET_WEBSITE=%s, NDAIVI_MAX_URLS=%d", 
-		n.config.TargetWebsite, n.config.MaxUrls)
-	
-	if err := n.crawlerCmd.Start(); err != nil {
-		return err
-	}
-	
-	// Store the crawler PID for status reporting
-	if n.crawlerCmd.Process != nil {
-		n.stats.CrawlerPid = n.crawlerCmd.Process.Pid
-		n.stats.CrawlerStatus = "running"
-		n.updateStats() // Update status file immediately
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
-	// Monitor crawler process
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start crawler: %w", err)
+	}
+	
+	// Store command and update status
+	n.crawlerCmd = cmd
+	n.stats.CrawlerStatus = "running"
+	n.stats.CrawlerPid = cmd.Process.Pid
+
+	// Log crawler output in background
+	n.wg.Add(2)
+	go n.streamOutput(stdoutPipe, n.crawlerLogger, "STDOUT")
+	go n.streamOutput(stderrPipe, n.crawlerLogger, "STDERR")
+
+	// Monitor crawler process in background
 	go func() {
-		if err := n.crawlerCmd.Wait(); err != nil {
-			log.Printf("Crawler process exited with error: %v", err)
-			// Update status
-			n.stats.CrawlerStatus = "stopped"
-			n.updateStats()
-			// Attempt to restart crawler after brief delay
-			time.Sleep(5 * time.Second)
-			if err := n.startCrawler(); err != nil {
-				log.Printf("Failed to restart crawler: %v", err)
-			}
+		err := cmd.Wait()
+		n.mu.Lock()
+		n.stats.CrawlerStatus = "stopped"
+		n.stats.CrawlerPid = 0
+		n.mu.Unlock()
+		
+		if err != nil {
+			n.mainLogger.Printf("Crawler process exited with error: %v", err)
 		} else {
-			log.Printf("Crawler process exited normally")
-			n.stats.CrawlerStatus = "stopped"
-			n.updateStats()
+			n.mainLogger.Println("Crawler process exited successfully")
 		}
 	}()
 
+	n.mainLogger.Printf("Crawler started with PID %d", cmd.Process.Pid)
 	return nil
 }
 
+// startAnalyzer starts the analyzer process
 func (n *NDAIVI) startAnalyzer() error {
-	n.analyzerCmd = exec.Command("python3", n.config.AnalyzerScript)
-	n.analyzerCmd.Stdout = os.Stdout
-	n.analyzerCmd.Stderr = os.Stderr
+	n.mainLogger.Println("Starting analyzer...")
 
-	if err := n.analyzerCmd.Start(); err != nil {
-		return err
+	// Use the configured analyzer script from config.yaml
+	analyzerScript := n.config.AnalyzerScript
+	n.mainLogger.Printf("Using analyzer script from config: %s", analyzerScript)
+	
+	// Check if analyzer script exists and is executable
+	fileInfo, err := os.Stat(analyzerScript)
+	if os.IsNotExist(err) {
+		n.mainLogger.Printf("ERROR: Analyzer script not found at %s", analyzerScript)
+		return fmt.Errorf("analyzer script not found at %s", analyzerScript)
+	}
+	
+	// Log file permissions
+	n.mainLogger.Printf("Analyzer script permissions: %s", fileInfo.Mode().String())
+
+	// Pass configuration via environment variables
+	env := os.Environ()
+	env = append(env, fmt.Sprintf("NDAIVI_LOG_FILE=%s", n.config.AnalyzerLogFile))
+	env = append(env, fmt.Sprintf("NDAIVI_DB_PATH=%s", n.config.SQLiteDBPath))
+	
+	// Always include the project root in PYTHONPATH
+	env = append(env, "PYTHONPATH=/var/ndaivimanuales")
+
+	// Use the virtual environment python if it exists
+	venvPython := "/var/ndaivimanuales/venv/bin/python"
+	venvExists := false
+	
+	// Check if the virtual environment exists
+	if _, err := os.Stat(venvPython); !os.IsNotExist(err) {
+		venvExists = true
+		n.mainLogger.Printf("Found virtual environment Python at %s", venvPython)
+	} else {
+		// Fall back to system Python if venv doesn't exist
+		venvPython = "python3"
+		n.mainLogger.Printf("Virtual environment Python not found, using system Python: %s", venvPython)
+	}
+	
+	// Properly configure virtual environment
+	if venvExists {
+		env = append(env, fmt.Sprintf("VIRTUAL_ENV=%s", "/var/ndaivimanuales/venv"))
+		
+		// Add the venv bin directory to the front of PATH
+		venvPath := fmt.Sprintf("/var/ndaivimanuales/venv/bin:%s", os.Getenv("PATH"))
+		env = append(env, fmt.Sprintf("PATH=%s", venvPath))
+		
+		n.mainLogger.Printf("Virtual environment activated with PATH=%s", venvPath)
+	}
+	
+	// Run the analyzer script directly (not as a module)
+	n.mainLogger.Printf("Executing %s %s (cwd: /var/ndaivimanuales/scraper)", venvPython, analyzerScript)
+	cmd := exec.Command(venvPython, analyzerScript)
+	cmd.Dir = "/var/ndaivimanuales/scraper"
+	// Set command environment with our configuration variables
+	cmd.Env = env
+	
+	// Setup stdout and stderr pipes
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
+	// Start the command
+	n.mainLogger.Printf("Attempting to start analyzer command: %s %s", venvPython, analyzerScript)
+	if err := cmd.Start(); err != nil {
+		n.mainLogger.Printf("ERROR: Failed to start analyzer: %v", err)
+		return fmt.Errorf("failed to start analyzer: %w", err)
+	}
+	
+	// Store command and update status
+	n.analyzerCmd = cmd
+	n.stats.AnalyzerStatus = "running"
+	n.stats.AnalyzerPid = cmd.Process.Pid
+	n.mainLogger.Printf("Analyzer process started successfully with PID: %d", cmd.Process.Pid)
+
+	// Log both stdout and stderr in background
+	n.wg.Add(2)
+	go n.streamOutput(stdoutPipe, n.analyzerLogger, "STDOUT")
+	go n.streamOutput(stderrPipe, n.analyzerLogger, "STDERR")
+
+	// Monitor analyzer process in background
+	go func() {
+		err := cmd.Wait()
+		n.mu.Lock()
+		n.stats.AnalyzerStatus = "stopped"
+		n.stats.AnalyzerPid = 0
+		n.mu.Unlock()
+		
+		if err != nil {
+			n.mainLogger.Printf("Analyzer process exited with error: %v", err)
+		} else {
+			n.mainLogger.Println("Analyzer process exited successfully")
+		}
+	}()
+
+	n.mainLogger.Printf("Analyzer started with PID %d", cmd.Process.Pid)
 	return nil
 }
 
-func (n *NDAIVI) monitorCrawlerSpeed() {
+// streamOutput reads from a pipe and logs the output
+func (n *NDAIVI) streamOutput(pipe io.ReadCloser, logger *log.Logger, prefix string) {
 	defer n.wg.Done()
-	ticker := time.NewTicker(time.Duration(n.config.SpeedCheckInterval) * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-n.stopChan:
-			return
-		case <-ticker.C:
-			unanalyzed, err := n.getUnanalyzedURLCount()
-			if err != nil {
-				log.Printf("Error getting unanalyzed URL count: %v", err)
-				continue
-			}
-
-			threshold := n.config.MaxUnanalyzedURLs
-			if unanalyzed > threshold {
-				log.Printf("Unanalyzed URLs (%d) exceeds threshold (%d), slowing down crawler", unanalyzed, threshold)
-				n.setCrawlerSpeed("slow")
-			} else if unanalyzed < threshold*3/4 { // 75% of threshold
-				log.Printf("Unanalyzed URLs (%d) below threshold (%d), resuming normal crawler speed", unanalyzed, threshold*3/4)
-				n.setCrawlerSpeed("normal")
-			}
-		}
+	
+	// Create scanner to read line by line
+	scanner := bufio.NewScanner(pipe)
+	
+	// Read and log each line
+	for scanner.Scan() {
+		logger.Printf("%s: %s", prefix, scanner.Text())
+	}
+	
+	if err := scanner.Err(); err != nil {
+		logger.Printf("Error reading %s: %v", prefix, err)
 	}
 }
 
-func (n *NDAIVI) monitorStats() {
-	defer n.wg.Done()
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-n.stopChan:
-			return
-		case <-ticker.C:
-			n.updateStats()
-		}
-	}
-}
-
-func (n *NDAIVI) processAnalyzerOutput() {
-	defer n.wg.Done()
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-n.stopChan:
-			return
-		case <-ticker.C:
-			n.processBatch()
-		}
-	}
-}
-
-func (n *NDAIVI) setCrawlerSpeed(speed string) {
+// loadLinkStatus loads the link status from a JSON file
+func (n *NDAIVI) loadLinkStatus() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
-	if n.crawlerCmd == nil || n.crawlerCmd.Process == nil {
-		return
+	
+	n.mainLogger.Printf("Loading link status from %s", n.linkStatusPath)
+	
+	// Check if file exists, create if not
+	if _, err := os.Stat(n.linkStatusPath); os.IsNotExist(err) {
+		// Create new empty link status file
+		n.linkStatus = &LinkStatus{
+			LastUpdated: time.Now().Format(time.RFC3339),
+			Links:       []Link{},
+		}
+		return n.saveLinkStatus()
 	}
-
-	delay := "0"
-	if speed == "slow" {
-		delay = "2"
+	
+	// Read file
+	data, err := os.ReadFile(n.linkStatusPath)
+	if err != nil {
+		return fmt.Errorf("failed to read link status file: %w", err)
 	}
-
-	cmd := fmt.Sprintf("SPEED:%s\n", delay)
-	if stdin, err := n.crawlerCmd.StdinPipe(); err == nil {
-		stdin.Write([]byte(cmd))
+	
+	// Parse JSON
+	var linkStatus LinkStatus
+	if err := json.Unmarshal(data, &linkStatus); err != nil {
+		return fmt.Errorf("failed to parse link status file: %w", err)
 	}
+	
+	n.linkStatus = &linkStatus
+	n.mainLogger.Printf("Loaded %d links from status file", len(n.linkStatus.Links))
+	return nil
 }
 
-func (n *NDAIVI) getUnanalyzedURLCount() (int, error) {
-	var count int
-	
-	// Check if the table exists before querying
-	var tableName string
-	err := n.sqliteDB.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'").Scan(&tableName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// Table doesn't exist yet - Python hasn't initialized the DB
-			return 0, nil
-		}
-		return 0, err
-	}
-	
-	// Table exists, query for unanalyzed count
-	err = n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE analyzed = 0").Scan(&count)
-	if err != nil {
-		// Handle case where 'analyzed' column might not exist
-		if strings.Contains(err.Error(), "no such column") {
-			log.Printf("Warning: 'analyzed' column not found in pages table")
-			return 0, nil
-		}
-		return 0, err
-	}
-	
-	return count, nil
-}
-
-func (n *NDAIVI) updateStats() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
+// saveLinkStatus saves the link status to a JSON file
+func (n *NDAIVI) saveLinkStatus() error {
 	// Update timestamp
-	n.stats.LastUpdated = time.Now().Format(time.RFC3339)
+	n.linkStatus.LastUpdated = time.Now().Format(time.RFC3339)
+	
+	// Marshal to JSON
+	data, err := json.MarshalIndent(n.linkStatus, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal link status: %w", err)
+	}
+	
+	// Create backup of existing file if it exists
+	if _, err := os.Stat(n.linkStatusPath); err == nil {
+		backupPath := n.linkStatusPath + ".bak"
+		if err := os.Rename(n.linkStatusPath, backupPath); err != nil {
+			n.mainLogger.Printf("Warning: failed to create backup of link status file: %v", err)
+		}
+	}
+	
+	// Write to file
+	if err := os.WriteFile(n.linkStatusPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write link status file: %w", err)
+	}
+	
+	n.mainLogger.Printf("Saved %d links to status file", len(n.linkStatus.Links))
+	return nil
+}
 
-	// Get URL counts from SQLite database
-	if n.sqliteDB != nil {
-		// Check if the table exists before querying
-		var tableName string
-		err := n.sqliteDB.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'").Scan(&tableName)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				// Table doesn't exist yet
-				n.stats.TotalURLs = 0
-				n.stats.AnalyzedURLs = 0
-				n.stats.UnanalyzedURLs = 0
-			} else {
-				log.Printf("Error checking for pages table: %v", err)
-			}
-		} else {
-			// Table exists, get URL counts
-			n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages").Scan(&n.stats.TotalURLs)
-			
-			// Check if analyzed column exists
-			rows, err := n.sqliteDB.Query("PRAGMA table_info(pages)")
+// monitorLinks periodically checks for new links in the SQLite database
+func (n *NDAIVI) monitorLinks() {
+	defer n.wg.Done()
+	n.mainLogger.Println("Starting link monitoring...")
+	
+	// Check for new links immediately at startup
+	n.mainLogger.Println("Performing initial check for links in SQLite database...")
+	found, err := n.checkForNewLinks()
+	if err != nil {
+		n.mainLogger.Printf("Error checking for new links at startup: %v", err)
+	} else if found {
+		n.mainLogger.Println("Initial links found and added to link status file")
+	} else {
+		n.mainLogger.Println("No initial links found in database, will check again in 5 seconds")
+	}
+	
+	// Create a ticker for periodic checks - always use 5 seconds regardless of config
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.stopChan:
+			n.mainLogger.Println("Link monitoring stopped")
+			return
+		case <-ticker.C:
+			// Check for new links in SQLite (read-only mode)
+			found, err := n.checkForNewLinks()
 			if err != nil {
-				log.Printf("Error querying table schema: %v", err)
-			} else {
-				hasAnalyzedColumn := false
-				defer rows.Close()
-				
-				for rows.Next() {
-					var cid, notnull, pk int
-					var name, ctype, dfltValue string
-					if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
-						log.Printf("Error scanning column info: %v", err)
-						continue
-					}
-					if name == "analyzed" {
-						hasAnalyzedColumn = true
-						break
-					}
-				}
-				
-				if hasAnalyzedColumn {
-					n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE analyzed = 1").Scan(&n.stats.AnalyzedURLs)
-					n.sqliteDB.QueryRow("SELECT COUNT(*) FROM pages WHERE status_code = 200 AND analyzed = 0").Scan(&n.stats.UnanalyzedURLs)
-				} else {
-					// No analyzed column, assume all unanalyzed
-					n.stats.AnalyzedURLs = 0
-					n.stats.UnanalyzedURLs = n.stats.TotalURLs
-				}
+				n.mainLogger.Printf("Error checking for new links: %v", err)
+			} else if found {
+				n.mainLogger.Println("New links found and added to link status file")
 			}
 		}
-		
-		// Update progress percentage
-		n.stats.TargetUrls = n.config.MaxUrls
-		if n.stats.TargetUrls > 0 && n.stats.TotalURLs > 0 {
-			progressPercent := (n.stats.TotalURLs * 100) / n.stats.TargetUrls
-			if progressPercent > 100 {
-				progressPercent = 100
-			}
-			n.stats.Progress = progressPercent
-		} else {
-			n.stats.Progress = 0
-		}
-	} else {
-		log.Printf("Warning: SQLite database connection is nil")
 	}
+}
 
-	// Update process status and PIDs
-	if n.crawlerCmd != nil && n.crawlerCmd.Process != nil {
-		// Check if process exists
-		if err := n.crawlerCmd.Process.Signal(syscall.Signal(0)); err != nil {
-			log.Printf("Crawler process signal check failed: %v", err)
-			n.stats.CrawlerStatus = "stopped"
-		} else {
-			n.stats.CrawlerStatus = "running"
-		}
-		n.stats.CrawlerPid = n.crawlerCmd.Process.Pid
-	} else {
-		n.stats.CrawlerStatus = "stopped"
-		n.stats.CrawlerPid = 0
-	}
-
-	if n.analyzerCmd != nil && n.analyzerCmd.Process != nil {
-		// Check if process exists
-		if err := n.analyzerCmd.Process.Signal(syscall.Signal(0)); err != nil {
-			n.stats.AnalyzerStatus = "stopped"
-		} else {
-			n.stats.AnalyzerStatus = "running"
-		}
-		n.stats.AnalyzerPid = n.analyzerCmd.Process.Pid
-	} else {
-		n.stats.AnalyzerStatus = "stopped"
-		n.stats.AnalyzerPid = 0
-	}
-
-	n.stats.BatchSize = len(n.analyzerBatch)
-
-	// Write stats to file
-	statsJSON, _ := json.MarshalIndent(n.stats, "", "  ")
-	os.WriteFile(n.config.StatusFile, statsJSON, 0644)
-} else {
-		log.Printf("Warning: SQLite database connection is nil")
+// checkForNewLinks checks for new links in the SQLite database (read-only) and adds them to the link status
+// Returns true if links were found, false otherwise
+func (n *NDAIVI) checkForNewLinks() (bool, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	
+	n.mainLogger.Println("Checking for new links in SQLite database...")
+	
+	// Ensure we have the latest link status
+	if err := n.loadLinkStatus(); err != nil {
+		n.mainLogger.Printf("Error loading link status: %v", err)
+		return false, err
 	}
 	
-	// Update crawler status if not running
-	if n.crawlerCmd != nil && n.crawlerCmd.Process != nil {
-		// Check if process exists
-		if err := n.crawlerCmd.Process.Signal(syscall.Signal(0)); err != nil {
-			log.Printf("Crawler process signal check failed: %v", err)
-			n.stats.CrawlerStatus = "stopped"
-		} else {
-			n.stats.CrawlerStatus = "running"
-		}
-		n.stats.CrawlerPid = n.crawlerCmd.Process.Pid
-	} else {
-		n.stats.CrawlerStatus = "stopped"
-		n.stats.CrawlerPid = 0
+	// Check if SQLite connection is active
+	if n.sqliteDB == nil {
+		n.mainLogger.Println("SQLite database connection not available")
+		return false, fmt.Errorf("SQLite database connection not available")
 	}
 	
-	// Update analyzer status
-	if n.analyzerCmd != nil && n.analyzerCmd.Process != nil {
-		// Check if process exists
-		if err := n.analyzerCmd.Process.Signal(syscall.Signal(0)); err != nil {
-			n.stats.AnalyzerStatus = "stopped"
-		} else {
-			n.stats.AnalyzerStatus = "running"
-		}
-		n.stats.AnalyzerPid = n.analyzerCmd.Process.Pid
-	} else {
-		n.stats.AnalyzerStatus = "stopped"
-		n.stats.AnalyzerPid = 0
+	// Get existing URLs from link status
+	existingURLs := make(map[string]bool)
+	for _, link := range n.linkStatus.Links {
+		existingURLs[link.URL] = true
 	}
 	
-	// Update batch size
-	n.stats.BatchSize = len(n.analyzerBatch)
-	
-	// Write stats to file
-	if n.config.StatusFile != "" {
-		data, err := json.MarshalIndent(n.stats, "", "  ")
-	// Check if the table exists before updating
+	// Check if the pages table exists
 	var tableName string
 	err := n.sqliteDB.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='pages'").Scan(&tableName)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// Table doesn't exist yet, can't process batch
-			log.Printf("Warning: Cannot process batch, pages table doesn't exist yet")
-			return
+			n.mainLogger.Println("pages table doesn't exist yet in SQLite database")
+			return false, nil
 		}
-		log.Printf("Error checking for pages table: %v", err)
-		return
+		n.mainLogger.Printf("Error checking for pages table: %v", err)
+		return false, err
 	}
 
-	// Check if analyzed column exists
-	var hasAnalyzedColumn bool = false
-	rows, err := n.sqliteDB.Query("PRAGMA table_info(pages)")
+	// Query SQLite for new links
+	n.mainLogger.Println("Querying for new URLs from pages table")
+	
+	// Per WindsurfRule #3: No ANALYSED flag in SQLite. Link status is tracked in a separate JSON file.
+	// We need to get URLs from pages table that aren't in our link_status.json
+	rows, err := n.sqliteDB.Query(`
+		SELECT url, status_code 
+		FROM pages 
+		LIMIT ?`, n.config.MaxBatchSize)
 	if err != nil {
-		log.Printf("Error querying table schema: %v", err)
-		return
+		n.mainLogger.Printf("Error querying SQLite pages table: %v", err)
+		return false, fmt.Errorf("failed to query SQLite: %w", err)
 	}
 	defer rows.Close()
-	
+
+	// Process results and add new URLs to link status
+	newLinks := 0
 	for rows.Next() {
-		var cid, notnull, pk int
-		var name, ctype, dfltValue string
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err != nil {
-			log.Printf("Error scanning column info: %v", err)
-			return
+		var url string
+		var statusCode int
+		
+		if err := rows.Scan(&url, &statusCode); err != nil {
+			n.mainLogger.Printf("Error scanning row: %v", err)
+			continue
 		}
-		if name == "analyzed" {
-			hasAnalyzedColumn = true
+		
+		// Debug log
+		n.mainLogger.Printf("Found URL in database: %s (status: %d)", url, statusCode)
+		
+		// Skip if URL already exists in our tracking
+		if existingURLs[url] {
+			continue
+		}
+		
+		// Calculate a priority score based on URL (simple heuristic)
+		priority := 100
+		if strings.Contains(url, n.config.TargetWebsite) {
+			priority += 100 // Boost priority for main target website
+		}
+		
+		// Add new URL to link status file
+		n.linkStatus.Links = append(n.linkStatus.Links, Link{
+			URL:       url,
+			Priority:  priority,
+			Analyzed:  false,
+			AddedAt:   time.Now().Format(time.RFC3339),
+		})
+		
+		newLinks++
+	}
+	
+	if err := rows.Err(); err != nil {
+		n.mainLogger.Printf("Error iterating rows: %v", err)
+		return false, err
+	}
+
+	// Save link status if we added new links
+	if newLinks > 0 {
+		n.mainLogger.Printf("Added %d new links from SQLite database", newLinks)
+		if err := n.saveLinkStatus(); err != nil {
+			n.mainLogger.Printf("Error saving link status: %v", err)
+		}
+		
+		// Update stats
+		n.stats.TotalURLs += newLinks
+		n.stats.UnanalyzedURLs += newLinks
+		
+		// Return true to indicate that links were found
+		return true, nil
+	} else {
+		n.mainLogger.Println("No new links found in SQLite database")
+		
+		// Return false to indicate that no links were found
+		return false, nil
+	}
+}
+
+// prepareAnalyzerBatch selects a batch of links from the link status file for analysis
+func (n *NDAIVI) prepareAnalyzerBatch() ([]Link, error) {
+	// First ensure we have the latest link status
+	if err := n.loadLinkStatus(); err != nil {
+		return nil, fmt.Errorf("failed to load link status: %w", err)
+	}
+	
+	// Look for unanalyzed links
+	var batch []Link
+	for _, link := range n.linkStatus.Links {
+		if !link.Analyzed && link.Error == "" {
+			// Add to batch
+			batch = append(batch, link)
+			
+			// Stop when we reach the max batch size
+			if len(batch) >= n.config.MaxBatchSize {
+				break
+			}
+		}
+	}
+	
+	return batch, nil
+}
+
+// processAnalyzerOutput processes output from the analyzer
+func (n *NDAIVI) processAnalyzerOutput() {
+	defer n.wg.Done()
+	n.mainLogger.Println("Starting analyzer output processing...")
+	
+	// We'll wait for results via files created by the analyzer
+	// and process them in a loop
+	n.mainLogger.Println("Waiting for analysis results from the analyzer...")
+	
+	// Create a ticker to check the results directory periodically
+	resultsDir := filepath.Join(n.config.TempDir, "analyzer_results")
+	
+	// Ensure results directory exists
+	if err := os.MkdirAll(resultsDir, 0755); err != nil {
+		n.mainLogger.Printf("Error creating results directory: %v", err)
+		return
+	}
+	
+	// Create ticker for periodic checks
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-n.stopChan:
+			n.mainLogger.Println("Analyzer output processing stopped")
+			return
+		case <-ticker.C:
+			// List all result files
+			files, err := os.ReadDir(resultsDir)
+			if err != nil {
+				n.mainLogger.Printf("Error reading results directory: %v", err)
+				continue
+			}
+			
+			// Process each result file
+			for _, file := range files {
+				if !file.IsDir() && strings.HasPrefix(file.Name(), "result_") && strings.HasSuffix(file.Name(), ".json") {
+					filePath := filepath.Join(resultsDir, file.Name())
+					
+					// Read result file
+					data, err := os.ReadFile(filePath)
+					if err != nil {
+						n.mainLogger.Printf("Error reading result file %s: %v", file.Name(), err)
+						continue
+					}
+					
+					// Parse result
+					var result struct {
+						URL    string                 `json:"url"`
+						Status string                 `json:"status"`
+						Data   map[string]interface{} `json:"data,omitempty"`
+						Error  string                 `json:"error,omitempty"`
+					}
+					
+					if err := json.Unmarshal(data, &result); err != nil {
+						n.mainLogger.Printf("Error parsing result file %s: %v", file.Name(), err)
+						
+						// Move the file to an error directory so we don't keep trying to process it
+						errorsDir := filepath.Join(n.config.TempDir, "analyzer_errors")
+						if err := os.MkdirAll(errorsDir, 0755); err != nil {
+							n.mainLogger.Printf("Error creating errors directory: %v", err)
+							continue
+						}
+						
+						if err := os.Rename(filePath, filepath.Join(errorsDir, file.Name())); err != nil {
+							n.mainLogger.Printf("Error moving file to errors directory: %v", err)
+						}
+						continue
+					}
+					
+					// Log the result
+					n.analyzerLogger.Printf("Processing analysis result for %s: %s", result.URL, result.Status)
+					
+					// Update link status in JSON file (not SQLite, which is read-only for Go daemon)
+					if err := n.updateLinkStatus(result.URL, result.Status == "success", result.Error); err != nil {
+						n.mainLogger.Printf("Error updating link status: %v", err)
+						continue
+					}
+					
+					// If analysis was successful, push results to PostgreSQL
+					if result.Status == "success" && result.Data != nil {
+						if err := n.pushResultToPostgres(result.URL, result.Data); err != nil {
+							n.mainLogger.Printf("Error pushing result to PostgreSQL: %v", err)
+						} else {
+							n.mainLogger.Printf("Successfully pushed result to PostgreSQL for URL: %s", result.URL)
+						}
+					}
+					
+					// Update stats
+					n.mu.Lock()
+					n.stats.AnalyzedURLs++
+					n.stats.UnanalyzedURLs--
+					if n.stats.UnanalyzedURLs < 0 {
+						n.stats.UnanalyzedURLs = 0
+					}
+					n.mu.Unlock()
+					
+					// Delete the processed file
+					if err := os.Remove(filePath); err != nil {
+						n.mainLogger.Printf("Error removing processed file %s: %v", filePath, err)
+					}
+				}
+			}
+		}
+	}
+}
+
+// updateLinkStatus updates the link status file to mark a URL as analyzed
+func (n *NDAIVI) updateLinkStatus(url string, success bool, errorMsg string) error {
+	// Lock to prevent concurrent modification
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	
+	// Ensure we have the latest link status
+	if err := n.loadLinkStatus(); err != nil {
+		return fmt.Errorf("failed to load link status: %w", err)
+	}
+	
+	// Find the URL in the link status file
+	found := false
+	for i := range n.linkStatus.Links {
+		if n.linkStatus.Links[i].URL == url {
+			// Update the link status
+			n.linkStatus.Links[i].Analyzed = true
+			n.linkStatus.Links[i].AnalyzedAt = time.Now().Format(time.RFC3339)
+			
+			// Set error message if analysis failed
+			if !success {
+				n.linkStatus.Links[i].Error = errorMsg
+			}
+			
+			found = true
 			break
 		}
 	}
 	
-	if !hasAnalyzedColumn {
-		log.Printf("Warning: 'analyzed' column doesn't exist in pages table, adding it")
-		_, err := n.sqliteDB.Exec("ALTER TABLE pages ADD COLUMN analyzed INTEGER DEFAULT 0")
-		if err != nil {
-			log.Printf("Error adding analyzed column: %v", err)
-			return
-		}
+	// If URL not found, add it to the link status file
+	if !found {
+		n.mainLogger.Printf("Warning: URL %s not found in link status file", url)
+		
+		// Add the URL to the link status file anyway
+		n.linkStatus.Links = append(n.linkStatus.Links, Link{
+			URL:        url,
+			Priority:   0,
+			Analyzed:   true,
+			AddedAt:    time.Now().Format(time.RFC3339),
+			AnalyzedAt: time.Now().Format(time.RFC3339),
+			Error:      errorMsg,
+		})
 	}
-
-	// Begin transaction
-	tx, err := n.sqliteDB.Begin()
-	if err != nil {
-		log.Printf("Error starting transaction: %v", err)
-		return
-	}
-
-	// Update URLs in batch
-	stmt, err := tx.Prepare("UPDATE pages SET analyzed = 1 WHERE url = ?")
-	if err != nil {
-		tx.Rollback()
-		log.Printf("Error preparing statement: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	for _, url := range n.analyzerBatch {
-		if _, err := stmt.Exec(url); err != nil {
-			tx.Rollback()
-			log.Printf("Error updating URL %s: %v", url, err)
-			return
-		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(); err != nil {
-		log.Printf("Error committing transaction: %v", err)
-		return
-	}
-
-	// Clear batch
-	n.analyzerBatch = n.analyzerBatch[:0]
+	
+	// Save the link status file
+	return n.saveLinkStatus()
 }
 
-// readConfig reads the YAML configuration file
-func readConfig(configPath string) (Config, error) {
-	// Default configuration
-	config := Config{
-		PostgresURL:    "postgres://localhost:5432/ndaivi?sslmode=disable",
-		SQLiteDBPath:   "/var/ndaivimanuales/scraper/data/crawler.db",
-		MaxBatchSize:   32,
-		MaxUnanalyzedURLs: 1024,
-		SpeedCheckInterval: 5,
-		TargetWebsite:  "manualslib.com", // Default target website
-		MaxUrls:        1000, // Default max URLs
-		CrawlerScript: "/var/ndaivimanuales/scraper/web_crawler.py",
-		AnalyzerScript: "/var/ndaivimanuales/scraper/claude_analyzer.py", // Fixed analyzer path
-		StatusFile:    "/var/ndaivimanuales/logs/ndaivi_status.json",
-		LogFile:       "/var/ndaivimanuales/logs/ndaivi.log",
-		PidFile:       "/var/ndaivimanuales/logs/ndaivi.pid", // Changed to logs directory for permissions
+// pushResultToPostgres pushes the analysis result to PostgreSQL
+func (n *NDAIVI) pushResultToPostgres(url string, result map[string]interface{}) error {
+	// Check if PostgreSQL connection is active
+	if n.pgDB == nil {
+		return fmt.Errorf("PostgreSQL database connection not available")
 	}
+	
+	n.mainLogger.Printf("Pushing analysis result for %s to PostgreSQL", url)
+	
+	// Convert result to JSON for storage
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("failed to marshal result: %w", err)
+	}
+	
+	// Insert into PostgreSQL
+	_, err = n.pgDB.Exec(`
+		INSERT INTO analysis_results (url, result, analyzed_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (url) DO UPDATE 
+		SET result = $2, analyzed_at = $3`, 
+		url, resultJSON, time.Now())
+	
+	if err != nil {
+		return fmt.Errorf("failed to insert result into PostgreSQL: %w", err)
+	}
+	
+	return nil
+}
 
+// updateStats periodically updates the system statistics
+// processLinkBatches processes batches of links for analysis and sends them to the analyzer
+func (n *NDAIVI) processLinkBatches() {
+	defer n.wg.Done()
+	n.mainLogger.Println("Starting link batch processing...")
+	
+	// Create a ticker for periodic checks
+	ticker := time.NewTicker(time.Duration(n.config.BatchInterval) * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-n.stopChan:
+			n.mainLogger.Println("Link batch processing stopped")
+			return
+		case <-ticker.C:
+			// Process a batch of links
+			if err := n.processBatch(); err != nil {
+				n.mainLogger.Printf("Error processing batch: %v", err)
+			}
+		}
+	}
+}
+
+// processBatch processes a single batch of links
+func (n *NDAIVI) processBatch() error {
+	// Check if analyzer is running
+	if n.analyzerCmd == nil || n.analyzerCmd.Process == nil {
+		return fmt.Errorf("analyzer not running")
+	}
+	
+	// Prepare a batch of links for analysis
+	batch, err := n.prepareAnalyzerBatch()
+	if err != nil {
+		return fmt.Errorf("failed to prepare analyzer batch: %w", err)
+	}
+	
+	// Skip if batch is empty
+	if len(batch) == 0 {
+		n.mainLogger.Println("No links to analyze")
+		return nil
+	}
+	
+	n.mainLogger.Printf("Sending batch of %d links to analyzer", len(batch))
+	
+	// Extract URLs from batch
+	urls := make([]string, len(batch))
+	for i, link := range batch {
+		urls[i] = link.URL
+	}
+	
+	// Prepare JSON batch for analyzer
+	batchJSON, err := json.Marshal(urls)
+	if err != nil {
+		return fmt.Errorf("failed to marshal batch: %w", err)
+	}
+	
+	// Create a batch file in the analyzer watch directory
+	watchDir := filepath.Join(n.config.TempDir, "analyzer_watch")
+	if err := os.MkdirAll(watchDir, 0755); err != nil {
+		return fmt.Errorf("failed to create watch directory: %w", err)
+	}
+	
+	// Write batch file directly to watch directory
+	batchFile := filepath.Join(watchDir, fmt.Sprintf("batch_%d.json", time.Now().UnixNano()))
+	if err := os.WriteFile(batchFile, batchJSON, 0644); err != nil {
+		return fmt.Errorf("failed to write batch file: %w", err)
+	}
+	
+	n.mainLogger.Printf("Created batch file %s for analyzer", batchFile)
+	return nil
+}
+
+
+
+func (n *NDAIVI) updateStats() {
+	defer n.wg.Done()
+	n.mainLogger.Println("Starting stats monitoring...")
+
+	// Create a ticker for periodic updates
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.stopChan:
+			n.mainLogger.Println("Stats monitoring stopped")
+			return
+		case <-ticker.C:
+			// Update stats
+			n.mu.Lock()
+			
+			// Count links
+			if n.linkStatus != nil {
+				totalLinks := len(n.linkStatus.Links)
+				analyzedLinks := 0
+				for _, link := range n.linkStatus.Links {
+					if link.Analyzed {
+						analyzedLinks++
+					}
+				}
+				
+				n.stats.TotalURLs = totalLinks
+				n.stats.AnalyzedURLs = analyzedLinks
+				n.stats.UnanalyzedURLs = totalLinks - analyzedLinks
+			}
+			
+			// Update timestamp and calculate progress
+			n.stats.LastUpdated = time.Now().Format(time.RFC3339)
+			if n.stats.TargetUrls > 0 && n.stats.TotalURLs > 0 {
+				n.stats.Progress = (n.stats.AnalyzedURLs * 100) / n.stats.TargetUrls
+				if n.stats.Progress > 100 {
+					n.stats.Progress = 100
+				}
+			}
+			
+			// Check component status
+			if n.crawlerCmd != nil && n.crawlerCmd.Process != nil {
+				n.stats.CrawlerStatus = "running"
+				n.stats.CrawlerPid = n.crawlerCmd.Process.Pid
+			} else {
+				n.stats.CrawlerStatus = "stopped"
+				n.stats.CrawlerPid = 0
+			}
+			
+			if n.analyzerCmd != nil && n.analyzerCmd.Process != nil {
+				n.stats.AnalyzerStatus = "running"
+				n.stats.AnalyzerPid = n.analyzerCmd.Process.Pid
+			} else {
+				n.stats.AnalyzerStatus = "stopped"
+				n.stats.AnalyzerPid = 0
+			}
+			
+			// Save stats to file
+			data, err := json.MarshalIndent(n.stats, "", "  ")
+			if err != nil {
+				n.mainLogger.Printf("Error marshaling stats: %v", err)
+			} else {
+				if err := os.WriteFile(n.config.StatusFile, data, 0644); err != nil {
+					n.mainLogger.Printf("Error writing status file: %v", err)
+				}
+			}
+			
+			n.mu.Unlock()
+		}
+	}
+}
+
+// loadConfig loads the application configuration from a YAML file
+func loadConfig(configPath string) (Config, error) {
+	var config Config
+	
 	// Read config file
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		log.Printf("Warning: Could not read config file %s: %v. Using defaults.", configPath, err)
-		return config, nil
+		return config, fmt.Errorf("failed to read config file: %w", err)
 	}
-
+	
+	// Debug: Print raw YAML content
+	fmt.Printf("Raw config file content: %s\n", string(data))
+	
 	// Parse YAML
-	var yamlConfig map[string]interface{}
-	if err := yaml.Unmarshal(data, &yamlConfig); err != nil {
-		log.Printf("Warning: Could not parse config file %s: %v. Using defaults.", configPath, err)
-		return config, nil
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return config, fmt.Errorf("failed to parse config file: %w", err)
 	}
-
-	// Extract database configuration
-	if db, ok := yamlConfig["database"].(map[string]interface{}); ok {
-		host := getStringOrDefault(db, "host", "localhost")
-		port := getIntOrDefault(db, "port", 5432)
-		user := getStringOrDefault(db, "user", "postgres")
-		password := getStringOrDefault(db, "password", "postgres")
-		dbname := getStringOrDefault(db, "dbname", "ndaivi")
-		sslmode := getStringOrDefault(db, "sslmode", "disable")
-
-		config.PostgresURL = fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s", 
-			user, password, host, port, dbname, sslmode)
+	
+	// Debug: Print parsed config values
+	fmt.Printf("Loaded config values:\n")
+	fmt.Printf("CrawlerScript: '%s'\n", config.CrawlerScript)
+	fmt.Printf("AnalyzerScript: '%s'\n", config.AnalyzerScript)
+	
+	// Set default values if not specified
+	if config.MaxBatchSize <= 0 {
+		config.MaxBatchSize = 10
 	}
-
-	// Extract web crawler configuration
-	if wc, ok := yamlConfig["web_crawler"].(map[string]interface{}); ok {
-		config.SQLiteDBPath = getStringOrDefault(wc, "db_path", config.SQLiteDBPath)
-		config.MaxUnanalyzedURLs = getIntOrDefault(wc, "max_unanalyzed_urls", config.MaxUnanalyzedURLs)
-		config.SpeedCheckInterval = getIntOrDefault(wc, "crawl_speed_check_interval", config.SpeedCheckInterval)
-		config.TargetWebsite = getStringOrDefault(wc, "target_website", "")
-		config.MaxUrls = getIntOrDefault(wc, "max_urls", 1000) // Default to 1000 if not specified
+	
+	if config.MaxConcurrentAnalysis <= 0 {
+		config.MaxConcurrentAnalysis = 5
 	}
-
+	
+	if config.LinkCheckInterval <= 0 {
+		config.LinkCheckInterval = 30 // seconds
+	}
+	
+	if config.BatchInterval <= 0 {
+		config.BatchInterval = 10 // seconds
+	}
+	
+	if config.RetryInterval <= 0 {
+		config.RetryInterval = 60 // seconds
+	}
+	
+	if config.TempDir == "" {
+		config.TempDir = "/tmp/ndaivi"
+	}
+	
+	// Ensure log files are set
+	if config.MainLogFile == "" {
+		config.MainLogFile = "logs/main.log"
+	}
+	
+	if config.CrawlerLogFile == "" {
+		config.CrawlerLogFile = "logs/crawler.log"
+	}
+	
+	if config.AnalyzerLogFile == "" {
+		config.AnalyzerLogFile = "logs/analyzer.log"
+	}
+	
+	// Ensure status and pid files are set
+	if config.StatusFile == "" {
+		config.StatusFile = "status.json"
+	}
+	
+	if config.PidFile == "" {
+		config.PidFile = "ndaivi.pid"
+	}
+	
 	return config, nil
 }
 
-// Helper functions for config parsing
-func getStringOrDefault(m map[string]interface{}, key, defaultValue string) string {
-	if val, ok := m[key].(string); ok {
-		return val
-	}
-	return defaultValue
-}
-
-func getIntOrDefault(m map[string]interface{}, key string, defaultValue int) int {
-	switch v := m[key].(type) {
-	case int:
-		return v
-	case float64:
-		return int(v)
-	default:
-		return defaultValue
-	}
-}
-
+// main is the entry point for the NDAIVI application
 func main() {
+	// Define config file path with absolute path
+	configPath := "/var/ndaivimanuales/config.yaml"
+	
 	// Parse command line arguments
-	configPath := flag.String("config", "/var/ndaivimanuales/config.yaml", "Path to config file")
-	daemonize := flag.Bool("daemon", false, "Run as daemon")
-	startDaemon := flag.Bool("start-daemon", false, "Start in daemon mode") // Added for direct daemon start
-	flag.Parse()
-	
-	// If start-daemon is provided, set daemonize to true
-	if *startDaemon {
-		*daemonize = true
+	if len(os.Args) < 2 {
+		printUsage()
+		os.Exit(1)
 	}
 
-	// Read configuration
-	config, err := readConfig(*configPath)
+	// Handle daemon commands
+	switch os.Args[1] {
+	case "start":
+		// Start the daemon
+		if err := RunAsDaemon(Start, configPath); err != nil {
+			fmt.Printf("Error starting daemon: %v\n", err)
+			os.Exit(1)
+		}
+	
+	case "stop":
+		// Stop the daemon
+		if err := RunAsDaemon(Stop, configPath); err != nil {
+			fmt.Printf("Error stopping daemon: %v\n", err)
+			os.Exit(1)
+		}
+	
+	case "status":
+		// Check daemon status
+		if err := RunAsDaemon(Status, configPath); err != nil {
+			fmt.Printf("Error checking daemon status: %v\n", err)
+			os.Exit(1)
+		}
+	
+	case "run":
+		// Run in foreground (called by daemon)
+		runNDAIVI(configPath)
+	
+	default:
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+// printUsage prints the usage information
+func printUsage() {
+	fmt.Println("Usage: ndaivi [command]")
+	fmt.Println("Commands:")
+	fmt.Println("  start   - Start the NDAIVI daemon")
+	fmt.Println("  stop    - Stop the NDAIVI daemon")
+	fmt.Println("  status  - Check the status of the NDAIVI daemon")
+	fmt.Println("  run     - Run NDAIVI in foreground (for internal use)")
+}
+
+// runNDAIVI runs the NDAIVI system in the foreground
+func runNDAIVI(configPath string) {
+	// Make sure we're using the absolute path to the config file
+	if !filepath.IsAbs(configPath) {
+		configPath = filepath.Join("/var/ndaivimanuales", configPath)
+	}
+	
+	// Load configuration from YAML file
+	config, err := loadConfig(configPath)
 	if err != nil {
-		log.Fatalf("Failed to read configuration: %v", err)
-	}
-
-	// If running as daemon, redirect output to log file
-	if *daemonize {
-		// Create log directory if it doesn't exist
-		logDir := filepath.Dir(config.LogFile)
-		if err := os.MkdirAll(logDir, 0755); err != nil {
-			log.Fatalf("Failed to create log directory: %v", err)
-		}
-
-		// Open log file
-		logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.Fatalf("Failed to open log file: %v", err)
-		}
-		log.SetOutput(logFile)
-		stdout, err := logFile.Stat()
-		if err == nil {
-			os.Stdout = os.NewFile(logFile.Fd(), stdout.Name())
-			os.Stderr = os.NewFile(logFile.Fd(), stdout.Name())
-		}
-		
-		// Detach from terminal if not already a daemon (ppid != 1)
-		// and not explicitly started with --start-daemon
-		if os.Getppid() != 1 && !*startDaemon {
-			// Re-run the same command as background process with nohup
-			cmd := exec.Command("nohup", os.Args[0], "--start-daemon", "--config", *configPath)
-			cmd.Start()
-			fmt.Printf("NDAIVI daemon started with PID %d\n", cmd.Process.Pid)
-			os.Exit(0)
-		}
-		
-		// We're now running as a daemon, create PID file
-		pid := os.Getpid()
-		log.Printf("Writing PID %d to %s", pid, config.PidFile)
-		if err := os.WriteFile(config.PidFile, []byte(fmt.Sprintf("%d", pid)), 0644); err != nil {
-			log.Printf("Warning: Failed to write PID file: %v", err)
-		}
+		fmt.Printf("Error loading configuration: %v\n", err)
+		os.Exit(1)
 	}
 	
-	// Configure status file
-	statusDir := filepath.Dir(config.StatusFile)
-	if err := os.MkdirAll(statusDir, 0755); err != nil {
-		log.Fatalf("Failed to create status directory: %v", err)
-	}
-
-	// Create NDAIVI instance
+	// Initialize NDAIVI instance
 	ndaivi, err := NewNDAIVI(config)
 	if err != nil {
-		log.Fatalf("Failed to create NDAIVI instance: %v", err)
+		fmt.Printf("Error initializing NDAIVI: %v\n", err)
+		os.Exit(1)
 	}
-
-	// Handle signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-
-	// Start system
+	
+	// Start the system
 	if err := ndaivi.Start(); err != nil {
-		log.Fatalf("Failed to start NDAIVI: %v", err)
+		fmt.Printf("Error starting NDAIVI: %v\n", err)
+		os.Exit(1)
 	}
-
-	// Wait for signal
-	<-sigChan
+	
+	// Setup signal handling for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	
+	// Wait for termination signal
+	ndaivi.mainLogger.Println("NDAIVI system running in daemon mode")
+	<-sigCh
+	
+	// Gracefully stop all components
+	ndaivi.mainLogger.Println("Received termination signal. Shutting down...")
 	ndaivi.Stop()
+	ndaivi.mainLogger.Println("NDAIVI system stopped.")
 }

@@ -32,9 +32,9 @@ function start() {
     export NDAIVI_LOG_FILE="$LOG_FILE"
     export NDAIVI_DB_PATH="$SCRIPT_DIR/scraper/data/crawler.db"
     
-    # Start daemon with nohup to keep running after terminal closes
+    # Start daemon using the new daemon implementation
     cd "$SCRIPT_DIR"
-    nohup ./ndaivi --start-daemon --config "$CONFIG_FILE" > /dev/null 2>&1 &
+    ./main start
     
     # Wait for PID file to be created
     echo "Waiting for daemon to initialize..."
@@ -70,45 +70,19 @@ function stop() {
         return 0
     fi
     
-    # Send SIGTERM to the process
-    kill -15 "$PID"
-    
-    # Wait for process to terminate
-    for i in {1..10}; do
-        if ! ps -p "$PID" > /dev/null; then
-            echo "NDAIVI daemon stopped"
-            rm -f "$PID_FILE"
-            return 0
-        fi
-        sleep 1
-    done
-    
-    # Force kill if still running
-    echo "NDAIVI daemon did not stop gracefully, forcing termination"
-    kill -9 "$PID"
-    rm -f "$PID_FILE"
+    # Use the new daemon stop command
+    cd "$SCRIPT_DIR"
+    ./main stop
     return 0
 }
 
 function status() {
-    # Use the status tool to display current status
-    if [ -f "$SCRIPT_DIR/ndaivi-status" ]; then
-        "$SCRIPT_DIR/ndaivi-status" --verbose --log 20
-    else
-        echo "NDAIVI Status Tool"
-        echo "==============="
-        
-        # Check if PID file exists and process is running
-        if [ -f "$PID_FILE" ]; then
-            PID=$(cat "$PID_FILE")
-            if ps -p "$PID" > /dev/null; then
-                echo "Status: Running (PID: $PID)"
-            else
-                echo "Status: Not running (stale PID file)"
-            fi
-        else
-            echo "Status: Not running"
-        fi
+    # Use the new daemon status command
+    cd "$SCRIPT_DIR"
+    ./main status
+    
+    echo "NDAIVI Status Tool"
+    echo "==============="
         
         # Show stats file if it exists
         if [ -f "$STATUS_FILE" ]; then

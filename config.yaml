@@ -1,44 +1,60 @@
 # NDAIVI Configuration
 
-# Language configuration
-languages:
-  # English is always the default source language
-  source: "en"
-  
-  # Target languages to translate into
-  # Format: "language_code": "language_name"
-  targets:
-    "es": "Spanish"
-    # Add or remove languages as needed
-    # Use ISO 639-1 two-letter language codes
-  
-  # Number of categories to translate in one batch
-  translation_batch_size: 50
+# Database configuration
+PostgresURL: "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+SQLiteDBPath: "/var/ndaivimanuales/data/crawler.db"
 
-# Translation configuration
+# System limits and settings
+MaxBatchSize: 10
+MaxConcurrentAnalysis: 5
+LinkCheckInterval: 30
+BatchInterval: 10
+RetryInterval: 60
+
+# Target website configuration
+TargetWebsite: "https://manualslib.com"
+MaxUrls: 100000
+
+# Script paths
+CrawlerScript: "/var/ndaivimanuales/scraper/web_crawler.py"
+AnalyzerScript: "/var/ndaivimanuales/scraper/run_analyzer.py"
+
+# System files
+StatusFile: "/var/ndaivimanuales/data/status.json"
+PidFile: "/var/ndaivimanuales/data/ndaivi.pid"
+TempDir: "/var/ndaivimanuales/tmp"
+
+# Log files
+MainLogFile: "/var/ndaivimanuales/logs/main.log"
+CrawlerLogFile: "/var/ndaivimanuales/logs/crawler.log"
+AnalyzerLogFile: "/var/ndaivimanuales/logs/analyzer.log"
+
+# Translation settings
 translation:
   enabled: true
   default_source_lang: "en"
   default_target_lang: "es"
-  batch_size: 50
   cache_enabled: true
-  cache_ttl: 86400  # 24 hours
+  batch_size: 50
 
-# Claude analyzer configuration
-claude_analyzer:
-  api_key: "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"
-  api_base_url: "https://api.anthropic.com/v1/messages"
-  claude_model: "claude-3-5-haiku-20241022"
-  enable_cache: true
-  cache_ttl: 86400
-  cache_dir: ".cache"
-  max_tokens: 4000
-  temperature: 0.0
-  min_confidence_threshold: 0.7
+# Target languages for translation
+languages:
+  targets:
+    es: "Spanish"
+
+
+# Claude analyzer settings
+ClaudeAnalyzer:
+  EnableCache: true
+  CacheTTL: 86400
+  CacheDir: ".cache"
+  MaxTokens: 4000
+  Temperature: 0.0
+  MinConfidenceThreshold: 0.7
 
 # Keywords for filtering
-keywords:
-  positive:
+Keywords:
+  Positive:
     - "manufacturer"
     - "brand"
     - "companies"
@@ -46,7 +62,7 @@ keywords:
     - "category"
     - "catalog"
     - "brands"
-  negative:
+  Negative:
     - "cart"
     - "checkout"
     - "login"
@@ -122,7 +138,7 @@ prompt_templates:
 # Web crawler configuration
 web_crawler:
   # Target website - used as the default start URL if none is specified
-  target_website: "manualslib.com"
+  target_website: "https://manualslib.com"
   
   # Crawler behavior
   max_depth: 3

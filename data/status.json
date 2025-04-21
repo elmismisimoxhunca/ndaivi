@@ -1,0 +1,16 @@
+{
+  "total_urls": 0,
+  "analyzed_urls": 0,
+  "unanalyzed_urls": 0,
+  "crawler_status": "running",
+  "analyzer_status": "stopped",
+  "batch_size": 0,
+  "last_updated": "2025-04-20T21:08:40-04:00",
+  "progress": 0,
+  "target_urls": 100000,
+  "crawler_pid": 49080,
+  "analyzer_pid": 0,
+  "crawler_log_file": "/var/ndaivimanuales/logs/crawler.log",
+  "analyzer_log_file": "/var/ndaivimanuales/logs/analyzer.log",
+  "main_log_file": "/var/ndaivimanuales/logs/main.log"
+}

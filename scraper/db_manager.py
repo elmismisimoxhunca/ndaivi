@@ -100,7 +100,7 @@ class CrawlDatabase:
         """
         self.logger.info("Creating database tables if they don't exist")
         
-        # Create url_queue table
+        # Create url_queue table - only essential fields: URL, priority, depth, visited status
         self.execute("""
         CREATE TABLE IF NOT EXISTS url_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,80 +108,34 @@ class CrawlDatabase:
             domain TEXT,
             depth INTEGER,
             priority REAL,
-            status TEXT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            source_url TEXT,
-            anchor_text TEXT,
-            metadata TEXT
+            visited INTEGER DEFAULT 0,  -- 0 = not visited, 1 = visited
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
         
-        # Create domains table
+        # Create domains table - only for robots.txt info
         self.execute("""
         CREATE TABLE IF NOT EXISTS domains (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            domain TEXT UNIQUE,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            robots_txt TEXT,
-            crawl_delay REAL,
-            robots_checked INTEGER DEFAULT 0
+            domain TEXT PRIMARY KEY,
+            robots_txt TEXT
         )
         """)
         
-        # Create pages table
-        self.execute("""
-        CREATE TABLE IF NOT EXISTS pages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE,
-            domain TEXT,
-            depth INTEGER DEFAULT 0,
-            title TEXT,
-            content_type TEXT,
-            status_code INTEGER,
-            content_hash TEXT,
-            content_length INTEGER DEFAULT 0,
-            content TEXT,
-            headers TEXT,
-            crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_modified TIMESTAMP,
-            analyzed INTEGER DEFAULT 0
-        )
-        """)
-        
-        # Create links table
-        self.execute("""
-        CREATE TABLE IF NOT EXISTS links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_url TEXT,
-            target_url TEXT,
-            anchor_text TEXT,
-            rel TEXT,
-            discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(source_url, target_url)
-        )
-        """)
-        
-        # Create crawl_stats table
+        # Create crawl_stats table - minimal statistics
         self.execute("""
         CREATE TABLE IF NOT EXISTS crawl_stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             end_time TIMESTAMP,
             urls_crawled INTEGER DEFAULT 0,
-            urls_queued INTEGER DEFAULT 0,
-            urls_failed INTEGER DEFAULT 0,
-            bytes_downloaded INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'running',
-            config TEXT
+            urls_queued INTEGER DEFAULT 0
         )
         """)
         
-        # Create indexes
-        self.execute("CREATE INDEX IF NOT EXISTS idx_url_queue_status ON url_queue(status)")
+        # Create indexes for performance
+        self.execute("CREATE INDEX IF NOT EXISTS idx_url_queue_visited ON url_queue(visited)")
+        self.execute("CREATE INDEX IF NOT EXISTS idx_url_queue_priority ON url_queue(priority DESC)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_url_queue_domain ON url_queue(domain)")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_pages_domain ON pages(domain)")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_url)")
-        self.execute("CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_url)")
         
     @property
     def conn(self):
@@ -339,8 +293,7 @@ class UrlQueueManager:
         self.db = db
         self.logger = logger or logging.getLogger(__name__)
         
-    def add(self, url: str, domain: str, depth: int = 0, priority: float = 0.0, 
-            source_url: str = None, anchor_text: str = None, metadata: str = None) -> bool:
+    def add(self, url: str, domain: str, depth: int = 0, priority: float = 0.0) -> bool:
         """
         Add a URL to the queue.
         
@@ -349,31 +302,39 @@ class UrlQueueManager:
             domain: Domain of the URL
             depth: Depth of the URL in the crawl tree
             priority: Priority of the URL
-            source_url: URL of the page containing the link
-            anchor_text: Text of the anchor linking to this URL
-            metadata: Additional metadata about the URL
             
         Returns:
             bool: True if URL was added, False if it was already in the queue
         """
         try:
-            self.db.execute(
-                """
-                INSERT INTO url_queue (url, domain, depth, priority, status, source_url, anchor_text, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (url, domain, depth, priority, 'pending', source_url, anchor_text, metadata)
-            )
-            self.logger.debug(f"Added URL to queue: {url}")
+            # Skip URLs that are too deep
+            max_depth = 3  # Default max depth
+            if depth > max_depth:
+                self.logger.debug(f"Skipping URL {url} - exceeds maximum depth of {max_depth}")
+                return False
+                
+            # Categorize URL by domain and file type
+            parsed_url = urlparse(url)
+            path = parsed_url.path.lower()
+            
+            # Skip certain file types that aren't useful for analysis
+            skip_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.ico', '.svg', '.woff', '.ttf', '.eot']
+            if any(path.endswith(ext) for ext in skip_extensions):
+                self.logger.debug(f"Skipping URL {url} - file type not relevant for analysis")
+                return False
+            
+            # Add to database with simplified schema
+            self.db.execute("""
+                INSERT OR IGNORE INTO url_queue (url, domain, depth, priority, visited)
+                VALUES (?, ?, ?, ?, 0)
+            """, (url, domain, depth, priority))
+            
             return True
-        except sqlite3.IntegrityError:
-            self.logger.debug(f"URL already in queue: {url}")
-            return False
         except Exception as e:
             self.logger.error(f"Error adding URL to queue: {str(e)}")
             return False
             
-    def get_next(self) -> Optional[Dict]:
+    def get_next(self):
         """
         Get the next URL from the queue.
         
@@ -381,98 +342,35 @@ class UrlQueueManager:
             dict: URL data or None if queue is empty
         """
         try:
-            self.db.execute(
-                """
-                SELECT id, url, domain, depth, priority, source_url, anchor_text, metadata
-                FROM url_queue
-                WHERE status = 'pending'
-                ORDER BY priority DESC, id ASC
+            # Get highest priority URL that hasn't been visited
+            self.db.execute("""
+                SELECT id, url, domain, depth, priority 
+                FROM url_queue 
+                WHERE visited = 0 
+                ORDER BY priority DESC, id ASC 
                 LIMIT 1
-                """
-            )
-            row = self.db.fetchone()
+            """)
             
+            row = self.db.fetchone()
             if not row:
                 return None
                 
-            url_id, url, domain, depth, priority, source_url, anchor_text, metadata = row
-            
-            # Mark URL as processing
-            self.db.execute(
-                "UPDATE url_queue SET status = 'processing' WHERE id = ?",
-                (url_id,)
-            )
-            
-            return {
-                'id': url_id,
-                'url': url,
-                'domain': domain,
-                'depth': depth,
-                'priority': priority,
-                'source_url': source_url,
-                'anchor_text': anchor_text,
-                'metadata': metadata
+            url_data = {
+                'id': row[0],
+                'url': row[1],
+                'domain': row[2],
+                'depth': row[3],
+                'priority': row[4]
             }
+            
+            return url_data
         except Exception as e:
             self.logger.error(f"Error getting next URL from queue: {str(e)}")
             return None
             
-    def get_next_url(self) -> dict:
+    def mark_visited(self, url_id: int) -> bool:
         """
-        Get the next URL from the queue.
-        
-        Returns:
-            dict: URL data or None if queue is empty
-        """
-        try:
-            self.db.execute(
-                """
-                SELECT url, domain, depth, priority, added_at, metadata
-                FROM url_queue
-                WHERE status = 'pending'
-                ORDER BY priority DESC, added_at ASC
-                LIMIT 1
-                """
-            )
-            row = self.db.fetchone()
-            
-            if not row:
-                return None
-                
-            url, domain, depth, priority, added_at, metadata_json = row
-            
-            # Parse metadata JSON
-            try:
-                metadata = json.loads(metadata_json) if metadata_json else {}
-            except:
-                metadata = {}
-                
-            # Mark URL as processing
-            self.db.execute(
-                """
-                UPDATE url_queue
-                SET status = 'processing'
-                WHERE url = ?
-                """,
-                (url,)
-            )
-            
-            return {
-                'url': url,
-                'domain': domain,
-                'depth': depth,
-                'priority': priority,
-                'added_at': added_at,
-                'metadata': metadata
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error getting next URL from queue: {str(e)}")
-            return None
-            
-    def mark_complete(self, url_id: int) -> bool:
-        """
-        Mark a URL as complete.
+        Mark a URL as visited.
         
         Args:
             url_id: ID of the URL
@@ -481,13 +379,10 @@ class UrlQueueManager:
             bool: True if successful, False otherwise
         """
         try:
-            self.db.execute(
-                "UPDATE url_queue SET status = 'complete' WHERE id = ?",
-                (url_id,)
-            )
+            self.db.execute("UPDATE url_queue SET visited = 1 WHERE id = ?", (url_id,))
             return True
         except Exception as e:
-            self.logger.error(f"Error marking URL as complete: {str(e)}")
+            self.logger.error(f"Error marking URL as visited: {str(e)}")
             return False
             
     def mark_failed(self, url_id: int) -> bool:
@@ -501,93 +396,38 @@ class UrlQueueManager:
             bool: True if successful, False otherwise
         """
         try:
-            self.db.execute(
-                "UPDATE url_queue SET status = 'failed' WHERE id = ?",
-                (url_id,)
-            )
+            self.db.execute("UPDATE url_queue SET visited = -1 WHERE id = ?", (url_id,))
             return True
         except Exception as e:
             self.logger.error(f"Error marking URL as failed: {str(e)}")
             return False
             
-    def get_count(self, status: str = None) -> int:
-        """
-        Get the number of URLs in the queue.
-        
-        Args:
-            status: Optional status filter
-            
-        Returns:
-            int: Number of URLs
-        """
-        try:
-            if status:
-                self.db.execute(
-                    "SELECT COUNT(*) FROM url_queue WHERE status = ?",
-                    (status,)
-                )
-            else:
-                self.db.execute("SELECT COUNT(*) FROM url_queue")
-                
-            return self.db.fetchone()[0]
-        except Exception as e:
-            self.logger.error(f"Error getting URL count: {str(e)}")
-            return 0
-            
-    def clear(self) -> bool:
-        """
-        Clear the URL queue.
-        
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            self.db.execute("DELETE FROM url_queue")
-            return True
-        except Exception as e:
-            self.logger.error(f"Error clearing URL queue: {str(e)}")
-            return False
-            
-    def is_empty(self) -> bool:
-        """
-        Check if the URL queue is empty.
-        
-        Returns:
-            bool: True if the queue is empty, False otherwise
-        """
-        try:
-            self.db.execute("SELECT COUNT(*) FROM url_queue WHERE status = 'pending'")
-            count = self.db.fetchone()[0]
-            return count == 0
-        except Exception as e:
-            self.logger.error(f"Error checking if URL queue is empty: {str(e)}")
-            return True  # Assume empty on error
-            
-    def get_stats(self) -> dict:
+    def get_stats(self) -> Dict:
         """
         Get statistics about the URL queue.
         
         Returns:
-            dict: Statistics about the URL queue
+            Dict: Statistics about the URL queue
         """
+        stats = {
+            'total': 0,
+            'visited': 0,
+            'unvisited': 0,
+            'domains': 0
+        }
+        
         try:
-            stats = {}
-            
             # Get total count
             self.db.execute("SELECT COUNT(*) FROM url_queue")
             stats['total'] = self.db.fetchone()[0]
             
-            # Get pending count
-            self.db.execute("SELECT COUNT(*) FROM url_queue WHERE status = 'pending'")
-            stats['pending'] = self.db.fetchone()[0]
+            # Get visited count
+            self.db.execute("SELECT COUNT(*) FROM url_queue WHERE visited = 1")
+            stats['visited'] = self.db.fetchone()[0]
             
-            # Get completed count
-            self.db.execute("SELECT COUNT(*) FROM url_queue WHERE status = 'complete'")
-            stats['complete'] = self.db.fetchone()[0]
-            
-            # Get failed count
-            self.db.execute("SELECT COUNT(*) FROM url_queue WHERE status = 'failed'")
-            stats['failed'] = self.db.fetchone()[0]
+            # Get unvisited count
+            self.db.execute("SELECT COUNT(*) FROM url_queue WHERE visited = 0")
+            stats['unvisited'] = self.db.fetchone()[0]
             
             # Get domain count
             self.db.execute("SELECT COUNT(DISTINCT domain) FROM url_queue")
@@ -596,70 +436,57 @@ class UrlQueueManager:
             return stats
         except Exception as e:
             self.logger.error(f"Error getting URL queue stats: {str(e)}")
-            return {
-                'total': 0,
-                'pending': 0,
-                'complete': 0,
-                'failed': 0,
-                'domains': 0
-            }
+            return stats
             
     def is_queued(self, url: str) -> bool:
         """
-        Check if a URL is already in the queue.
+        Check if a URL is already in the queue but not yet visited.
         
         Args:
             url: URL to check
             
         Returns:
-            bool: True if URL is in the queue, False otherwise
+            bool: True if URL is in the queue and not visited, False otherwise
         """
         try:
             self.db.execute(
-                "SELECT COUNT(*) FROM url_queue WHERE url = ? AND status = 'pending'",
+                "SELECT COUNT(*) FROM url_queue WHERE url = ? AND visited = 0",
                 (url,)
             )
             count = self.db.fetchone()[0]
             return count > 0
         except Exception as e:
-            self.logger.error(f"Error checking if URL is in queue: {str(e)}")
+            self.logger.error(f"Error checking if URL exists in queue: {str(e)}")
             return False
             
     def get_all_queued(self) -> List[Dict]:
         """
-        Get all URLs in the queue with 'pending' status.
+        Get all URLs in the queue that haven't been visited yet.
         
         Returns:
             list: List of URL data dictionaries
         """
         try:
-            self.db.execute(
-                """
-                SELECT id, url, domain, depth, priority, source_url, anchor_text, metadata
+            self.db.execute("""
+                SELECT id, url, domain, depth, priority
                 FROM url_queue
-                WHERE status = 'pending'
-                ORDER BY priority DESC, id ASC
-                """
-            )
+                WHERE visited = 0
+                ORDER BY priority DESC
+            """)
+            
             rows = self.db.fetchall()
-            
-            if not rows:
-                return []
-                
             result = []
-            for row in rows:
-                url_id, url, domain, depth, priority, source_url, anchor_text, metadata = row
-                result.append({
-                    'id': url_id,
-                    'url': url,
-                    'domain': domain,
-                    'depth': depth,
-                    'priority': priority,
-                    'source_url': source_url,
-                    'anchor_text': anchor_text,
-                    'metadata': metadata
-                })
             
+            for row in rows:
+                url_data = {
+                    'id': row[0],
+                    'url': row[1],
+                    'domain': row[2],
+                    'depth': row[3],
+                    'priority': row[4]
+                }
+                result.append(url_data)
+                
             return result
         except Exception as e:
             self.logger.error(f"Error getting all queued URLs: {str(e)}")

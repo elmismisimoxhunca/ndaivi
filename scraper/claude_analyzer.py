@@ -1,18 +1,49 @@
 import os
 import re
+import sys
 import time
 import json
 import yaml
 import hashlib
 import logging
 import requests
+import traceback
 from bs4 import BeautifulSoup
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime, timedelta
+from pathlib import Path
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
-# Import the new ConfigManager
-from utils.config_manager import ConfigManager
+# Create fallback ConfigManager if import fails
+try:
+    from utils.config_manager import ConfigManager
+except ImportError:
+    # Simple fallback ConfigManager implementation
+    class ConfigManager:
+        def __init__(self, config_path=None):
+            self.config = {}
+            self.logger = logging.getLogger(__name__)
+            if isinstance(config_path, dict):
+                self.config = config_path
+            elif config_path and os.path.exists(config_path):
+                try:
+                    with open(config_path, 'r') as f:
+                        self.config = yaml.safe_load(f)
+                except Exception as e:
+                    self.logger.error(f"Failed to load config: {e}")
+            
+        def get(self, key, default=None):
+            # Handle nested keys with dots
+            if '.' in key:
+                parts = key.split('.')
+                current = self.config
+                for part in parts:
+                    if isinstance(current, dict) and part in current:
+                        current = current[part]
+                    else:
+                        return default
+                return current
+            return self.config.get(key, default)
 
 class ClaudeAnalyzer:
     """
@@ -37,13 +68,31 @@ class ClaudeAnalyzer:
         # Load configuration
         self.config_manager = ConfigManager(config_path)
         
-        # Get API key from environment or config
+        # Set up Claude API key - prioritize .env file for security
         self.claude_api_key = os.environ.get('CLAUDE_API_KEY')
         if not self.claude_api_key:
+            # Try to load from .env file if present
+            try:
+                from dotenv import load_dotenv
+                from pathlib import Path
+                
+                env_path = Path('/var/ndaivimanuales/.env')
+                if env_path.exists():
+                    load_dotenv(env_path)
+                    self.claude_api_key = os.environ.get('CLAUDE_API_KEY')
+                    if self.claude_api_key:
+                        self.logger.info("Loaded Claude API key from .env file")
+            except ImportError:
+                self.logger.warning("python-dotenv not installed, cannot load from .env file")
+        
+        # Fall back to config.yaml only if not in .env
+        if not self.claude_api_key:
             self.claude_api_key = self.config_manager.get('claude_analyzer.api_key', '')
+            if self.claude_api_key:
+                self.logger.warning("Using Claude API key from config.yaml. Consider moving it to .env file for better security")
             
         if not self.claude_api_key:
-            raise ValueError("Claude API key is required. Set CLAUDE_API_KEY environment variable or configure it in config.yaml")
+            raise ValueError("Claude API key is required. Set CLAUDE_API_KEY in .env file or environment variable")
                 
         self.claude_model = self.config_manager.get('claude_analyzer.claude_model', 'claude-3-5-haiku-20241022')
         
@@ -1181,3 +1230,185 @@ Do not include any explanations or other text, just the JSON array.
         except Exception as e:
             self.logger.error(f"Error extracting categories from brand page: {str(e)}")
             return []
+
+# Batch processing for integration with Go daemon
+# The following code allows the analyzer to run as a standalone process
+
+# Define directories for analyzer communication
+WATCH_DIR = '/var/ndaivimanuales/tmp/analyzer_watch'
+RESULTS_DIR = '/var/ndaivimanuales/tmp/analyzer_results'
+ERRORS_DIR = '/var/ndaivimanuales/tmp/analyzer_errors'
+
+def fetch_url_content(url):
+    """Fetch content from a URL for analysis"""
+    try:
+        print(f"Fetching content from {url}")
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (compatible; NDaiviBot/1.0; +https://ndaivi.com/bot)'
+        }
+        response = requests.get(url, timeout=30, headers=headers)
+        
+        if response.status_code == 200:
+            # Parse HTML content
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Extract title and content
+            title = soup.title.string if soup.title else "No title"
+            content = soup.get_text(separator=" ", strip=True)
+            
+            # Extract metadata
+            metadata = {}
+            for meta in soup.find_all('meta'):
+                if meta.get('name'):
+                    metadata[meta.get('name')] = meta.get('content', '')
+                elif meta.get('property'):
+                    metadata[meta.get('property')] = meta.get('content', '')
+            
+            # Convert metadata to string format
+            metadata_str = '\n'.join([f"{k}: {v}" for k, v in metadata.items()])
+            
+            return {
+                'url': url,
+                'title': title,
+                'content': content,
+                'metadata': metadata_str,
+                'status': 'success'
+            }
+        else:
+            print(f"Failed to fetch {url}: HTTP {response.status_code}")
+            return {
+                'url': url,
+                'status': 'error',
+                'error': f"HTTP error {response.status_code}"
+            }
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return {
+            'url': url,
+            'status': 'error',
+            'error': str(e)
+        }
+
+def process_batch_file(batch_file, analyzer):
+    """Process a batch file of URLs"""
+    try:
+        batch_path = os.path.join(WATCH_DIR, batch_file)
+        print(f"Processing batch file: {batch_path}")
+        
+        # Read the batch file
+        with open(batch_path, 'r') as f:
+            urls = json.load(f)
+        
+        if not urls or not isinstance(urls, list):
+            print(f"Invalid batch file format: {batch_path}")
+            return False
+        
+        print(f"Found {len(urls)} URLs in batch")
+        
+        # Process each URL
+        results = []
+        for url in urls:
+            try:
+                # Fetch content from URL
+                content_data = fetch_url_content(url)
+                
+                if content_data['status'] == 'success':
+                    # Analyze the page
+                    print(f"Analyzing content for {url}")
+                    result = analyzer.analyze_page(
+                        url, 
+                        content_data['title'], 
+                        content_data['content'], 
+                        content_data['metadata']
+                    )
+                    
+                    # Add status and URL to result
+                    result['status'] = 'success'
+                    result['url'] = url
+                    
+                    results.append(result)
+                    print(f"Analysis complete for {url}")
+                else:
+                    # Add error result
+                    results.append(content_data)
+            except Exception as e:
+                print(f"Error analyzing {url}: {e}")
+                print(traceback.format_exc())
+                results.append({
+                    'url': url,
+                    'status': 'error',
+                    'error': str(e)
+                })
+        
+        # Write results to output directory
+        batch_id = batch_file.split('.')[0].split('_')[1]  # Extract batch ID from filename
+        result_file = os.path.join(RESULTS_DIR, f"result_{batch_id}.json")
+        
+        with open(result_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        print(f"Wrote analysis results to {result_file}")
+        
+        # Remove the processed batch file
+        os.remove(batch_path)
+        print(f"Removed processed batch file: {batch_path}")
+        
+        return True
+    except Exception as e:
+        print(f"Error processing batch file {batch_file}: {e}")
+        print(traceback.format_exc())
+        
+        # Move to errors directory if there was a problem
+        try:
+            src_path = os.path.join(WATCH_DIR, batch_file)
+            dst_path = os.path.join(ERRORS_DIR, batch_file)
+            os.rename(src_path, dst_path)
+            print(f"Moved problematic batch file to {dst_path}")
+        except Exception as move_err:
+            print(f"Error moving batch file to errors directory: {move_err}")
+        
+        return False
+
+def main():
+    """Main function for handling batch processing"""
+    print("=== NDAIVI Analyzer Starting ===")
+    
+    # Create necessary directories
+    os.makedirs(WATCH_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(ERRORS_DIR, exist_ok=True)
+    
+    # Initialize the analyzer
+    try:
+        analyzer = ClaudeAnalyzer()
+        print("Claude Analyzer initialized")
+        
+        # Main watch loop
+        while True:
+            try:
+                # List all JSON files in the watch directory
+                batch_files = [f for f in os.listdir(WATCH_DIR) 
+                             if f.endswith('.json') and f.startswith('batch_')]
+                
+                if batch_files:
+                    print(f"Found {len(batch_files)} batch files to process")
+                    
+                    # Process each batch file
+                    for batch_file in sorted(batch_files):  # Process in order
+                        process_batch_file(batch_file, analyzer)
+                else:
+                    # No batch files found, wait before checking again
+                    time.sleep(5)  # Sleep for 5 seconds
+            except Exception as e:
+                print(f"Error in watch loop: {e}")
+                print(traceback.format_exc())
+                time.sleep(5)  # Sleep and try again
+    except Exception as e:
+        print(f"Critical error in analyzer: {e}")
+        print(traceback.format_exc())
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
